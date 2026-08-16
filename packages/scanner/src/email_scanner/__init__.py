@@ -22,7 +22,11 @@ from email_scanner.errors import (
     FetchOutcomeCode,
     HostSafetyError,
     HostSafetyErrorCode,
+    PageScanOutcome,
     RobotsDecisionCode,
+    SiteScanConfigError,
+    SiteScanConfigErrorCode,
+    SiteScanOutcome,
     URLNormalizationError,
     URLNormalizationErrorCode,
 )
@@ -44,12 +48,17 @@ from email_scanner.models import (
     FetchResult,
     HostType,
     NormalizedURL,
+    PageScanRecord,
     RankedPage,
     RedirectHop,
     RejectedEmailCandidate,
     RobotsDecision,
+    SiteScanConfig,
+    SiteScanResult,
+    SiteScanStatistics,
 )
 from email_scanner.normalization import normalize_url
+from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.ranking import RANKING_VERSION, calculate_page_score, rank_pages
 from email_scanner.robots import RobotsPolicyEvaluator
 from email_scanner.scope import (
@@ -92,12 +101,21 @@ __all__ = [
     "HostSafetyErrorCode",
     "HostType",
     "NormalizedURL",
+    "PageScanOutcome",
+    "PageScanRecord",
     "RankedPage",
     "RedirectHop",
     "RejectedEmailCandidate",
     "RobotsDecision",
     "RobotsDecisionCode",
     "RobotsPolicyEvaluator",
+    "SiteScanConfig",
+    "SiteScanConfigError",
+    "SiteScanConfigErrorCode",
+    "SiteScanOrchestrator",
+    "SiteScanOutcome",
+    "SiteScanResult",
+    "SiteScanStatistics",
     "SystemDNSResolver",
     "URLNormalizationError",
     "URLNormalizationErrorCode",

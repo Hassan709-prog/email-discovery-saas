@@ -5,6 +5,7 @@ content-type checking, response size streaming limits, and error mapping.
 """
 
 import urllib.parse
+from collections.abc import Callable
 
 import httpx
 
@@ -32,10 +33,12 @@ class AsyncHTTPFetcher:
         dns_resolver: AsyncDNSResolver | None = None,
         client: httpx.AsyncClient | None = None,
         config: FetchConfig | None = None,
+        redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
     ) -> None:
         self._dns_resolver = dns_resolver or SystemDNSResolver()
         self._client = client
         self._config = config or FetchConfig()
+        self._redirect_validator = redirect_validator
 
     @property
     def config(self) -> FetchConfig:
@@ -45,8 +48,13 @@ class AsyncHTTPFetcher:
         self,
         url: str | NormalizedURL,
         allowed_content_types: tuple[str, ...] | None = None,
+        redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
     ) -> FetchResult:
         """Fetch content for a URL safely and asynchronously."""
+        effective_redirect_validator = (
+            redirect_validator if redirect_validator is not None else self._redirect_validator
+        )
+
         config = self._config
         effective_allowed_types = (
             allowed_content_types
@@ -170,6 +178,18 @@ class AsyncHTTPFetcher:
                                     outcome=FetchOutcomeCode.INVALID_URL,
                                     error_message=str(err),
                                 )
+
+                            if effective_redirect_validator is not None:
+                                if not effective_redirect_validator(normalized_target, current_url):
+                                    return FetchResult(
+                                        final_url=current_url.normalized_url,
+                                        status_code=status_code,
+                                        content_type=content_type_header,
+                                        body_text=None,
+                                        redirect_history=tuple(redirect_history),
+                                        outcome=FetchOutcomeCode.UNSAFE_HOST,
+                                        error_message="Redirect target is out of crawl scope",
+                                    )
 
                             try:
                                 await self._dns_resolver.resolve(current_url)

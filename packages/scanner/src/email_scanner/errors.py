@@ -167,3 +167,47 @@ class ExtractionConfigError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class SiteScanOutcome(StrEnum):
+    """Stable status codes representing the overall outcome of a single-site scan."""
+
+    COMPLETED = "COMPLETED"
+    COMPLETED_NO_EMAILS = "COMPLETED_NO_EMAILS"
+    PARTIAL = "PARTIAL"
+    ROBOTS_BLOCKED = "ROBOTS_BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class PageScanOutcome(StrEnum):
+    """Stable status codes representing the scan outcome for an individual page."""
+
+    FETCHED_AND_PROCESSED = "FETCHED_AND_PROCESSED"
+    ROBOTS_DISALLOWED = "ROBOTS_DISALLOWED"
+    ROBOTS_TEMPORARY_FAILURE = "ROBOTS_TEMPORARY_FAILURE"
+    FETCH_FAILED = "FETCH_FAILED"
+    UNSAFE_HOST = "UNSAFE_HOST"
+    RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
+    UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE"
+    SKIPPED_BUDGET_REACHED = "SKIPPED_BUDGET_REACHED"
+
+
+class SiteScanConfigErrorCode(StrEnum):
+    """Stable error codes for invalid site scan configuration."""
+
+    INVALID_LIMIT = "INVALID_LIMIT"
+    INVALID_INTERVAL = "INVALID_INTERVAL"
+    NON_FINITE_VALUE = "NON_FINITE_VALUE"
+
+
+class SiteScanConfigError(ValueError):
+    """Raised when a SiteScanConfig instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: SiteScanConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

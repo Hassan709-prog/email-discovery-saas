@@ -5,6 +5,7 @@ import ssl
 from typing import Any
 
 import httpcore
+import httpx
 import pytest
 
 from email_scanner.dns import AsyncDNSResolver
@@ -219,3 +220,119 @@ def test_ssl_context_verification_enabled_default() -> None:
     assert (
         transport._ssl_context.verify_mode == ssl.CERT_REQUIRED  # pyright: ignore[reportPrivateUsage]
     )
+
+
+class FakeHTTPNetworkStream(httpcore.AsyncNetworkStream):
+    def __init__(self, target_ip: str) -> None:
+        self.target_ip = target_ip
+        self.written_bytes = b""
+        self.closed = False
+        self.read_buffer = b""
+
+    async def read(self, max_bytes: int = 4096, timeout: float | None = None) -> bytes:
+        if not self.read_buffer:
+            return b""
+        chunk = self.read_buffer[:max_bytes]
+        self.read_buffer = self.read_buffer[max_bytes:]
+        return chunk
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self.written_bytes += buffer
+        if not self.read_buffer:
+            self.read_buffer = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"Content-Length: 12\r\n"
+                b"X-Custom-Header: adapter-test\r\n"
+                b"\r\n"
+                b"Hello World!"
+            )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    async def start_tls(
+        self,
+        ssl_context: Any,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return self
+
+    def get_extra_info(self, info: str, default: Any = None) -> Any:
+        return default
+
+
+class FakeHTTPNetworkBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.connected_hosts: list[tuple[str, int]] = []
+        self.last_stream: FakeHTTPNetworkStream | None = None
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        self.connected_hosts.append((host, port))
+        stream = FakeHTTPNetworkStream(target_ip=host)
+        self.last_stream = stream
+        return stream
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(0.0)
+
+
+def test_pinned_transport_httpx_request_adapter_integration() -> None:
+    async def _test() -> None:
+        dns_resolver = MockDNSResolver({"example.com": ["93.184.216.34"]})
+        backend = FakeHTTPNetworkBackend()
+        transport = PinnedAsyncHTTPTransport(
+            dns_resolver=dns_resolver,
+            network_backend=backend,
+        )
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            # Test POST with request body stream adaptation, headers, and extensions
+            response = await client.post(
+                "https://example.com/api/test",
+                content=b"request body payload",
+                headers={"X-Test-Header": "httpx-adapter"},
+            )
+
+            assert response.status_code == 200
+            assert response.text == "Hello World!"
+            assert response.headers["x-custom-header"] == "adapter-test"
+
+            # Check original host header & original URL origin
+            assert response.request.url.scheme == "https"
+            assert response.request.url.host == "example.com"
+            assert response.request.headers["host"] == "example.com"
+
+            # Check backend connected to resolved IP
+            assert backend.connected_hosts == [("93.184.216.34", 443)]
+
+            # Check request payload written to fake network stream
+            assert backend.last_stream is not None
+            assert b"POST /api/test HTTP/1.1" in backend.last_stream.written_bytes
+            assert (
+                b"Host: example.com" in backend.last_stream.written_bytes
+                or b"host: example.com" in backend.last_stream.written_bytes
+            )
+            assert (
+                b"X-Test-Header: httpx-adapter" in backend.last_stream.written_bytes
+                or b"x-test-header: httpx-adapter" in backend.last_stream.written_bytes
+            )
+            assert b"request body payload" in backend.last_stream.written_bytes
+
+            # Test streaming response close propagation
+            async with client.stream("GET", "https://example.com/stream") as stream_resp:
+                chunks = [chunk async for chunk in stream_resp.aiter_bytes()]
+                assert b"".join(chunks) == b"Hello World!"
+
+        # Verify closing client/transport closes underlying connection pool stream
+        assert backend.last_stream.closed is True
+
+    asyncio.run(_test())

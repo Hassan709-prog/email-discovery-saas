@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "email-discovery-api"
+version = "0.1.0"
+description = "FastAPI and PostgreSQL application service for Email Discovery SaaS"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy[asyncio]>=2.0.38",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "pydantic-settings>=2.7.0",
+    "email-discovery-scanner",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "anyio>=4.8.0",
+    "httpx>=0.28.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/email_discovery_api"]

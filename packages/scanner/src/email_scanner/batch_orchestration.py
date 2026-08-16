@@ -347,7 +347,7 @@ class BatchScanOrchestrator:
                     if domain_queues[d_key]:
                         ready_domains.append(d_key)
 
-                    asyncio.create_task(_run_work_item(w_item))
+                    asyncio.create_task(_run_work_item(w_item), name="scanner-worker")
 
         # Start initial worker dispatch under state_lock
         async with state_lock:

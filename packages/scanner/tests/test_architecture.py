@@ -26,6 +26,8 @@ PROHIBITED_MODULES = frozenset(
         "tenant",
         "authentication",
         "auth",
+        "email_discovery_api",
+        "apps",
     }
 )
 

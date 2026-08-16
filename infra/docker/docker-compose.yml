@@ -1,0 +1,28 @@
+# Development PostgreSQL service for Email Discovery SaaS.
+# Usage:
+#   Start database:       docker compose -f infra/docker/docker-compose.yml up -d
+#   Stop database:        docker compose -f infra/docker/docker-compose.yml stop
+#   Remove (keep data):   docker compose -f infra/docker/docker-compose.yml down
+#   Remove (delete data): docker compose -f infra/docker/docker-compose.yml down -v
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-email_discovery}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-email_discovery}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+    name: email_discovery_postgres_data

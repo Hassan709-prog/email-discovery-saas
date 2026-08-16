@@ -5,10 +5,11 @@ description = "Email Discovery SaaS monorepo development tools"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "email-discovery-scanner",
+    "email-discovery-api",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/scanner/tests", "tests"]
+testpaths = ["packages/scanner/tests", "apps/api/tests", "tests"]
 addopts = "-ra --strict-markers"
 
 [tool.ruff]
@@ -21,16 +22,18 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
-include = ["packages/scanner/src", "packages/scanner/tests"]
-extraPaths = ["packages/scanner/src"]
+include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests"]
+extraPaths = ["packages/scanner/src", "apps/api/src"]
 
 [tool.uv.workspace]
 members = [
     "packages/scanner",
+    "apps/api",
 ]
 
 [tool.uv.sources]
 email-discovery-scanner = { workspace = true, editable = true }
+email-discovery-api = { workspace = true, editable = true }
 
 [dependency-groups]
 dev = [
@@ -42,4 +45,4 @@ dev = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["email_scanner"]
+known-first-party = ["email_scanner", "email_discovery_api"]

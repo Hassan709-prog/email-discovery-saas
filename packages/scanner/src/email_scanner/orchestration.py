@@ -112,53 +112,57 @@ class SiteScanOrchestrator:
     ) -> SiteScanResult:
         """Run an end-to-end single-site email scan."""
         cfg = config or SiteScanConfig()
-        start_time = self._clock()
 
         if isinstance(starting_url, str):
             try:
-                norm_start_url = normalize_url(starting_url)
+                start_url_norm = normalize_url(starting_url)
             except URLNormalizationError as err:
-                stats = SiteScanStatistics(
-                    pages_queued=0,
-                    pages_attempted=0,
-                    pages_fetched=0,
-                    pages_blocked_by_robots=0,
-                    pages_failed=0,
-                    urls_discovered=0,
-                    accepted_email_findings=0,
-                    rejected_email_candidates=0,
-                    elapsed_seconds=0.0,
-                    stop_reason="INVALID_STARTING_URL",
-                )
                 return SiteScanResult(
                     starting_url=starting_url,
                     outcome=SiteScanOutcome.FAILED,
-                    statistics=stats,
+                    statistics=SiteScanStatistics(
+                        pages_queued=0,
+                        pages_attempted=0,
+                        pages_fetched=0,
+                        pages_blocked_by_robots=0,
+                        pages_failed=0,
+                        urls_discovered=0,
+                        accepted_email_findings=0,
+                        rejected_email_candidates=0,
+                        elapsed_seconds=0.0,
+                        stop_reason="INVALID_STARTING_URL",
+                    ),
                     page_records=(),
                     email_findings=(),
                     rejected_email_candidates=(),
                     error_message=f"Invalid starting URL: {err}",
                 )
         else:
-            norm_start_url = starting_url
+            start_url_norm = starting_url
 
-        start_url_str = norm_start_url.normalized_url
+        start_url_str = start_url_norm.normalized_url
+        start_time = self._clock()
 
-        def redirect_validator(source: NormalizedURL, target: NormalizedURL) -> bool:
-            return is_in_scope(target, norm_start_url, cfg.discovery_config.scope_mode)
+        def redirect_validator(from_url: NormalizedURL, to_url: NormalizedURL) -> bool:
+            return is_in_scope(to_url, start_url_norm, cfg.discovery_config.scope_mode)
 
-        # Queue tracking: priority queue of _QueueItem
+        # Initialize priority queue with starting URL
+        start_score, _ = calculate_page_score(start_url_str, "")
         queue: list[_QueueItem] = []
         sequence_counter = 0
-
         heapq.heappush(
-            queue, _QueueItem(score=100, depth=0, url=start_url_str, sequence=sequence_counter)
+            queue,
+            _QueueItem(
+                score=start_score,
+                depth=0,
+                url=start_url_str,
+                sequence=sequence_counter,
+            ),
         )
         sequence_counter += 1
 
         visited_urls: set[str] = set()
         discovered_urls_set: set[str] = {start_url_str}
-
         page_records: list[PageScanRecord] = []
         global_accepted_map: dict[str, tuple[int, EmailFinding]] = {}
         global_rejected_set: set[RejectedEmailCandidate] = set()
@@ -168,6 +172,7 @@ class SiteScanOrchestrator:
         pages_fetched = 0
         pages_blocked_by_robots = 0
         pages_failed = 0
+
         last_request_time: float | None = None
         stop_reason = "QUEUE_EXHAUSTED"
 
@@ -186,6 +191,11 @@ class SiteScanOrchestrator:
             # Check page budget
             if pages_attempted >= cfg.max_pages:
                 stop_reason = "MAX_PAGES_REACHED"
+                break
+
+            # Check email finding budget
+            if len(global_accepted_map) >= cfg.max_email_findings:
+                stop_reason = "MAX_EMAIL_FINDINGS_REACHED"
                 break
 
             # Pop highest priority URL

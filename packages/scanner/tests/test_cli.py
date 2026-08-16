@@ -1,3 +1,5 @@
+"""Tests for experimental email_scanner CLI adapter."""
+
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch

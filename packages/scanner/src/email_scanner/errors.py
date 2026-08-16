@@ -30,3 +30,24 @@ class URLNormalizationError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class HostSafetyErrorCode(StrEnum):
+    """Stable reasons why a host is unsafe to crawl."""
+
+    BLOCKED_HOSTNAME = "BLOCKED_HOSTNAME"
+    NO_RESOLVED_ADDRESSES = "NO_RESOLVED_ADDRESSES"
+    INVALID_IP_ADDRESS = "INVALID_IP_ADDRESS"
+    NON_PUBLIC_IP_ADDRESS = "NON_PUBLIC_IP_ADDRESS"
+
+
+class HostSafetyError(ValueError):
+    """Raised when a URL points to an unsafe destination."""
+
+    def __init__(
+        self,
+        code: HostSafetyErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

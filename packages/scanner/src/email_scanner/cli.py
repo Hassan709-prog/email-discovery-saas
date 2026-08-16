@@ -302,6 +302,54 @@ def main(cli_args: list[str] | None = None) -> int:
         help="Maximum total batch elapsed time in seconds",
     )
 
+    # benchmark command
+    bench_parser = subparsers.add_parser(
+        "benchmark", help="Run deterministic offline benchmark scenarios for scanner-core"
+    )
+    bench_parser.add_argument(
+        "--size",
+        default="100",
+        help="Scenario size: 1, 10, 100, 1000, or 'all' (default: 100)",
+    )
+    bench_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Number of measured repeat iterations per scenario (default: 3)",
+    )
+    bench_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Enable live-input network mode (prints permission warning)",
+    )
+    bench_parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Skip initial unmeasured warmup iteration",
+    )
+    bench_parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random/fixture seed for benchmark scenario (default: 42)",
+    )
+    bench_parser.add_argument(
+        "--simulated-delay",
+        type=float,
+        default=0.0,
+        help="Simulated network latency per request in seconds (default: 0.0)",
+    )
+    bench_parser.add_argument(
+        "--output-dir",
+        default=".benchmark-output",
+        help="Directory path to save JSON benchmark report (default: .benchmark-output)",
+    )
+    bench_parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Path to an existing benchmark JSON file for performance comparison",
+    )
+
     args = parser.parse_args(cli_args)
 
     if args.command == "scan":
@@ -311,6 +359,13 @@ def main(cli_args: list[str] | None = None) -> int:
 
     if args.command == "scan-batch":
         exit_code, json_output = asyncio.run(run_scan_batch_cli(args))
+        sys.stdout.write(json_output + "\n")
+        return exit_code
+
+    if args.command == "benchmark":
+        from email_scanner.benchmarking import run_benchmark_cli
+
+        exit_code, json_output = asyncio.run(run_benchmark_cli(args))
         sys.stdout.write(json_output + "\n")
         return exit_code
 

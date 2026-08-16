@@ -3,7 +3,13 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-from email_scanner.errors import DiscoveryOutcomeCode, FetchOutcomeCode, RobotsDecisionCode
+from email_scanner.errors import (
+    DiscoveryOutcomeCode,
+    EmailRejectionCode,
+    ExtractionOutcomeCode,
+    FetchOutcomeCode,
+    RobotsDecisionCode,
+)
 
 
 class HostType(StrEnum):
@@ -245,4 +251,120 @@ class DiscoveryResult:
     discovered_links: tuple[DiscoveredLink, ...]
     ranked_pages: tuple[RankedPage, ...]
     outcome: DiscoveryOutcomeCode
+    error_message: str | None = None
+
+
+class EmailSourceKind(StrEnum):
+    """Source origin of an extracted email candidate."""
+
+    VISIBLE_TEXT = "VISIBLE_TEXT"
+    MAILTO = "MAILTO"
+    OBFUSCATED_TEXT = "OBFUSCATED_TEXT"
+
+
+class EmailDisposition(StrEnum):
+    """Disposition of an extracted email candidate."""
+
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+class EmailCategory(StrEnum):
+    """Classification of an accepted email address."""
+
+    ROLE_BASED = "ROLE_BASED"
+    PERSONAL_OR_NAMED = "PERSONAL_OR_NAMED"
+    NO_REPLY = "NO_REPLY"
+    UNKNOWN = "UNKNOWN"
+
+
+class DomainAffinity(StrEnum):
+    """Domain affinity of an email address relative to the source page URL."""
+
+    EXACT_HOST = "EXACT_HOST"
+    SAME_REGISTRABLE_DOMAIN = "SAME_REGISTRABLE_DOMAIN"
+    EXTERNAL = "EXTERNAL"
+
+
+@dataclass(frozen=True, slots=True)
+class EmailExtractionConfig:
+    """Configuration options for HTML email extraction, cleaning, and filtering."""
+
+    max_html_chars: int = 1_000_000
+    max_raw_candidates: int = 2_000
+    max_accepted_findings: int = 200
+    max_rejected_candidates: int = 200
+    max_evidence_length: int = 120
+    allow_obfuscated: bool = True
+    allow_external_domains: bool = True
+    reject_no_reply: bool = True
+    reject_dummy_test: bool = True
+
+    def __post_init__(self) -> None:
+        from email_scanner.errors import ExtractionConfigError, ExtractionConfigErrorCode
+
+        if self.max_html_chars < 1:
+            raise ExtractionConfigError(
+                ExtractionConfigErrorCode.INVALID_LIMIT,
+                "max_html_chars must be at least 1.",
+            )
+        if self.max_raw_candidates < 1:
+            raise ExtractionConfigError(
+                ExtractionConfigErrorCode.INVALID_LIMIT,
+                "max_raw_candidates must be at least 1.",
+            )
+        if self.max_accepted_findings < 1:
+            raise ExtractionConfigError(
+                ExtractionConfigErrorCode.INVALID_LIMIT,
+                "max_accepted_findings must be at least 1.",
+            )
+        if self.max_rejected_candidates < 1:
+            raise ExtractionConfigError(
+                ExtractionConfigErrorCode.INVALID_LIMIT,
+                "max_rejected_candidates must be at least 1.",
+            )
+        if self.max_evidence_length < 10:
+            raise ExtractionConfigError(
+                ExtractionConfigErrorCode.INVALID_LIMIT,
+                "max_evidence_length must be at least 10.",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class EmailFinding:
+    """An accepted email address discovered on a source page."""
+
+    source_url: str
+    raw_candidate: str
+    canonical_email: str
+    local_part: str
+    domain: str
+    source_kind: EmailSourceKind
+    category: EmailCategory
+    domain_affinity: DomainAffinity
+    evidence_snippet: str
+    disposition: EmailDisposition = EmailDisposition.ACCEPTED
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedEmailCandidate:
+    """An email candidate rejected during extraction/validation with audit reason."""
+
+    source_url: str
+    raw_candidate: str
+    rejection_code: EmailRejectionCode
+    reason: str
+    source_kind: EmailSourceKind
+    evidence_snippet: str
+    disposition: EmailDisposition = EmailDisposition.REJECTED
+
+
+@dataclass(frozen=True, slots=True)
+class EmailExtractionResult:
+    """Typed result of deterministic HTML email extraction."""
+
+    source_url: str
+    findings: tuple[EmailFinding, ...]
+    rejected_candidates: tuple[RejectedEmailCandidate, ...]
+    outcome: ExtractionOutcomeCode
     error_message: str | None = None

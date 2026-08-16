@@ -124,3 +124,46 @@ class DiscoveryConfigError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class ExtractionOutcomeCode(StrEnum):
+    """Stable status codes representing the outcome of email extraction."""
+
+    SUCCESS = "SUCCESS"
+    NO_EMAILS_FOUND = "NO_EMAILS_FOUND"
+    INVALID_SOURCE_URL = "INVALID_SOURCE_URL"
+    HTML_TOO_LARGE = "HTML_TOO_LARGE"
+    PARSING_ERROR = "PARSING_ERROR"
+
+
+class EmailRejectionCode(StrEnum):
+    """Stable reason codes for rejected email candidates."""
+
+    INVALID_SYNTAX = "INVALID_SYNTAX"
+    LOCAL_PART_TOO_LONG = "LOCAL_PART_TOO_LONG"
+    TOTAL_LENGTH_TOO_LONG = "TOTAL_LENGTH_TOO_LONG"
+    INVALID_DOMAIN_LABEL = "INVALID_DOMAIN_LABEL"
+    NO_PUBLIC_SUFFIX = "NO_PUBLIC_SUFFIX"
+    PLACEHOLDER_DOMAIN = "PLACEHOLDER_DOMAIN"
+    FILE_EXTENSION_LIKE = "FILE_EXTENSION_LIKE"
+    NO_REPLY_ADDRESS = "NO_REPLY_ADDRESS"
+    DUMMY_TEST_ADDRESS = "DUMMY_TEST_ADDRESS"
+    EXTERNAL_DOMAIN_REJECTED = "EXTERNAL_DOMAIN_REJECTED"
+
+
+class ExtractionConfigErrorCode(StrEnum):
+    """Stable error codes for invalid email extraction configuration."""
+
+    INVALID_LIMIT = "INVALID_LIMIT"
+
+
+class ExtractionConfigError(ValueError):
+    """Raised when an EmailExtractionConfig instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: ExtractionConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

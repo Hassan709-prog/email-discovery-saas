@@ -32,6 +32,7 @@ from email_scanner.models import (
 )
 from email_scanner.normalization import normalize_url
 from email_scanner.ranking import calculate_page_score
+from email_scanner.request_gate import DomainRequestGate
 from email_scanner.robots import RobotsPolicyEvaluator
 from email_scanner.scope import is_in_scope
 
@@ -96,6 +97,14 @@ class SiteScanOrchestrator:
         self._sleeper = async_sleeper
         self._cancellation_checker = cancellation_checker
 
+        if isinstance(self._fetcher, AsyncHTTPFetcher):
+            gate = self._fetcher.request_gate
+            if isinstance(gate, DomainRequestGate):
+                if self._sleeper is not None:
+                    gate.set_sleeper(self._sleeper)
+                if clock is not None:
+                    gate.set_clock(clock)
+
     async def scan(
         self,
         starting_url: str | NormalizedURL,
@@ -159,7 +168,6 @@ class SiteScanOrchestrator:
         pages_fetched = 0
         pages_blocked_by_robots = 0
         pages_failed = 0
-
         last_request_time: float | None = None
         stop_reason = "QUEUE_EXHAUSTED"
 
@@ -180,28 +188,43 @@ class SiteScanOrchestrator:
                 stop_reason = "MAX_PAGES_REACHED"
                 break
 
-            # Check email finding budget
-            if len(global_accepted_map) >= cfg.max_email_findings:
-                stop_reason = "MAX_EMAIL_FINDINGS_REACHED"
-                break
+            # Pop highest priority URL
+            queue_item = heapq.heappop(queue)
+            url_str = queue_item.url
+            depth = queue_item.depth
 
-            item = heapq.heappop(queue)
-            url_str = item.url
-            depth = item.depth
+            if url_str in visited_urls:
+                continue
+
+            visited_urls.add(url_str)
+            pages_attempted += 1
 
             try:
                 norm_current = normalize_url(url_str)
             except URLNormalizationError:
+                pages_failed += 1
+                page_records.append(
+                    PageScanRecord(
+                        requested_url=url_str,
+                        final_url=None,
+                        depth=depth,
+                        outcome=PageScanOutcome.FETCH_FAILED,
+                        status_code=None,
+                        robots_decision=RobotsDecision(
+                            target_url=url_str,
+                            decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+                            crawl_delay=None,
+                            reason="URL normalization failed",
+                        ),
+                        fetch_result=None,
+                        emails_found_count=0,
+                        links_discovered_count=0,
+                        error_message="Invalid URL normalization",
+                    )
+                )
                 continue
 
-            if norm_current.normalized_url in visited_urls:
-                continue
-
-            # Mark requested URL as visited
-            visited_urls.add(norm_current.normalized_url)
-            pages_attempted += 1
-
-            # 1. Evaluate robots policy first
+            # 1. Evaluate Robots.txt policy
             robots_decision = await self._robots_evaluator.evaluate(norm_current)
 
             if robots_decision.decision == RobotsDecisionCode.DISALLOWED:
@@ -240,34 +263,42 @@ class SiteScanOrchestrator:
                 )
                 continue
 
-            # 2. Politeness delay calculation using injected clock & sleeper
-            crawl_delay = robots_decision.crawl_delay or 0.0
-            effective_delay = max(cfg.minimum_request_interval_seconds, crawl_delay)
+            # 2. Politeness fallback if fetcher does not have a request_gate
+            if not hasattr(self._fetcher, "request_gate"):
+                crawl_delay = robots_decision.crawl_delay or 0.0
+                effective_delay = max(cfg.minimum_request_interval_seconds, crawl_delay)
 
-            if last_request_time is not None:
-                current_now = self._clock()
-                elapsed_since_last = current_now - last_request_time
-                remaining_sleep = max(0.0, effective_delay - elapsed_since_last)
+                if last_request_time is not None:
+                    elapsed_since_last = self._clock() - last_request_time
+                    remaining_sleep = max(0.0, effective_delay - elapsed_since_last)
 
-                if remaining_sleep > 0.0:
-                    if self._cancellation_checker is not None and self._cancellation_checker():
-                        stop_reason = "CANCELLED"
-                        break
+                    if remaining_sleep > 0.0:
+                        if self._cancellation_checker is not None and self._cancellation_checker():
+                            stop_reason = "CANCELLED"
+                            break
 
-                    if self._sleeper is not None:
-                        await self._sleeper(remaining_sleep)
+                        if self._sleeper is not None:
+                            await self._sleeper(remaining_sleep)
 
-                    if self._cancellation_checker is not None and self._cancellation_checker():
-                        stop_reason = "CANCELLED"
-                        break
+                        if self._cancellation_checker is not None and self._cancellation_checker():
+                            stop_reason = "CANCELLED"
+                            break
 
-            last_request_time = self._clock()
+                last_request_time = self._clock()
 
-            # 3. Safe HTTP Fetch
+            if self._cancellation_checker is not None and self._cancellation_checker():
+                stop_reason = "CANCELLED"
+                break
+
+            # 3. Safe HTTP Fetch (politeness rate-limiting is handled by request_gate when present)
             fetch_result = await self._fetcher.fetch(
                 norm_current,
                 redirect_validator=redirect_validator,
             )
+
+            if self._cancellation_checker is not None and self._cancellation_checker():
+                stop_reason = "CANCELLED"
+                break
 
             # Mark final_url as visited if different from requested URL
             final_url_str = fetch_result.final_url
@@ -314,7 +345,7 @@ class SiteScanOrchestrator:
                 global_rejected_set.add(rejected)
 
             # Aggregate findings with global deterministic deduplication
-            page_score = item.score
+            page_score = queue_item.score
             for finding in extraction_result.findings:
                 canonical = finding.canonical_email
                 if canonical not in global_accepted_map:

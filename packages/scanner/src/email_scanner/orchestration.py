@@ -32,6 +32,7 @@ from email_scanner.models import (
 )
 from email_scanner.normalization import normalize_url
 from email_scanner.ranking import calculate_page_score
+from email_scanner.request_gate import DomainRequestGate
 from email_scanner.robots import RobotsPolicyEvaluator
 from email_scanner.scope import is_in_scope
 
@@ -96,6 +97,14 @@ class SiteScanOrchestrator:
         self._sleeper = async_sleeper
         self._cancellation_checker = cancellation_checker
 
+        if isinstance(self._fetcher, AsyncHTTPFetcher):
+            gate = self._fetcher.request_gate
+            if isinstance(gate, DomainRequestGate):
+                if self._sleeper is not None:
+                    gate.set_sleeper(self._sleeper)
+                if clock is not None:
+                    gate.set_clock(clock)
+
     async def scan(
         self,
         starting_url: str | NormalizedURL,
@@ -103,53 +112,57 @@ class SiteScanOrchestrator:
     ) -> SiteScanResult:
         """Run an end-to-end single-site email scan."""
         cfg = config or SiteScanConfig()
-        start_time = self._clock()
 
         if isinstance(starting_url, str):
             try:
-                norm_start_url = normalize_url(starting_url)
+                start_url_norm = normalize_url(starting_url)
             except URLNormalizationError as err:
-                stats = SiteScanStatistics(
-                    pages_queued=0,
-                    pages_attempted=0,
-                    pages_fetched=0,
-                    pages_blocked_by_robots=0,
-                    pages_failed=0,
-                    urls_discovered=0,
-                    accepted_email_findings=0,
-                    rejected_email_candidates=0,
-                    elapsed_seconds=0.0,
-                    stop_reason="INVALID_STARTING_URL",
-                )
                 return SiteScanResult(
                     starting_url=starting_url,
                     outcome=SiteScanOutcome.FAILED,
-                    statistics=stats,
+                    statistics=SiteScanStatistics(
+                        pages_queued=0,
+                        pages_attempted=0,
+                        pages_fetched=0,
+                        pages_blocked_by_robots=0,
+                        pages_failed=0,
+                        urls_discovered=0,
+                        accepted_email_findings=0,
+                        rejected_email_candidates=0,
+                        elapsed_seconds=0.0,
+                        stop_reason="INVALID_STARTING_URL",
+                    ),
                     page_records=(),
                     email_findings=(),
                     rejected_email_candidates=(),
                     error_message=f"Invalid starting URL: {err}",
                 )
         else:
-            norm_start_url = starting_url
+            start_url_norm = starting_url
 
-        start_url_str = norm_start_url.normalized_url
+        start_url_str = start_url_norm.normalized_url
+        start_time = self._clock()
 
-        def redirect_validator(source: NormalizedURL, target: NormalizedURL) -> bool:
-            return is_in_scope(target, norm_start_url, cfg.discovery_config.scope_mode)
+        def redirect_validator(from_url: NormalizedURL, to_url: NormalizedURL) -> bool:
+            return is_in_scope(to_url, start_url_norm, cfg.discovery_config.scope_mode)
 
-        # Queue tracking: priority queue of _QueueItem
+        # Initialize priority queue with starting URL
+        start_score, _ = calculate_page_score(start_url_str, "")
         queue: list[_QueueItem] = []
         sequence_counter = 0
-
         heapq.heappush(
-            queue, _QueueItem(score=100, depth=0, url=start_url_str, sequence=sequence_counter)
+            queue,
+            _QueueItem(
+                score=start_score,
+                depth=0,
+                url=start_url_str,
+                sequence=sequence_counter,
+            ),
         )
         sequence_counter += 1
 
         visited_urls: set[str] = set()
         discovered_urls_set: set[str] = {start_url_str}
-
         page_records: list[PageScanRecord] = []
         global_accepted_map: dict[str, tuple[int, EmailFinding]] = {}
         global_rejected_set: set[RejectedEmailCandidate] = set()
@@ -185,23 +198,43 @@ class SiteScanOrchestrator:
                 stop_reason = "MAX_EMAIL_FINDINGS_REACHED"
                 break
 
-            item = heapq.heappop(queue)
-            url_str = item.url
-            depth = item.depth
+            # Pop highest priority URL
+            queue_item = heapq.heappop(queue)
+            url_str = queue_item.url
+            depth = queue_item.depth
+
+            if url_str in visited_urls:
+                continue
+
+            visited_urls.add(url_str)
+            pages_attempted += 1
 
             try:
                 norm_current = normalize_url(url_str)
             except URLNormalizationError:
+                pages_failed += 1
+                page_records.append(
+                    PageScanRecord(
+                        requested_url=url_str,
+                        final_url=None,
+                        depth=depth,
+                        outcome=PageScanOutcome.FETCH_FAILED,
+                        status_code=None,
+                        robots_decision=RobotsDecision(
+                            target_url=url_str,
+                            decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+                            crawl_delay=None,
+                            reason="URL normalization failed",
+                        ),
+                        fetch_result=None,
+                        emails_found_count=0,
+                        links_discovered_count=0,
+                        error_message="Invalid URL normalization",
+                    )
+                )
                 continue
 
-            if norm_current.normalized_url in visited_urls:
-                continue
-
-            # Mark requested URL as visited
-            visited_urls.add(norm_current.normalized_url)
-            pages_attempted += 1
-
-            # 1. Evaluate robots policy first
+            # 1. Evaluate Robots.txt policy
             robots_decision = await self._robots_evaluator.evaluate(norm_current)
 
             if robots_decision.decision == RobotsDecisionCode.DISALLOWED:
@@ -240,34 +273,42 @@ class SiteScanOrchestrator:
                 )
                 continue
 
-            # 2. Politeness delay calculation using injected clock & sleeper
-            crawl_delay = robots_decision.crawl_delay or 0.0
-            effective_delay = max(cfg.minimum_request_interval_seconds, crawl_delay)
+            # 2. Politeness fallback if fetcher does not have a request_gate
+            if not hasattr(self._fetcher, "request_gate"):
+                crawl_delay = robots_decision.crawl_delay or 0.0
+                effective_delay = max(cfg.minimum_request_interval_seconds, crawl_delay)
 
-            if last_request_time is not None:
-                current_now = self._clock()
-                elapsed_since_last = current_now - last_request_time
-                remaining_sleep = max(0.0, effective_delay - elapsed_since_last)
+                if last_request_time is not None:
+                    elapsed_since_last = self._clock() - last_request_time
+                    remaining_sleep = max(0.0, effective_delay - elapsed_since_last)
 
-                if remaining_sleep > 0.0:
-                    if self._cancellation_checker is not None and self._cancellation_checker():
-                        stop_reason = "CANCELLED"
-                        break
+                    if remaining_sleep > 0.0:
+                        if self._cancellation_checker is not None and self._cancellation_checker():
+                            stop_reason = "CANCELLED"
+                            break
 
-                    if self._sleeper is not None:
-                        await self._sleeper(remaining_sleep)
+                        if self._sleeper is not None:
+                            await self._sleeper(remaining_sleep)
 
-                    if self._cancellation_checker is not None and self._cancellation_checker():
-                        stop_reason = "CANCELLED"
-                        break
+                        if self._cancellation_checker is not None and self._cancellation_checker():
+                            stop_reason = "CANCELLED"
+                            break
 
-            last_request_time = self._clock()
+                last_request_time = self._clock()
 
-            # 3. Safe HTTP Fetch
+            if self._cancellation_checker is not None and self._cancellation_checker():
+                stop_reason = "CANCELLED"
+                break
+
+            # 3. Safe HTTP Fetch (politeness rate-limiting is handled by request_gate when present)
             fetch_result = await self._fetcher.fetch(
                 norm_current,
                 redirect_validator=redirect_validator,
             )
+
+            if self._cancellation_checker is not None and self._cancellation_checker():
+                stop_reason = "CANCELLED"
+                break
 
             # Mark final_url as visited if different from requested URL
             final_url_str = fetch_result.final_url
@@ -314,7 +355,7 @@ class SiteScanOrchestrator:
                 global_rejected_set.add(rejected)
 
             # Aggregate findings with global deterministic deduplication
-            page_score = item.score
+            page_score = queue_item.score
             for finding in extraction_result.findings:
                 canonical = finding.canonical_email
                 if canonical not in global_accepted_map:

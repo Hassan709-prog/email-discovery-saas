@@ -1,13 +1,21 @@
 """Tests for experimental email_scanner CLI adapter."""
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from email_scanner.cli import main, serialize_scan_result
-from email_scanner.errors import PageScanOutcome, RobotsDecisionCode, SiteScanOutcome
+from email_scanner.errors import (
+    BatchScanOutcome,
+    PageScanOutcome,
+    RobotsDecisionCode,
+    SiteScanOutcome,
+)
 from email_scanner.models import (
+    BatchScanResult,
+    BatchScanStatistics,
     PageScanRecord,
     RobotsDecision,
     SiteScanResult,
@@ -169,3 +177,55 @@ def test_cli_partial_exit_code_3(mock_scan: AsyncMock, capsys: pytest.CaptureFix
 
     assert code == 3
     assert '"outcome": "PARTIAL"' in captured.out
+
+
+def test_cli_batch_invalid_config_exit_code_1(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["scan-batch", "--input", "nonexistent.txt", "--max-inputs", "0"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert '"code": "INVALID_LIMIT"' in captured.out
+
+
+def test_cli_batch_file_not_found_exit_code_1(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(["scan-batch", "--input", "nonexistent_file_path.txt"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert '"error": "Input file not found"' in captured.out
+
+
+@patch("email_scanner.cli.BatchScanOrchestrator.scan_batch", new_callable=AsyncMock)
+def test_cli_batch_completed_exit_code_0(
+    mock_scan_batch: AsyncMock, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    input_file = tmp_path / "urls.txt"
+    input_file.write_text("https://acme.com\nhttps://company.com\n", encoding="utf-8")
+
+    stats = BatchScanStatistics(
+        total_inputs=2,
+        valid_inputs=2,
+        invalid_inputs=0,
+        unique_normalized_urls=2,
+        duplicate_coalesced_items=0,
+        started_scans=2,
+        completed_scans=2,
+        failed_scans=0,
+        cancelled_scans=0,
+        peak_global_concurrency=2,
+        peak_per_domain_concurrency=1,
+        elapsed_seconds=0.1,
+        stop_reason="COMPLETED",
+    )
+    mock_scan_batch.return_value = BatchScanResult(
+        outcome=BatchScanOutcome.COMPLETED,
+        statistics=stats,
+        items=(),
+    )
+
+    code = main(["scan-batch", "--input", str(input_file)])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "WARNING: email_scanner CLI is experimental" in captured.err
+    assert '"outcome": "COMPLETED"' in captured.out

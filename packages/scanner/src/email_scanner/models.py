@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from email_scanner.errors import (
+    BatchItemOutcome,
+    BatchScanOutcome,
     DiscoveryOutcomeCode,
     EmailRejectionCode,
     ExtractionOutcomeCode,
@@ -481,4 +483,103 @@ class SiteScanResult:
     page_records: tuple[PageScanRecord, ...]
     email_findings: tuple[EmailFinding, ...]
     rejected_email_candidates: tuple[RejectedEmailCandidate, ...]
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchScanConfig:
+    """Configuration options for multi-URL batch scan orchestration."""
+
+    max_inputs: int = 100
+    global_concurrency: int = 5
+    per_domain_concurrency: int = 1
+    default_minimum_domain_interval_seconds: float = 1.0
+    coalesce_duplicate_urls: bool = True
+    max_elapsed_batch_seconds: float | None = 300.0
+    site_scan_config: SiteScanConfig = field(default_factory=SiteScanConfig)
+
+    def __post_init__(self) -> None:
+        from email_scanner.errors import BatchScanConfigError, BatchScanConfigErrorCode
+
+        def _check_finite(val: float, name: str) -> None:
+            if math.isnan(val) or math.isinf(val):
+                raise BatchScanConfigError(
+                    BatchScanConfigErrorCode.NON_FINITE_VALUE,
+                    f"{name} must be a finite number",
+                )
+
+        _check_finite(
+            self.default_minimum_domain_interval_seconds,
+            "default_minimum_domain_interval_seconds",
+        )
+        if self.max_elapsed_batch_seconds is not None:
+            _check_finite(self.max_elapsed_batch_seconds, "max_elapsed_batch_seconds")
+            if self.max_elapsed_batch_seconds <= 0.0:
+                raise BatchScanConfigError(
+                    BatchScanConfigErrorCode.INVALID_INTERVAL,
+                    "max_elapsed_batch_seconds must be positive",
+                )
+
+        if self.max_inputs < 1:
+            raise BatchScanConfigError(
+                BatchScanConfigErrorCode.INVALID_LIMIT,
+                "max_inputs must be at least 1",
+            )
+        if self.global_concurrency < 1:
+            raise BatchScanConfigError(
+                BatchScanConfigErrorCode.INVALID_LIMIT,
+                "global_concurrency must be at least 1",
+            )
+        if self.per_domain_concurrency < 1:
+            raise BatchScanConfigError(
+                BatchScanConfigErrorCode.INVALID_LIMIT,
+                "per_domain_concurrency must be at least 1",
+            )
+        if self.default_minimum_domain_interval_seconds < 0.0:
+            raise BatchScanConfigError(
+                BatchScanConfigErrorCode.INVALID_INTERVAL,
+                "default_minimum_domain_interval_seconds must be non-negative",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class BatchScanItem:
+    """Result record for an individual input item within a batch scan."""
+
+    original_index: int
+    original_input: str
+    normalized_url: str | None
+    outcome: BatchItemOutcome
+    is_duplicate: bool
+    duplicate_of_index: int | None
+    result: SiteScanResult | None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchScanStatistics:
+    """Deterministic counters and metrics for a multi-URL batch scan."""
+
+    total_inputs: int
+    valid_inputs: int
+    invalid_inputs: int
+    unique_normalized_urls: int
+    duplicate_coalesced_items: int
+    started_scans: int
+    completed_scans: int
+    failed_scans: int
+    cancelled_scans: int
+    peak_global_concurrency: int
+    peak_per_domain_concurrency: int
+    elapsed_seconds: float
+    stop_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BatchScanResult:
+    """Typed result of a multi-URL batch scan execution."""
+
+    outcome: BatchScanOutcome
+    statistics: BatchScanStatistics
+    items: tuple[BatchScanItem, ...]
     error_message: str | None = None

@@ -1,5 +1,6 @@
 """Independent scanner core for the Email Discovery SaaS."""
 
+from email_scanner.batch_orchestration import BatchScanOrchestrator
 from email_scanner.discovery import HTMLLinkExtractor, discover_and_rank_links
 from email_scanner.dns import AsyncDNSResolver, SystemDNSResolver
 from email_scanner.email_extraction import HTMLEmailExtractor
@@ -10,6 +11,10 @@ from email_scanner.email_pipeline import (
 )
 from email_scanner.email_validation import validate_email_candidate
 from email_scanner.errors import (
+    BatchItemOutcome,
+    BatchScanConfigError,
+    BatchScanConfigErrorCode,
+    BatchScanOutcome,
     DiscoveryConfigError,
     DiscoveryConfigErrorCode,
     DiscoveryOutcomeCode,
@@ -33,6 +38,10 @@ from email_scanner.errors import (
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
 from email_scanner.models import (
+    BatchScanConfig,
+    BatchScanItem,
+    BatchScanResult,
+    BatchScanStatistics,
     CrawlScopeMode,
     DiscoveredLink,
     DiscoveryConfig,
@@ -60,6 +69,11 @@ from email_scanner.models import (
 from email_scanner.normalization import normalize_url
 from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.ranking import RANKING_VERSION, calculate_page_score, rank_pages
+from email_scanner.request_gate import (
+    DomainRequestGate,
+    RequestGateProtocol,
+    get_domain_key,
+)
 from email_scanner.robots import RobotsPolicyEvaluator
 from email_scanner.scope import (
     is_asset_url,
@@ -72,6 +86,15 @@ __all__ = [
     "RANKING_VERSION",
     "AsyncDNSResolver",
     "AsyncHTTPFetcher",
+    "BatchItemOutcome",
+    "BatchScanConfig",
+    "BatchScanConfigError",
+    "BatchScanConfigErrorCode",
+    "BatchScanItem",
+    "BatchScanOrchestrator",
+    "BatchScanOutcome",
+    "BatchScanResult",
+    "BatchScanStatistics",
     "CrawlScopeMode",
     "DiscoveredLink",
     "DiscoveryConfig",
@@ -80,6 +103,7 @@ __all__ = [
     "DiscoveryOutcomeCode",
     "DiscoveryResult",
     "DomainAffinity",
+    "DomainRequestGate",
     "EmailCategory",
     "EmailDisposition",
     "EmailExtractionConfig",
@@ -106,6 +130,7 @@ __all__ = [
     "RankedPage",
     "RedirectHop",
     "RejectedEmailCandidate",
+    "RequestGateProtocol",
     "RobotsDecision",
     "RobotsDecisionCode",
     "RobotsPolicyEvaluator",
@@ -124,6 +149,7 @@ __all__ = [
     "classify_email_category",
     "discover_and_rank_links",
     "extract_emails",
+    "get_domain_key",
     "is_asset_url",
     "is_in_scope",
     "is_same_origin",

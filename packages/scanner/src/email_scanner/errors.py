@@ -211,3 +211,46 @@ class SiteScanConfigError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class BatchScanOutcome(StrEnum):
+    """Stable status codes representing the overall outcome of a multi-URL batch scan."""
+
+    COMPLETED = "COMPLETED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class BatchItemOutcome(StrEnum):
+    """Stable status codes representing the outcome of an individual item in a batch scan."""
+
+    COMPLETED = "COMPLETED"
+    COMPLETED_NO_EMAILS = "COMPLETED_NO_EMAILS"
+    PARTIAL = "PARTIAL"
+    ROBOTS_BLOCKED = "ROBOTS_BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    DUPLICATE_COALESCED = "DUPLICATE_COALESCED"
+    INVALID_INPUT = "INVALID_INPUT"
+    SKIPPED_BUDGET_REACHED = "SKIPPED_BUDGET_REACHED"
+
+
+class BatchScanConfigErrorCode(StrEnum):
+    """Stable error codes for invalid batch scan configuration."""
+
+    INVALID_LIMIT = "INVALID_LIMIT"
+    INVALID_INTERVAL = "INVALID_INTERVAL"
+    NON_FINITE_VALUE = "NON_FINITE_VALUE"
+
+
+class BatchScanConfigError(ValueError):
+    """Raised when a BatchScanConfig instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: BatchScanConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

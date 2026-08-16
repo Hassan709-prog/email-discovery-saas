@@ -23,6 +23,10 @@ from email_scanner.models import (
     RedirectHop,
 )
 from email_scanner.normalization import normalize_url
+from email_scanner.request_gate import (
+    DomainRequestGate,
+    RequestGateProtocol,
+)
 
 
 class AsyncHTTPFetcher:
@@ -34,15 +38,21 @@ class AsyncHTTPFetcher:
         client: httpx.AsyncClient | None = None,
         config: FetchConfig | None = None,
         redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+        request_gate: RequestGateProtocol | None = None,
     ) -> None:
         self._dns_resolver = dns_resolver or SystemDNSResolver()
         self._client = client
         self._config = config or FetchConfig()
         self._redirect_validator = redirect_validator
+        self._request_gate: RequestGateProtocol = request_gate or DomainRequestGate()
 
     @property
     def config(self) -> FetchConfig:
         return self._config
+
+    @property
+    def request_gate(self) -> RequestGateProtocol:
+        return self._request_gate
 
     async def fetch(
         self,
@@ -125,6 +135,9 @@ class AsyncHTTPFetcher:
                         outcome=FetchOutcomeCode.INVALID_URL,
                         error_message=f"Unsupported scheme: {current_url.scheme}",
                     )
+
+                # Acquire permission from domain request gate before HTTP request attempt
+                await self._request_gate.acquire(current_url)
 
                 try:
                     async with client.stream(

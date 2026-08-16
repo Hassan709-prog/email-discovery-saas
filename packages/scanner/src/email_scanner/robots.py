@@ -4,6 +4,7 @@ Fetches and evaluates robots.txt rules for target URLs with in-memory TTL
 caching and deterministic clock support.
 """
 
+import asyncio
 import time
 import urllib.robotparser
 from collections.abc import Callable
@@ -60,6 +61,7 @@ def _extract_crawl_delay(
         parts = line.split(":", 1)
         if len(parts) != 2:
             continue
+
         key = parts[0].strip().lower()
         val = parts[1].strip()
 
@@ -68,39 +70,47 @@ def _extract_crawl_delay(
                 current_agents = []
                 in_user_agent_block = True
             current_agents.append(val.lower())
+        elif key == "crawl-delay":
+            in_user_agent_block = False
+            try:
+                parsed_val = float(val)
+                if any(agent == token_lower for agent in current_agents):
+                    matched_delay = parsed_val
+                elif any(agent == "*" for agent in current_agents):
+                    wildcard_delay = parsed_val
+            except ValueError:
+                pass
         else:
             in_user_agent_block = False
-            if key == "crawl-delay":
-                try:
-                    parsed_val = float(val)
-                    for agent in current_agents:
-                        if agent != "*" and (agent in token_lower or token_lower in agent):
-                            matched_delay = parsed_val
-                        elif agent == "*" and wildcard_delay is None:
-                            wildcard_delay = parsed_val
-                except ValueError:
-                    pass
 
-    return matched_delay if matched_delay is not None else wildcard_delay
+    if matched_delay is not None:
+        return matched_delay
+    return wildcard_delay
 
 
 class RobotsPolicyEvaluator:
-    """Evaluates robots.txt rules for target URLs with in-memory TTL caching."""
+    """Evaluates robots.txt rules with TTL caching and single-flight misses."""
 
     def __init__(
         self,
         fetcher: AsyncHTTPFetcher | None = None,
-        config: FetchConfig | None = None,
-        cache_ttl: float = 3600.0,
-        temp_fail_ttl: float = 60.0,
         clock: Callable[[], float] | None = None,
+        cache_ttl_seconds: float = 3600.0,
+        temp_fail_ttl_seconds: float = 60.0,
+        config: FetchConfig | None = None,
+        cache_ttl: float | None = None,
     ) -> None:
         self._fetcher = fetcher or AsyncHTTPFetcher(config=config)
-        self._config = config or self._fetcher.config
-        self._cache_ttl = cache_ttl
-        self._temp_fail_ttl = temp_fail_ttl
         self._clock = clock or time.monotonic
+        self._cache_ttl = cache_ttl if cache_ttl is not None else cache_ttl_seconds
+        self._temp_fail_ttl = temp_fail_ttl_seconds
         self._cache: dict[tuple[str, str], _CachedRobotsPolicy] = {}
+        self._single_flight_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._config = config or self._fetcher.config
+
+    @property
+    def config(self) -> FetchConfig:
+        return self._config
 
     def _get_origin(self, url: NormalizedURL) -> str:
         if url.port:
@@ -112,7 +122,7 @@ class RobotsPolicyEvaluator:
         url: str | NormalizedURL,
         user_agent_token: str | None = None,
     ) -> RobotsDecision:
-        """Evaluate robots.txt policy for a target URL."""
+        """Evaluate robots.txt policy for a target URL asynchronously."""
         if isinstance(url, str):
             try:
                 target_url = normalize_url(url)
@@ -133,20 +143,31 @@ class RobotsPolicyEvaluator:
 
         cached_policy = self._cache.get(cache_key)
         if cached_policy is None or now >= cached_policy.expires_at:
-            robots_url_str = f"{origin}/robots.txt"
+            if cache_key not in self._single_flight_locks:
+                self._single_flight_locks[cache_key] = asyncio.Lock()
+            lock = self._single_flight_locks[cache_key]
 
-            robots_result = await self._fetcher.fetch(
-                robots_url_str,
-                allowed_content_types=(
-                    "text/plain",
-                    "text/robots.txt",
-                    "text/html",
-                    "application/xhtml+xml",
-                ),
-            )
+            async with lock:
+                now = self._clock()
+                cached_policy = self._cache.get(cache_key)
+                if cached_policy is None or now >= cached_policy.expires_at:
+                    robots_url_str = f"{origin}/robots.txt"
 
-            cached_policy = self._build_policy(robots_result, token, now)
-            self._cache[cache_key] = cached_policy
+                    robots_result = await self._fetcher.fetch(
+                        robots_url_str,
+                        allowed_content_types=(
+                            "text/plain",
+                            "text/robots.txt",
+                            "text/html",
+                            "application/xhtml+xml",
+                        ),
+                    )
+
+                    cached_policy = self._build_policy(robots_result, token, now)
+                    self._cache[cache_key] = cached_policy
+
+        if cached_policy.crawl_delay is not None:
+            self._fetcher.request_gate.update_domain_interval(target_url, cached_policy.crawl_delay)
 
         return self._evaluate_cached_policy(cached_policy, target_url.normalized_url, token)
 

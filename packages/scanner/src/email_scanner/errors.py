@@ -61,6 +61,8 @@ class FetchOutcomeCode(StrEnum):
     MAX_REDIRECTS_EXCEEDED = "MAX_REDIRECTS_EXCEEDED"
     UNSAFE_HOST = "UNSAFE_HOST"
     DNS_RESOLUTION_FAILED = "DNS_RESOLUTION_FAILED"
+    TLS_VERIFICATION_FAILED = "TLS_VERIFICATION_FAILED"
+    OUT_OF_SCOPE_REDIRECT = "OUT_OF_SCOPE_REDIRECT"
     RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
     UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE"
     TIMEOUT = "TIMEOUT"
@@ -250,6 +252,42 @@ class BatchScanConfigError(ValueError):
     def __init__(
         self,
         code: BatchScanConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+class RetryReason(StrEnum):
+    """Stable reason codes for HTTP request retries."""
+
+    TIMEOUT = "TIMEOUT"
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    HTTP_STATUS = "HTTP_STATUS"
+    RETRY_AFTER_HEADER = "RETRY_AFTER_HEADER"
+
+
+class DelaySource(StrEnum):
+    """Source of backoff delay calculation."""
+
+    EXPONENTIAL_BACKOFF = "EXPONENTIAL_BACKOFF"
+    RETRY_AFTER_HEADER = "RETRY_AFTER_HEADER"
+
+
+class RetryPolicyErrorCode(StrEnum):
+    """Stable error codes for invalid retry policy configuration."""
+
+    INVALID_LIMIT = "INVALID_LIMIT"
+    INVALID_INTERVAL = "INVALID_INTERVAL"
+    NON_FINITE_VALUE = "NON_FINITE_VALUE"
+
+
+class RetryPolicyError(ValueError):
+    """Raised when a RetryPolicy instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: RetryPolicyErrorCode,
         message: str,
     ) -> None:
         self.code = code

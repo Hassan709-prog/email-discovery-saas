@@ -172,7 +172,6 @@ class SiteScanOrchestrator:
         pages_fetched = 0
         pages_blocked_by_robots = 0
         pages_failed = 0
-
         last_request_time: float | None = None
         stop_reason = "QUEUE_EXHAUSTED"
 
@@ -193,16 +192,10 @@ class SiteScanOrchestrator:
                 stop_reason = "MAX_PAGES_REACHED"
                 break
 
-            # Check email finding budget
-            if len(global_accepted_map) >= cfg.max_email_findings:
-                stop_reason = "MAX_EMAIL_FINDINGS_REACHED"
-                break
-
             # Pop highest priority URL
             queue_item = heapq.heappop(queue)
             url_str = queue_item.url
             depth = queue_item.depth
-
             if url_str in visited_urls:
                 continue
 

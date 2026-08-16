@@ -25,6 +25,7 @@ from email_scanner.models import (
     SiteScanResult,
 )
 from email_scanner.orchestration import SiteScanOrchestrator
+from email_scanner.pinned_transport import PinnedAsyncHTTPTransport
 from email_scanner.request_gate import DomainRequestGate
 from email_scanner.robots import RobotsPolicyEvaluator
 
@@ -49,7 +50,7 @@ async def run_scan_cli(args: argparse.Namespace) -> tuple[int, str]:
     """Execute single scan CLI asynchronously with guaranteed resource cleanup."""
     sys.stderr.write(
         "WARNING: email_scanner CLI is experimental. "
-        "Note: DNS pre-checking does not yet provide connection pinning against rebinding.\n"
+        "All network requests use DNS-pinned transport and bounded rate limiting.\n"
     )
 
     try:
@@ -72,27 +73,32 @@ async def run_scan_cli(args: argparse.Namespace) -> tuple[int, str]:
     gate = DomainRequestGate(
         default_minimum_interval_seconds=config.minimum_request_interval_seconds
     )
-    async with httpx.AsyncClient(follow_redirects=False) as client:
-        fetcher = AsyncHTTPFetcher(client=client, config=config.fetch_config, request_gate=gate)
-        robots = RobotsPolicyEvaluator(fetcher=fetcher)
-        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+    async with PinnedAsyncHTTPTransport(
+        pinning_config=config.fetch_config.pinning_config
+    ) as transport:
+        async with httpx.AsyncClient(
+            transport=transport, follow_redirects=False, trust_env=False
+        ) as client:
+            fetcher = AsyncHTTPFetcher(client=client, config=config.fetch_config, request_gate=gate)
+            robots = RobotsPolicyEvaluator(fetcher=fetcher)
+            orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
 
-        try:
-            result: SiteScanResult = await orchestrator.scan(args.url, config=config)
-        except URLNormalizationError as err:
-            error_json = json.dumps(
-                {"error": "Invalid starting URL", "code": err.code.value, "message": str(err)},
-                indent=2,
-                sort_keys=True,
-            )
-            return (1, error_json)
-        except Exception as err:
-            error_json = json.dumps(
-                {"error": "Unexpected scan exception", "message": str(err)},
-                indent=2,
-                sort_keys=True,
-            )
-            return (4, error_json)
+            try:
+                result: SiteScanResult = await orchestrator.scan(args.url, config=config)
+            except URLNormalizationError as err:
+                error_json = json.dumps(
+                    {"error": "Invalid starting URL", "code": err.code.value, "message": str(err)},
+                    indent=2,
+                    sort_keys=True,
+                )
+                return (1, error_json)
+            except Exception as err:
+                error_json = json.dumps(
+                    {"error": "Unexpected scan exception", "message": str(err)},
+                    indent=2,
+                    sort_keys=True,
+                )
+                return (4, error_json)
 
     serialized = serialize_scan_result(result)
     output_json = json.dumps(serialized, indent=2, sort_keys=True)
@@ -114,7 +120,7 @@ async def run_scan_batch_cli(args: argparse.Namespace) -> tuple[int, str]:
     """Execute multi-URL batch scan CLI with bounded line streaming and resource cleanup."""
     sys.stderr.write(
         "WARNING: email_scanner CLI is experimental. "
-        "Note: DNS pre-checking does not yet provide connection pinning against rebinding.\n"
+        "All network requests use DNS-pinned transport and bounded rate limiting.\n"
     )
 
     try:
@@ -189,28 +195,33 @@ async def run_scan_batch_cli(args: argparse.Namespace) -> tuple[int, str]:
         default_minimum_interval_seconds=batch_config.default_minimum_domain_interval_seconds
     )
 
-    async with httpx.AsyncClient(follow_redirects=False) as client:
-        fetcher = AsyncHTTPFetcher(
-            client=client,
-            config=batch_config.site_scan_config.fetch_config,
-            request_gate=gate,
-        )
-        robots = RobotsPolicyEvaluator(fetcher=fetcher)
-        orchestrator = BatchScanOrchestrator(
-            request_gate=gate, fetcher=fetcher, robots_evaluator=robots
-        )
+    async with PinnedAsyncHTTPTransport(
+        pinning_config=batch_config.site_scan_config.fetch_config.pinning_config
+    ) as transport:
+        async with httpx.AsyncClient(
+            transport=transport, follow_redirects=False, trust_env=False
+        ) as client:
+            fetcher = AsyncHTTPFetcher(
+                client=client,
+                config=batch_config.site_scan_config.fetch_config,
+                request_gate=gate,
+            )
+            robots = RobotsPolicyEvaluator(fetcher=fetcher)
+            orchestrator = BatchScanOrchestrator(
+                request_gate=gate, fetcher=fetcher, robots_evaluator=robots
+            )
 
-        try:
-            result: BatchScanResult = await orchestrator.scan_batch(
-                input_lines, config=batch_config
-            )
-        except Exception as err:
-            error_json = json.dumps(
-                {"error": "Unexpected batch scan exception", "message": str(err)},
-                indent=2,
-                sort_keys=True,
-            )
-            return (4, error_json)
+            try:
+                result: BatchScanResult = await orchestrator.scan_batch(
+                    input_lines, config=batch_config
+                )
+            except Exception as err:
+                error_json = json.dumps(
+                    {"error": "Unexpected batch scan exception", "message": str(err)},
+                    indent=2,
+                    sort_keys=True,
+                )
+                return (4, error_json)
 
     serialized = serialize_scan_result(result)
     output_json = json.dumps(serialized, indent=2, sort_keys=True)

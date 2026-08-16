@@ -1,6 +1,7 @@
 """Typed values returned by scanner-core."""
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from email_scanner.errors import (
@@ -8,7 +9,9 @@ from email_scanner.errors import (
     EmailRejectionCode,
     ExtractionOutcomeCode,
     FetchOutcomeCode,
+    PageScanOutcome,
     RobotsDecisionCode,
+    SiteScanOutcome,
 )
 
 
@@ -367,4 +370,115 @@ class EmailExtractionResult:
     findings: tuple[EmailFinding, ...]
     rejected_candidates: tuple[RejectedEmailCandidate, ...]
     outcome: ExtractionOutcomeCode
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SiteScanConfig:
+    """Configuration options for deterministic single-site scan orchestration."""
+
+    max_pages: int = 10
+    max_depth: int = 2
+    max_total_discovered_urls: int = 100
+    max_email_findings: int = 50
+    max_rejected_candidates: int = 500
+    minimum_request_interval_seconds: float = 1.0
+    max_elapsed_seconds: float | None = 60.0
+    fetch_config: FetchConfig = field(default_factory=FetchConfig)
+    discovery_config: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    email_config: EmailExtractionConfig = field(default_factory=EmailExtractionConfig)
+
+    def __post_init__(self) -> None:
+        from email_scanner.errors import SiteScanConfigError, SiteScanConfigErrorCode
+
+        def _check_finite(val: float, name: str) -> None:
+            if math.isnan(val) or math.isinf(val):
+                raise SiteScanConfigError(
+                    SiteScanConfigErrorCode.NON_FINITE_VALUE,
+                    f"{name} must be a finite number",
+                )
+
+        _check_finite(self.minimum_request_interval_seconds, "minimum_request_interval_seconds")
+        if self.max_elapsed_seconds is not None:
+            _check_finite(self.max_elapsed_seconds, "max_elapsed_seconds")
+            if self.max_elapsed_seconds <= 0.0:
+                raise SiteScanConfigError(
+                    SiteScanConfigErrorCode.INVALID_INTERVAL,
+                    "max_elapsed_seconds must be positive",
+                )
+
+        if self.max_pages < 1:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_LIMIT,
+                "max_pages must be at least 1",
+            )
+        if self.max_depth < 0:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_LIMIT,
+                "max_depth must be non-negative",
+            )
+        if self.max_total_discovered_urls < 1:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_LIMIT,
+                "max_total_discovered_urls must be at least 1",
+            )
+        if self.max_email_findings < 1:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_LIMIT,
+                "max_email_findings must be at least 1",
+            )
+        if self.max_rejected_candidates < 1:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_LIMIT,
+                "max_rejected_candidates must be at least 1",
+            )
+        if self.minimum_request_interval_seconds < 0.0:
+            raise SiteScanConfigError(
+                SiteScanConfigErrorCode.INVALID_INTERVAL,
+                "minimum_request_interval_seconds must be non-negative",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PageScanRecord:
+    """Record of an individual page scan step within a site scan."""
+
+    requested_url: str
+    final_url: str | None
+    depth: int
+    outcome: PageScanOutcome
+    status_code: int | None
+    robots_decision: RobotsDecision
+    fetch_result: FetchResult | None
+    emails_found_count: int
+    links_discovered_count: int
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SiteScanStatistics:
+    """Deterministic counters and metrics for a site scan."""
+
+    pages_queued: int
+    pages_attempted: int
+    pages_fetched: int
+    pages_blocked_by_robots: int
+    pages_failed: int
+    urls_discovered: int
+    accepted_email_findings: int
+    rejected_email_candidates: int
+    elapsed_seconds: float
+    stop_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SiteScanResult:
+    """Typed result of a single-site orchestration scan."""
+
+    starting_url: str
+    outcome: SiteScanOutcome
+    statistics: SiteScanStatistics
+    page_records: tuple[PageScanRecord, ...]
+    email_findings: tuple[EmailFinding, ...]
+    rejected_email_candidates: tuple[RejectedEmailCandidate, ...]
     error_message: str | None = None

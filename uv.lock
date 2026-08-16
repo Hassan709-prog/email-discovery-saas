@@ -2,6 +2,12 @@ version = 1
 revision = 3
 requires-python = "==3.14.*"
 
+[manifest]
+members = [
+    "email-discovery-saas",
+    "email-discovery-scanner",
+]
+
 [[package]]
 name = "colorama"
 version = "0.4.6"
@@ -54,6 +60,9 @@ wheels = [
 name = "email-discovery-saas"
 version = "0.1.0"
 source = { virtual = "." }
+dependencies = [
+    { name = "email-discovery-scanner" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -65,6 +74,7 @@ dev = [
 ]
 
 [package.metadata]
+requires-dist = [{ name = "email-discovery-scanner", editable = "packages/scanner" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -74,6 +84,30 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "ruff", specifier = ">=0.16.3" },
 ]
+
+[[package]]
+name = "email-discovery-scanner"
+version = "0.1.0"
+source = { editable = "packages/scanner" }
+
+[package.optional-dependencies]
+dev = [
+    { name = "hypothesis" },
+    { name = "pyright" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "hypothesis"

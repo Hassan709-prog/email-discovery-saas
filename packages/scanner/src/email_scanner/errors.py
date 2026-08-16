@@ -51,3 +51,47 @@ class HostSafetyError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class FetchOutcomeCode(StrEnum):
+    """Stable status codes representing the outcome of an HTTP fetch operation."""
+
+    SUCCESS = "SUCCESS"
+    HTTP_ERROR = "HTTP_ERROR"
+    MAX_REDIRECTS_EXCEEDED = "MAX_REDIRECTS_EXCEEDED"
+    UNSAFE_HOST = "UNSAFE_HOST"
+    DNS_RESOLUTION_FAILED = "DNS_RESOLUTION_FAILED"
+    RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
+    UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE"
+    TIMEOUT = "TIMEOUT"
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    INVALID_URL = "INVALID_URL"
+
+
+class RobotsDecisionCode(StrEnum):
+    """Stable decisions produced by the robots.txt policy evaluator."""
+
+    ALLOWED = "ALLOWED"
+    DISALLOWED = "DISALLOWED"
+    TEMPORARY_FAILURE = "TEMPORARY_FAILURE"
+
+
+class FetchConfigErrorCode(StrEnum):
+    """Stable error codes for invalid fetch configuration."""
+
+    INVALID_TIMEOUT = "INVALID_TIMEOUT"
+    INVALID_MAX_REDIRECTS = "INVALID_MAX_REDIRECTS"
+    INVALID_USER_AGENT = "INVALID_USER_AGENT"
+    INVALID_MAX_RESPONSE_BYTES = "INVALID_MAX_RESPONSE_BYTES"
+
+
+class FetchConfigError(ValueError):
+    """Raised when a FetchConfig instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: FetchConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

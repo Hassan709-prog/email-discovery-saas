@@ -3,6 +3,7 @@
 from dataclasses import FrozenInstanceError
 
 import pytest
+
 from email_scanner import (
     HostType,
     NormalizedURL,

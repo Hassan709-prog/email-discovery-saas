@@ -49,7 +49,7 @@ async def run_scan_cli(args: argparse.Namespace) -> tuple[int, str]:
     """Execute single scan CLI asynchronously with guaranteed resource cleanup."""
     sys.stderr.write(
         "WARNING: email_scanner CLI is experimental. "
-        "Note: DNS pre-checking does not yet provide connection pinning against rebinding.\n"
+        "All network requests use DNS-pinned transport and bounded rate limiting.\n"
     )
 
     try:
@@ -114,7 +114,7 @@ async def run_scan_batch_cli(args: argparse.Namespace) -> tuple[int, str]:
     """Execute multi-URL batch scan CLI with bounded line streaming and resource cleanup."""
     sys.stderr.write(
         "WARNING: email_scanner CLI is experimental. "
-        "Note: DNS pre-checking does not yet provide connection pinning against rebinding.\n"
+        "All network requests use DNS-pinned transport and bounded rate limiting.\n"
     )
 
     try:

@@ -24,11 +24,7 @@ class AsyncDNSResolver(Protocol):
     """Protocol for asynchronous DNS resolution and host safety checking."""
 
     async def resolve(self, url: NormalizedURL) -> tuple[str, ...]:
-        """Resolve host for a NormalizedURL and return safe IP addresses.
-
-        Returns a tuple of safe, deterministically sorted IP string addresses.
-        Raises HostSafetyError if DNS resolution fails or the host is unsafe.
-        """
+        """Resolve host for a NormalizedURL and return safe IP addresses."""
         ...
 
 
@@ -40,24 +36,65 @@ class SystemDNSResolver:
             return validate_public_host(url, ())
 
         port = url.port or (443 if url.scheme == "https" else 80)
+        return await self.resolve_host(url.hostname, port)
+
+    async def resolve_host(self, hostname: str, port: int = 80) -> tuple[str, ...]:
+        cleaned_host = hostname.strip().strip("[]")
+        if not cleaned_host:
+            raise HostSafetyError(
+                code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
+                message="Hostname string is empty",
+            )
+
+        # Check if hostname is an IP literal directly
+        try:
+            from ipaddress import ip_address
+
+            ip_obj = ip_address(cleaned_host)
+            fake_url = NormalizedURL(
+                original_url=f"http://{cleaned_host}",
+                normalized_url=f"http://{cleaned_host}",
+                scheme="https" if port == 443 else "http",
+                hostname=cleaned_host,
+                port=port if port not in (80, 443) else None,
+                path="/",
+                query="",
+                host_type=HostType.IPV6 if ip_obj.version == 6 else HostType.IPV4,
+                registrable_domain=None,
+            )
+            return validate_public_host(fake_url, ())
+        except ValueError:
+            pass
+
         try:
             results = await asyncio.to_thread(
                 socket.getaddrinfo,
-                url.hostname,
+                cleaned_host,
                 port,
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as err:
             raise HostSafetyError(
                 code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
-                message=f"DNS resolution failed for {url.hostname}: {err}",
+                message=f"DNS resolution failed for {cleaned_host}: {err}",
             ) from err
 
         addresses = tuple(str(res[4][0]) for res in results if res[4])
         if not addresses:
             raise HostSafetyError(
                 code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
-                message=f"No IP addresses resolved for {url.hostname}",
+                message=f"No IP addresses resolved for {cleaned_host}",
             )
 
-        return validate_public_host(url, addresses)
+        fake_url = NormalizedURL(
+            original_url=f"http://{cleaned_host}",
+            normalized_url=f"http://{cleaned_host}",
+            scheme="https" if port == 443 else "http",
+            hostname=cleaned_host,
+            port=port if port not in (80, 443) else None,
+            path="/",
+            query="",
+            host_type=HostType.DOMAIN,
+            registrable_domain=None,
+        )
+        return validate_public_host(fake_url, addresses)

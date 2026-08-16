@@ -173,6 +173,7 @@ name = "email-discovery-scanner"
 version = "0.1.0"
 source = { editable = "packages/scanner" }
 dependencies = [
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "tldextract" },
 ]
@@ -188,7 +189,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "httpcore", specifier = ">=1.0.0,<1.1.0" },
+    { name = "httpx", specifier = ">=0.28.0,<0.29.0" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },

@@ -7,6 +7,7 @@ from enum import StrEnum
 from email_scanner.errors import (
     BatchItemOutcome,
     BatchScanOutcome,
+    DelaySource,
     DiscoveryOutcomeCode,
     EmailRejectionCode,
     ExtractionOutcomeCode,
@@ -41,9 +42,109 @@ class NormalizedURL:
 
 
 @dataclass(frozen=True, slots=True)
-class FetchConfig:
-    """Configuration options for HTTP fetcher and robots.txt evaluation."""
+class PinningConfig:
+    """Configuration options for DNS IP pinning and failover."""
 
+    max_ip_failover_attempts: int = 3
+    allow_ipv6: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_ip_failover_attempts < 1:
+            raise ValueError("max_ip_failover_attempts must be at least 1")
+
+
+@dataclass(frozen=True, slots=True)
+class IPConnectionAttempt:
+    """Diagnostic evidence of an individual TCP connection attempt to a pinned IP."""
+
+    target_host: str
+    target_port: int
+    attempted_ip: str
+    success: bool
+    error_message: str | None = None
+    timestamp: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Configuration for deterministic bounded retry logic."""
+
+    max_attempts_per_hop: int = 3
+    max_total_fetch_attempts: int = 10
+    base_delay_seconds: float = 0.5
+    max_delay_seconds: float = 10.0
+    max_elapsed_retry_seconds: float = 30.0
+    max_retry_after_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        from email_scanner.errors import RetryPolicyError, RetryPolicyErrorCode
+
+        def _check_finite(val: float, name: str) -> None:
+            if math.isnan(val) or math.isinf(val):
+                raise RetryPolicyError(
+                    RetryPolicyErrorCode.NON_FINITE_VALUE,
+                    f"{name} must be a finite number",
+                )
+
+        _check_finite(self.base_delay_seconds, "base_delay_seconds")
+        _check_finite(self.max_delay_seconds, "max_delay_seconds")
+        _check_finite(self.max_elapsed_retry_seconds, "max_elapsed_retry_seconds")
+        _check_finite(self.max_retry_after_seconds, "max_retry_after_seconds")
+
+        if self.max_attempts_per_hop < 1:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_LIMIT,
+                "max_attempts_per_hop must be at least 1",
+            )
+        if self.max_total_fetch_attempts < 1:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_LIMIT,
+                "max_total_fetch_attempts must be at least 1",
+            )
+        if self.base_delay_seconds < 0.0:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_INTERVAL,
+                "base_delay_seconds must be non-negative",
+            )
+        if self.max_delay_seconds < 0.0:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_INTERVAL,
+                "max_delay_seconds must be non-negative",
+            )
+        if self.max_elapsed_retry_seconds < 0.0:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_INTERVAL,
+                "max_elapsed_retry_seconds must be non-negative",
+            )
+        if self.max_retry_after_seconds < 0.0:
+            raise RetryPolicyError(
+                RetryPolicyErrorCode.INVALID_INTERVAL,
+                "max_retry_after_seconds must be non-negative",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class FetchAttempt:
+    """Record of an individual HTTP request attempt during a fetch execution."""
+
+    hop_index: int
+    hop_attempt_number: int
+    global_attempt_number: int
+    request_url: str
+    status_code: int | None
+    outcome: FetchOutcomeCode
+    pinned_ip: str | None
+    delay_before_attempt_seconds: float
+    delay_source: DelaySource | None
+    connection_attempts: tuple[IPConnectionAttempt, ...]
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FetchConfig:
+    """Configuration parameters governing network fetches."""
+
+    timeout_total: float = 15.0
     timeout_connect: float = 5.0
     timeout_read: float = 10.0
     timeout_write: float = 5.0
@@ -56,6 +157,8 @@ class FetchConfig:
         "text/html",
         "application/xhtml+xml",
     )
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    pinning_config: PinningConfig = field(default_factory=PinningConfig)
 
     def __post_init__(self) -> None:
         from email_scanner.errors import FetchConfigError, FetchConfigErrorCode
@@ -112,6 +215,7 @@ class FetchResult:
     redirect_history: tuple[RedirectHop, ...]
     outcome: FetchOutcomeCode
     error_message: str | None = None
+    attempts: tuple[FetchAttempt, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

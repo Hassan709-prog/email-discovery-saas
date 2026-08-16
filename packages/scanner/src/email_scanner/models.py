@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-from email_scanner.errors import FetchOutcomeCode, RobotsDecisionCode
+from email_scanner.errors import DiscoveryOutcomeCode, FetchOutcomeCode, RobotsDecisionCode
 
 
 class HostType(StrEnum):
@@ -111,3 +111,138 @@ class RobotsDecision:
     decision: RobotsDecisionCode
     crawl_delay: float | None
     reason: str
+
+
+class CrawlScopeMode(StrEnum):
+    """Modes for crawl scope filtering."""
+
+    SAME_REGISTRABLE_DOMAIN = "SAME_REGISTRABLE_DOMAIN"
+    SAME_ORIGIN = "SAME_ORIGIN"
+
+
+_DEFAULT_IGNORED_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".ico",
+    ".bmp",
+    ".tiff",
+    ".mp4",
+    ".webm",
+    ".avi",
+    ".mov",
+    ".mkv",
+    ".flv",
+    ".mp3",
+    ".wav",
+    ".ogg",
+    ".m4a",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".rar",
+    ".bz2",
+    ".xz",
+    ".pdf",
+    ".exe",
+    ".dmg",
+    ".pkg",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".csv",
+    ".json",
+    ".xml",
+    ".css",
+    ".js",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryConfig:
+    """Configuration for HTML link discovery, scope filtering, and page ranking."""
+
+    scope_mode: CrawlScopeMode = CrawlScopeMode.SAME_REGISTRABLE_DOMAIN
+    max_html_chars: int = 1_000_000
+    max_raw_anchors: int = 2_000
+    max_discovered_links: int = 500
+    max_ranked_pages: int = 50
+    ignored_extensions: tuple[str, ...] = _DEFAULT_IGNORED_EXTENSIONS
+
+    def __post_init__(self) -> None:
+        from email_scanner.errors import DiscoveryConfigError, DiscoveryConfigErrorCode
+
+        if self.max_html_chars < 1:
+            raise DiscoveryConfigError(
+                DiscoveryConfigErrorCode.INVALID_LIMIT,
+                "max_html_chars must be at least 1.",
+            )
+        if self.max_raw_anchors < 1:
+            raise DiscoveryConfigError(
+                DiscoveryConfigErrorCode.INVALID_LIMIT,
+                "max_raw_anchors must be at least 1.",
+            )
+        if self.max_discovered_links < 1:
+            raise DiscoveryConfigError(
+                DiscoveryConfigErrorCode.INVALID_LIMIT,
+                "max_discovered_links must be at least 1.",
+            )
+        if self.max_ranked_pages < 1:
+            raise DiscoveryConfigError(
+                DiscoveryConfigErrorCode.INVALID_LIMIT,
+                "max_ranked_pages must be at least 1.",
+            )
+        if self.max_ranked_pages > self.max_discovered_links:
+            raise DiscoveryConfigError(
+                DiscoveryConfigErrorCode.INVALID_LIMIT,
+                "max_ranked_pages cannot exceed max_discovered_links.",
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredLink:
+    """A single HTML candidate link discovered on a source page."""
+
+    source_url: str
+    raw_href: str
+    normalized_url: str
+    link_text: str
+    is_same_origin: bool
+    is_same_registrable_domain: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RankedPage:
+    """An important candidate page prioritized for scanner operations."""
+
+    url: str
+    score: int
+    signals: tuple[str, ...]
+    ranking_version: str
+    discovered_link: DiscoveredLink | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryResult:
+    """Typed result of HTML link discovery and ranking."""
+
+    source_url: str
+    discovered_links: tuple[DiscoveredLink, ...]
+    ranked_pages: tuple[RankedPage, ...]
+    outcome: DiscoveryOutcomeCode
+    error_message: str | None = None

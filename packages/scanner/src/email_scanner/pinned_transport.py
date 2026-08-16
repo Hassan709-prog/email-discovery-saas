@@ -235,15 +235,14 @@ class PinnedAsyncHTTPTransport(httpx.AsyncBaseTransport):
             target=target_bytes,
         )
 
-        stream_obj: Any = None
-        if request.stream is not None:  # pyright: ignore[reportUnnecessaryComparison]
-            stream_obj = request.stream
+        content_obj: Any = request.stream
 
         httpcore_req = httpcore.Request(
             method=request.method.encode("ascii"),
             url=httpcore_url,
             headers=request.headers.raw,
-            stream=stream_obj,  # pyright: ignore[reportCallIssue]
+            content=content_obj,
+            extensions=request.extensions,
         )
 
         httpcore_resp = await self._pool.handle_async_request(httpcore_req)
@@ -257,12 +256,14 @@ class PinnedAsyncHTTPTransport(httpx.AsyncBaseTransport):
                     yield chunk
 
             async def aclose(self) -> None:
-                await self._core_stream.aclose()
+                if hasattr(self._core_stream, "aclose"):
+                    await self._core_stream.aclose()
 
         return httpx.Response(
             status_code=httpcore_resp.status,
             headers=httpcore_resp.headers,
             stream=_HTTPXByteStream(httpcore_resp.stream),
+            extensions=httpcore_resp.extensions,  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
             request=request,
         )
 

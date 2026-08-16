@@ -95,3 +95,32 @@ class FetchConfigError(ValueError):
     ) -> None:
         self.code = code
         super().__init__(message)
+
+
+class DiscoveryOutcomeCode(StrEnum):
+    """Stable status codes representing the outcome of HTML link discovery."""
+
+    SUCCESS = "SUCCESS"
+    NO_LINKS_DISCOVERED = "NO_LINKS_DISCOVERED"
+    INVALID_SOURCE_URL = "INVALID_SOURCE_URL"
+    HTML_TOO_LARGE = "HTML_TOO_LARGE"
+    PARSING_ERROR = "PARSING_ERROR"
+
+
+class DiscoveryConfigErrorCode(StrEnum):
+    """Stable error codes for invalid discovery configuration."""
+
+    INVALID_LIMIT = "INVALID_LIMIT"
+    INVALID_SCOPE_MODE = "INVALID_SCOPE_MODE"
+
+
+class DiscoveryConfigError(ValueError):
+    """Raised when a DiscoveryConfig instance contains invalid parameters."""
+
+    def __init__(
+        self,
+        code: DiscoveryConfigErrorCode,
+        message: str,
+    ) -> None:
+        self.code = code
+        super().__init__(message)

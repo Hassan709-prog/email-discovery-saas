@@ -94,6 +94,9 @@ def test_scan_job_counter_constraints_exist() -> None:
         "ck_scan_jobs_duplicate_le_total",
         "ck_scan_jobs_valid_dup_le_total",
         "ck_scan_jobs_processed_le_valid",
+        "ck_scan_jobs_next_event_seq_positive",
+        "ck_scan_jobs_fingerprint_hex",
+        "ck_scan_jobs_idempotency_fingerprint_pair",
     }
     assert expected_cks.issubset(ck_names)
 
@@ -151,7 +154,7 @@ def test_alembic_single_head_revision() -> None:
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "20260816_0001"
+    assert heads[0] == "20260816_0002"
 
 
 def test_enum_values_synchronized() -> None:

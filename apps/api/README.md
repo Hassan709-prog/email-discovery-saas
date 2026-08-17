@@ -51,10 +51,13 @@ FastAPI and PostgreSQL application service for Email Discovery SaaS.
 | `POST` | `/api/v1/scan-jobs/{job_id}/queue` | Queue Job | Transitions job from `DRAFT` to `QUEUED`. Persists intent state (worker dispatch deferred). |
 | `POST` | `/api/v1/scan-jobs/{job_id}/cancel` | Cancel Job | Transitions `QUEUED` $\rightarrow$ `CANCELLED` or `RUNNING` $\rightarrow$ `CANCELLING`. Replays return `200` without duplicate events. |
 
-### Authentication & Principal Security Model
-- **RequestPrincipal**: All endpoints require an authenticated `RequestPrincipal` containing tenant `organization_id` and `user_id`.
-- **Default 401 Unauthorized**: Requests without valid authentication return HTTP 401. Client-supplied tenant fields in request bodies or URLs are strictly forbidden and rejected (`extra="forbid"`).
-- **Development Identity Mode**: Optional dev identity header adapter (`X-Dev-User-ID`, `X-Dev-Organization-ID`) is disabled by default. Enabling requires `ALLOW_DEV_IDENTITY_HEADERS=true` and is rejected if environment is not `development`.
+### Authentication & Session Security (`/api/v1/auth`)
+- **Argon2id Password Hashing**: Passwords hashed with Argon2id (OWASP profile: 64MB memory, 3 iterations, 4 parallelism). Hashing runs off event loop via `asyncio.to_thread` with a bounded semaphore (`AUTH_HASH_CONCURRENCY_LIMIT`). Dummy hash is verified for missing users to mitigate account enumeration timing.
+- **HS256 JWT Access Tokens**: Short-lived JWT access tokens signed using fixed `HS256` algorithm. Explicit claim validation (`sub`, `org`, `ver`, `jti`, `typ="access"`, `iss`, `aud`, `iat`, `nbf`, `exp`). Reject booleans and malformed UUIDs with generic HTTP 401.
+- **Opaque Refresh Token Rotation**: 256-bit opaque refresh tokens stored only as SHA-256 digests. Atomic rotation under `SELECT ... FOR UPDATE`. Reusing a `ROTATED` refresh token revokes all sessions in the token family as `COMPROMISED` and commits the compromise before returning HTTP 401 (`REFRESH_REUSE_DETECTED`).
+- **HttpOnly Cookies & CSRF Defense**: Refresh tokens transmitted strictly in `HttpOnly` cookies (`Path=/api/v1/auth`, `SameSite=Lax`, `Secure` in prod). CSRF tokens stored as SHA-256 digests, sent as readable CSRF cookies, and validated against `X-CSRF-Token` headers using constant-time `hmac.compare_digest`.
+- **Global Auth Invalidation (`auth_version`)**: `POST /api/v1/auth/logout-all` atomically increments `User.auth_version` and revokes all refresh sessions. Access tokens fail immediately on next request because `RequestPrincipal` checks `user.auth_version`.
+- **Local Rate Limiting**: In-memory sliding window limiter bounds memory to max 10,000 keys. Distributed multi-server rate limiting is deferred to Redis.
 
 ### Idempotency-Key Header
 - Clients may supply an `Idempotency-Key` header (1-128 printable ASCII chars).

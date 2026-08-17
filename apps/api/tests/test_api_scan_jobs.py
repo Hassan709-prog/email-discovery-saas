@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from email_discovery_api.api.dependencies.identity import RequestPrincipal, get_current_principal
 from email_discovery_api.api.dependencies.services import get_scan_job_service
@@ -72,6 +73,8 @@ def test_dev_identity_headers_rejected_in_non_dev_environment() -> None:
     prod_settings = Settings(
         environment="production",
         allow_dev_identity_headers=True,
+        jwt_secret_key=SecretStr("a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6"),
+        cookie_secure=True,
     )
     with pytest.raises(ValueError, match="ALLOW_DEV_IDENTITY_HEADERS cannot be enabled"):
         create_app(prod_settings)

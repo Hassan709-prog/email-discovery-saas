@@ -69,3 +69,21 @@ async def get_db_session(request: Request) -> AsyncGenerator[AsyncSession]:
             raise
         finally:
             await session.close()
+
+
+async def get_identity_db_session(request: Request) -> AsyncGenerator[AsyncSession]:
+    """FastAPI dependency injecting a separate AsyncSession for authentication lookup.
+
+    Using a distinct dependency function provides a unique FastAPI dependency cache key,
+    ensuring identity resolution runs on an independent AsyncSession from application
+    service write transactions.
+    """
+    db_manager: DatabaseManager = request.app.state.db_manager
+    async with db_manager.session_factory() as session:
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()

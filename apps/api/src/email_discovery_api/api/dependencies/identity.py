@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from email_discovery_api.config import Settings, get_settings
-from email_discovery_api.database import get_db_session
+from email_discovery_api.database import get_identity_db_session
 from email_discovery_api.models import UserStatus
 from email_discovery_api.repositories.users import UserRepository
 from email_discovery_api.services.tokens import InvalidTokenError, TokenService
@@ -30,7 +30,7 @@ class RequestPrincipal:
 async def get_current_principal(
     request: Request,
     token: str | None = Depends(oauth2_scheme),
-    session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_identity_db_session),
     settings: Settings = Depends(get_settings),
 ) -> RequestPrincipal:
     """Dependency extracting OAuth2 Bearer token, confirming identity, or raising HTTP 401."""

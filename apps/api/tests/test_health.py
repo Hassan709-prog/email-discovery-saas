@@ -8,7 +8,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 
 from email_discovery_api.config import Settings
-from email_discovery_api.database import DatabaseManager, get_db_session
+from email_discovery_api.database import DatabaseManager, get_db_session, get_identity_db_session
 from email_discovery_api.logging import is_valid_request_id
 from email_discovery_api.main import create_app
 
@@ -178,6 +178,50 @@ async def test_get_db_session_lifecycle(test_app: FastAPI) -> None:
     with pytest.raises(RuntimeError, match="Service Error"):
         try:
             raise RuntimeError("Service Error")
+        except Exception as exc:
+            await gen_fail.athrow(exc)
+
+    mock_session_fail.rollback.assert_called_once()
+    mock_session_fail.close.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_get_identity_db_session_lifecycle(test_app: FastAPI) -> None:
+    """Verify get_identity_db_session yields session, rolls back on error, and closes cleanly."""
+    mock_session = AsyncMock()
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__.return_value = mock_session
+    mock_factory = MagicMock(return_value=mock_cm)
+    test_app.state.db_manager.session_factory = mock_factory
+
+    mock_request = MagicMock()
+    mock_request.app = test_app
+
+    # Normal yield and cleanup
+    gen = get_identity_db_session(mock_request)
+    session = await anext(gen)
+    assert session is mock_session
+
+    try:
+        await anext(gen)
+    except StopAsyncIteration:
+        pass
+
+    mock_session.close.assert_called_once()
+
+    # Exception rollback and cleanup
+    mock_session_fail = AsyncMock()
+    mock_cm_fail = AsyncMock()
+    mock_cm_fail.__aenter__.return_value = mock_session_fail
+    mock_factory_fail = MagicMock(return_value=mock_cm_fail)
+    test_app.state.db_manager.session_factory = mock_factory_fail
+
+    gen_fail = get_identity_db_session(mock_request)
+    await anext(gen_fail)
+
+    with pytest.raises(RuntimeError, match="Identity Session Error"):
+        try:
+            raise RuntimeError("Identity Session Error")
         except Exception as exc:
             await gen_fail.athrow(exc)
 

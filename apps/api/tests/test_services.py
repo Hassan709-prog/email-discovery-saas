@@ -161,11 +161,11 @@ async def test_create_job_success_workflow() -> None:
     service.url_repo.add_scan_urls = MagicMock()
     service.event_repo.append_event = MagicMock()
 
-    job = await service.create_job(cmd)
+    res = await service.create_job(cmd)
 
-    assert job.total_input_count == 2
-    assert job.valid_input_count == 1
-    assert job.duplicate_input_count == 1
+    assert res.job.total_input_count == 2
+    assert res.job.valid_input_count == 1
+    assert res.job.duplicate_input_count == 1
     assert service.job_repo.add_job.call_count == 1
     assert service.url_repo.add_scan_urls.call_count == 1
     assert service.event_repo.append_event.call_count == 1
@@ -207,8 +207,8 @@ async def test_idempotency_matching_and_conflict() -> None:
     service.job_repo.find_by_idempotency_key = AsyncMock(return_value=existing_job)
 
     # 1. Same fingerprint -> returns existing job
-    job = await service.create_job(cmd)
-    assert job.id == existing_job.id
+    res = await service.create_job(cmd)
+    assert res.job.id == existing_job.id
 
     # 2. Different fingerprint -> raises IDEMPOTENCY_CONFLICT
     existing_job.request_fingerprint = "different-fp-123"
@@ -248,7 +248,7 @@ async def test_uniqueness_race_recovery_on_integrity_error() -> None:
     service.job_repo.find_by_idempotency_key = AsyncMock(return_value=existing_job)
 
     recovered = await service.create_job(cmd)
-    assert recovered.id == existing_job.id
+    assert recovered.job.id == existing_job.id
     assert service.job_repo.find_by_idempotency_key.call_count == 1
 
 

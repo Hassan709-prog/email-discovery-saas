@@ -15,6 +15,7 @@ from email_discovery_api.models.enums import (
     MembershipRole,
     MembershipStatus,
     OrganizationStatus,
+    RefreshSessionStatus,
     ScanJobSourceType,
     ScanJobStatus,
     ScanURLStatus,
@@ -25,6 +26,7 @@ from email_discovery_api.models.job_event import JobEvent
 from email_discovery_api.models.membership import Membership
 from email_discovery_api.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 from email_discovery_api.models.organization import Organization
+from email_discovery_api.models.refresh_session import RefreshSession
 from email_discovery_api.models.rejected_email_candidate import RejectedEmailCandidate
 from email_discovery_api.models.scan_job import ScanJob
 from email_discovery_api.models.scan_url import ScanURL
@@ -48,6 +50,8 @@ __all__ = [
     "MembershipStatus",
     "Organization",
     "OrganizationStatus",
+    "RefreshSession",
+    "RefreshSessionStatus",
     "RejectedEmailCandidate",
     "ScanJob",
     "ScanJobSourceType",

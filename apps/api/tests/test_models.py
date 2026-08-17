@@ -27,7 +27,7 @@ def test_mapper_configuration() -> None:
 
 
 def test_metadata_tables_exist() -> None:
-    """Verify Base.metadata contains all core database tables including crawl result entities."""
+    """Verify Base.metadata contains all core database tables including auth and crawl results."""
     table_names = set(Base.metadata.tables.keys())
     expected_tables = {
         "organizations",
@@ -37,6 +37,7 @@ def test_metadata_tables_exist() -> None:
         "scan_urls",
         "job_events",
         "audit_logs",
+        "refresh_sessions",
         "crawl_attempts",
         "crawled_pages",
         "email_findings",

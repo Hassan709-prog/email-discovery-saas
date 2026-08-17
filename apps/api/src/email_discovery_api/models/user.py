@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import TIMESTAMP, CheckConstraint, String
+from sqlalchemy import TIMESTAMP, CheckConstraint, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from email_discovery_api.models.base import Base
@@ -25,6 +25,10 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             "status IN ('ACTIVE', 'SUSPENDED', 'DELETED')",
             name="ck_users_status",
         ),
+        CheckConstraint(
+            "auth_version >= 1",
+            name="ck_users_auth_version",
+        ),
     )
 
     email: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -42,6 +46,9 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         TIMESTAMP(timezone=True), nullable=True
     )
     last_login_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
     # Relationships
     memberships: Mapped[list[Membership]] = relationship(

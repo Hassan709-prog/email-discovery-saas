@@ -73,6 +73,15 @@ class ScanURLStatus(StrEnum):
     DUPLICATE = "DUPLICATE"
 
 
+class RefreshSessionStatus(StrEnum):
+    """Refresh session security lifecycle status."""
+
+    ACTIVE = "ACTIVE"
+    ROTATED = "ROTATED"
+    REVOKED = "REVOKED"
+    COMPROMISED = "COMPROMISED"
+
+
 class CrawlAttemptOutcome(StrEnum):
     """Execution outcome of a single crawl attempt."""
 

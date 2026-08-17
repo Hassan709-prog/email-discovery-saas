@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from email_discovery_api.services.auth import AuthServiceError
 from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 
 logger = logging.getLogger("email_discovery_api.api.errors")
@@ -128,9 +129,39 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     )
 
 
+AUTH_SERVICE_ERROR_STATUS_MAP: dict[str, int] = {
+    "INVALID_CREDENTIALS": status.HTTP_401_UNAUTHORIZED,
+    "INVALID_TOKEN": status.HTTP_401_UNAUTHORIZED,
+    "REFRESH_REUSE_DETECTED": status.HTTP_401_UNAUTHORIZED,
+    "CSRF_VALIDATION_FAILED": status.HTTP_401_UNAUTHORIZED,
+    "ORGANIZATION_SELECTION_REQUIRED": status.HTTP_400_BAD_REQUEST,
+    "EMAIL_OR_SLUG_CONFLICT": status.HTTP_409_CONFLICT,
+    "PASSWORD_POLICY_VIOLATION": status.HTTP_422_UNPROCESSABLE_ENTITY,
+    "RATE_LIMITED": status.HTTP_429_TOO_MANY_REQUESTS,
+}
+
+
+async def auth_service_error_handler(request: Request, exc: AuthServiceError) -> JSONResponse:
+    """Handle AuthServiceError exceptions by mapping to HTTP status codes and error envelopes."""
+    request_id = get_request_id(request)
+    status_code = AUTH_SERVICE_ERROR_STATUS_MAP.get(exc.code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+    headers: dict[str, str] = {}
+    if status_code == status.HTTP_401_UNAUTHORIZED:
+        headers["WWW-Authenticate"] = "Bearer"
+    if request_id:
+        headers["X-Request-ID"] = request_id
+
+    content = build_error_envelope(exc.code, exc.message, request_id)
+    if exc.details:
+        content["error"].update(exc.details)
+
+    return JSONResponse(status_code=status_code, content=content, headers=headers)
+
+
 def register_error_handlers(app: FastAPI) -> None:
     """Register all exception handlers on the FastAPI application instance."""
     app.add_exception_handler(ServiceError, cast(Any, service_error_handler))
+    app.add_exception_handler(AuthServiceError, cast(Any, auth_service_error_handler))
     app.add_exception_handler(HTTPException, cast(Any, http_exception_handler))
     app.add_exception_handler(RequestValidationError, cast(Any, validation_exception_handler))
     app.add_exception_handler(Exception, unhandled_exception_handler)

@@ -35,6 +35,52 @@ FastAPI and PostgreSQL application service for Email Discovery SaaS.
 
 ---
 
+## HTTP API Contracts (`/api/v1/scan-jobs`)
+
+### Endpoints Table
+
+| Method | Path | Summary | Description |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/api/v1/scan-jobs/preview` | Input Preview | Performs network-free URL input normalization & limit validation. Does not write to DB. |
+| `POST` | `/api/v1/scan-jobs` | Create Scan Job | Ingests inputs, checks quota & idempotency. Returns `201` + `Location` on creation; `200` on replay. |
+| `GET` | `/api/v1/scan-jobs` | List Jobs | Lists tenant jobs with keyset pagination (`created_at`, `id`) and optional status filter. |
+| `GET` | `/api/v1/scan-jobs/{job_id}` | Get Job Detail | Returns detail for authorized tenant job (HTTP 404 for missing or cross-tenant). |
+| `GET` | `/api/v1/scan-jobs/{job_id}/progress` | Get Job Progress | Returns execution progress derived from persisted database counters. |
+| `GET` | `/api/v1/scan-jobs/{job_id}/urls` | List Job URLs | Lists URL input rows with keyset pagination (`original_index`, `id`). |
+| `GET` | `/api/v1/scan-jobs/{job_id}/events` | List Job Events | Lists audit event history with sequence pagination (`sequence_number`, `id`). |
+| `POST` | `/api/v1/scan-jobs/{job_id}/queue` | Queue Job | Transitions job from `DRAFT` to `QUEUED`. Persists intent state (worker dispatch deferred). |
+| `POST` | `/api/v1/scan-jobs/{job_id}/cancel` | Cancel Job | Transitions `QUEUED` $\rightarrow$ `CANCELLED` or `RUNNING` $\rightarrow$ `CANCELLING`. Replays return `200` without duplicate events. |
+
+### Authentication & Principal Security Model
+- **RequestPrincipal**: All endpoints require an authenticated `RequestPrincipal` containing tenant `organization_id` and `user_id`.
+- **Default 401 Unauthorized**: Requests without valid authentication return HTTP 401. Client-supplied tenant fields in request bodies or URLs are strictly forbidden and rejected (`extra="forbid"`).
+- **Development Identity Mode**: Optional dev identity header adapter (`X-Dev-User-ID`, `X-Dev-Organization-ID`) is disabled by default. Enabling requires `ALLOW_DEV_IDENTITY_HEADERS=true` and is rejected if environment is not `development`.
+
+### Idempotency-Key Header
+- Clients may supply an `Idempotency-Key` header (1-128 printable ASCII chars).
+- Replayed identical requests return `HTTP 200 OK` with the same `Location` header.
+- Reusing a key with different request content returns `HTTP 409 Conflict`.
+
+### Keyset Cursor Pagination
+- Paginating endpoints return opaque `next_cursor` tokens (URL-safe base64 encoded JSON).
+- Enforces format version `1`, resource type match (`"jobs"`, `"urls"`, `"events"`), maximum byte size (512 bytes), and strict field schema.
+- Cursors encode boundary ordering values only and NEVER bypass tenant scoping.
+
+### Standard Error Response Envelope
+All API errors return a standard JSON error envelope:
+```json
+{
+  "error": {
+    "code": "STABLE_ERROR_CODE",
+    "message": "Safe human-readable error message.",
+    "request_id": "req-12345"
+  }
+}
+```
+Every response preserves the `X-Request-ID` header. Unhandled server errors return HTTP 500 with a generic message, while logging tracebacks server-side.
+
+---
+
 ## Developer Setup & Commands
 
 ### 1. Install & Sync Dependencies
@@ -47,23 +93,16 @@ Start local PostgreSQL with Docker Compose:
 ```bash
 docker compose -f infra/docker/docker-compose.yml up -d
 ```
-To stop the database while preserving data:
+
+Apply migrations:
 ```bash
-docker compose -f infra/docker/docker-compose.yml stop
-```
-To stop and remove containers while keeping persistent data volumes:
-```bash
-docker compose -f infra/docker/docker-compose.yml down
+uv run alembic -c apps/api/alembic.ini upgrade head
 ```
 
-> **Note on Migrations**: Migrations `20260816_0001_initial_schema` and `20260816_0002_idempotency_and_event_sequence` have been verified offline. Apply them to live PostgreSQL using:
-> ```bash
-> uv run alembic -c apps/api/alembic.ini upgrade head
-> ```
-
-### 3. Running Tests
+### 3. Running Code Quality & Test Suite
 ```bash
+uv run ruff format .
+uv run ruff check .
+uv run pyright
 uv run pytest
 ```
-
-> **Pending Live Concurrency Verification**: Row locking (`FOR UPDATE`), partial unique-index races, and atomic `UPDATE ... RETURNING` sequence allocation have been structurally verified via unit tests and will be subjected to live PostgreSQL multi-connection concurrency tests when Docker environment is active.

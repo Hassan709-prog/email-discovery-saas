@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     app_name: str = Field(default="email-discovery-api", description="Application service name")
     debug: bool = Field(default=False, description="Enable debug mode")
     log_level: str = Field(default="INFO", description="Logging output level")
+    allow_dev_identity_headers: bool = Field(
+        default=False,
+        validation_alias="ALLOW_DEV_IDENTITY_HEADERS",
+        description="Allow development X-Dev-User-ID and X-Dev-Organization-ID identity headers",
+    )
 
     # Database Settings
     database_url: SecretStr = Field(

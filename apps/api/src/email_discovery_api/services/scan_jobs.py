@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from email_discovery_api.api.dependencies.cursors import encode_cursor
 from email_discovery_api.models.enums import MembershipRole, ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
 from email_discovery_api.models.scan_job import ScanJob
@@ -40,11 +42,26 @@ ALLOWED_STATE_TRANSITIONS: dict[ScanJobStatus, set[ScanJobStatus]] = {
     ScanJobStatus.CANCELLING: {ScanJobStatus.CANCELLED},
 }
 
+TERMINAL_STATUSES: set[ScanJobStatus] = {
+    ScanJobStatus.CANCELLED,
+    ScanJobStatus.COMPLETED,
+    ScanJobStatus.COMPLETED_WITH_ERRORS,
+    ScanJobStatus.FAILED,
+}
+
 ALLOWED_ROLES: set[str] = {
     MembershipRole.OWNER.value,
     MembershipRole.ADMIN.value,
     MembershipRole.MEMBER.value,
 }
+
+
+@dataclass(frozen=True)
+class CreateJobResult:
+    """Result of job creation distinguishing newly created jobs from idempotent replays."""
+
+    job: ScanJob
+    created: bool
 
 
 def utc_now() -> datetime:
@@ -133,7 +150,7 @@ class ScanJobService:
         self.url_repo = ScanURLRepository(session)
         self.event_repo = JobEventRepository(session)
 
-    async def create_job(self, command: CreateScanJobCommand) -> ScanJob:
+    async def create_job(self, command: CreateScanJobCommand) -> CreateJobResult:
         """Create scan job, ingest inputs, allocate sequence 1, and append JOB_CREATED event.
 
         Pre-ingestion Order:
@@ -145,17 +162,13 @@ class ScanJobService:
             6. Parse & normalize inputs into ScanURL ORM objects
             7. Create ScanJob, ScanURL, allocate sequence 1, and append JOB_CREATED event
         """
-        # 1. Pre-ingestion limit policy validation before DB locks or row construction
         self.policy.validate_pre_ingestion(command.inputs, command.configuration_snapshot)
-
         fingerprint = compute_request_fingerprint(command)
 
         try:
             async with self.session.begin():
                 return await self._create_job_in_transaction(command, fingerprint)
         except IntegrityError as err:
-            # PostgreSQL aborts transaction on uniqueness conflict.
-            # Recover by starting a fresh transaction to tenant-scoped re-read the existing job.
             if command.idempotency_key:
                 async with self.session.begin():
                     existing = await self.job_repo.find_by_idempotency_key(
@@ -163,7 +176,7 @@ class ScanJobService:
                     )
                     if existing is not None:
                         if existing.request_fingerprint == fingerprint:
-                            return existing
+                            return CreateJobResult(job=existing, created=False)
                         raise ServiceError(
                             ServiceErrorCode.IDEMPOTENCY_CONFLICT,
                             f"Key {command.idempotency_key!r} used with different fingerprint.",
@@ -172,9 +185,8 @@ class ScanJobService:
 
     async def _create_job_in_transaction(
         self, command: CreateScanJobCommand, fingerprint: str
-    ) -> ScanJob:
+    ) -> CreateJobResult:
         """Internal job creation steps executed within an active transaction."""
-        # 2. Lock Organization FOR UPDATE to serialize creation per tenant
         org = await self.org_repo.get_active_organization_for_update(command.organization_id)
         if org is None:
             raise ServiceError(
@@ -182,7 +194,6 @@ class ScanJobService:
                 f"Organization {command.organization_id} was not found or is not active.",
             )
 
-        # 3. Check active membership and role
         membership = await self.org_repo.get_active_membership(
             command.organization_id, command.created_by_user_id
         )
@@ -192,7 +203,6 @@ class ScanJobService:
                 f"User {command.created_by_user_id} unauthorized for organization.",
             )
 
-        # 4. Enforce active job quota
         active_count = await self.job_repo.count_active_jobs(command.organization_id)
         if active_count >= self.policy.max_active_jobs_per_organization:
             raise ServiceError(
@@ -201,20 +211,18 @@ class ScanJobService:
                 f"{self.policy.max_active_jobs_per_organization}.",
             )
 
-        # 5. Check idempotency key if supplied
         if command.idempotency_key:
             existing = await self.job_repo.find_by_idempotency_key(
                 command.organization_id, command.idempotency_key
             )
             if existing is not None:
                 if existing.request_fingerprint == fingerprint:
-                    return existing
+                    return CreateJobResult(job=existing, created=False)
                 raise ServiceError(
                     ServiceErrorCode.IDEMPOTENCY_CONFLICT,
-                    f"Idempotency key {command.idempotency_key!r} used with different fingerprint.",
+                    f"Key {command.idempotency_key!r} used with different fingerprint.",
                 )
 
-        # 6. Parse and normalize URL inputs
         job_id = uuid.uuid4()
         scan_urls: list[ScanURL] = []
         seen_urls: dict[str, tuple[uuid.UUID, int]] = {}
@@ -272,7 +280,6 @@ class ScanJobService:
                     )
                 )
 
-        # 7. Create ScanJob entity
         job = ScanJob(
             id=job_id,
             organization_id=command.organization_id,
@@ -300,11 +307,9 @@ class ScanJobService:
         self.job_repo.add_job(job)
         self.url_repo.add_scan_urls(scan_urls)
 
-        # 8. Allocate event sequence 1 atomically
         seq = await self.job_repo.allocate_event_sequence(command.organization_id, job_id)
         assert seq == 1
 
-        # 9. Append JOB_CREATED event
         event = JobEvent(
             id=uuid.uuid4(),
             scan_job_id=job_id,
@@ -318,7 +323,111 @@ class ScanJobService:
         )
         self.event_repo.append_event(event)
 
+        return CreateJobResult(job=job, created=True)
+
+    async def get_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
+        """Fetch a job strictly scoped to tenant or raise JOB_NOT_FOUND."""
+        job = await self.job_repo.get_job(organization_id, job_id)
+        if job is None:
+            raise ServiceError(
+                ServiceErrorCode.JOB_NOT_FOUND,
+                f"Scan job {job_id} was not found for organization {organization_id}.",
+            )
         return job
+
+    async def list_jobs(
+        self,
+        organization_id: uuid.UUID,
+        *,
+        limit: int = 50,
+        cursor_created_at: datetime | None = None,
+        cursor_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> tuple[list[ScanJob], str | None]:
+        """List jobs tenant-scoped with keyset pagination returning items and next_cursor."""
+        fetch_limit = limit + 1
+        jobs = await self.job_repo.list_jobs(
+            organization_id,
+            limit=fetch_limit,
+            cursor_created_at=cursor_created_at,
+            cursor_id=cursor_id,
+            status=status,
+        )
+
+        next_cursor: str | None = None
+        if len(jobs) > limit:
+            has_more = jobs[:limit]
+            last_item = has_more[-1]
+            next_cursor = encode_cursor(
+                "jobs", [last_item.created_at.isoformat(), str(last_item.id)]
+            )
+            return has_more, next_cursor
+
+        return jobs, None
+
+    async def list_job_urls(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        *,
+        limit: int = 100,
+        cursor_index: int | None = None,
+        cursor_id: uuid.UUID | None = None,
+        status: str | None = None,
+    ) -> tuple[list[ScanURL], str | None]:
+        """List job URLs tenant-scoped with keyset pagination returning items and next_cursor."""
+        # Verify job exists for tenant first
+        await self.get_job(organization_id, job_id)
+
+        fetch_limit = limit + 1
+        urls = await self.url_repo.list_job_urls(
+            organization_id,
+            job_id,
+            limit=fetch_limit,
+            cursor_index=cursor_index,
+            cursor_id=cursor_id,
+            status=status,
+        )
+
+        next_cursor: str | None = None
+        if len(urls) > limit:
+            has_more = urls[:limit]
+            last_item = has_more[-1]
+            next_cursor = encode_cursor("urls", [last_item.original_index, str(last_item.id)])
+            return has_more, next_cursor
+
+        return urls, None
+
+    async def list_job_events(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        *,
+        limit: int = 100,
+        cursor_seq: int | None = None,
+        cursor_id: uuid.UUID | None = None,
+    ) -> tuple[list[JobEvent], str | None]:
+        """List job events tenant-scoped with keyset pagination returning items and next_cursor."""
+        # Verify job exists for tenant first
+        await self.get_job(organization_id, job_id)
+
+        fetch_limit = limit + 1
+        events = await self.event_repo.list_job_events(
+            organization_id,
+            job_id,
+            limit=fetch_limit,
+            cursor_seq=cursor_seq,
+            cursor_id=cursor_id,
+        )
+
+        next_cursor: str | None = None
+        if len(events) > limit:
+            has_more = events[:limit]
+            last_item = has_more[-1]
+            next_cursor = encode_cursor("events", [last_item.sequence_number, str(last_item.id)])
+            return has_more, next_cursor
+
+        return events, None
 
     async def transition_job_status(
         self,
@@ -326,7 +435,7 @@ class ScanJobService:
         job_id: uuid.UUID,
         new_status: ScanJobStatus,
     ) -> ScanJob:
-        """Perform a validated status transition and append a JOB_STATUS_CHANGED event."""
+        """Perform a validated status transition with strict idempotency and event logging."""
         async with self.session.begin():
             job = await self.job_repo.get_job(organization_id, job_id)
             if job is None:
@@ -336,6 +445,27 @@ class ScanJobService:
                 )
 
             current_status = ScanJobStatus(job.status)
+
+            # Idempotent replay handling (no duplicate events created)
+            if current_status == new_status:
+                if new_status in (
+                    ScanJobStatus.QUEUED,
+                    ScanJobStatus.CANCELLING,
+                    ScanJobStatus.CANCELLED,
+                ):
+                    return job
+
+            # Reject transition from terminal states
+            if current_status in TERMINAL_STATUSES:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Job {job_id} is in terminal state {current_status.value}.",
+                    details={
+                        "current_status": current_status.value,
+                        "requested_status": new_status.value,
+                    },
+                )
+
             allowed = ALLOWED_STATE_TRANSITIONS.get(current_status, set())
             if new_status not in allowed:
                 raise ServiceError(
@@ -373,7 +503,6 @@ class ScanJobService:
             )
 
             if not updated:
-                # Disambiguate staveness vs missing job
                 recheck = await self.job_repo.get_job(organization_id, job_id)
                 if recheck is None:
                     raise ServiceError(
@@ -400,7 +529,6 @@ class ScanJobService:
             )
             self.event_repo.append_event(event)
 
-            # Re-read updated job within transaction
             updated_job = await self.job_repo.get_job(organization_id, job_id)
             assert updated_job is not None
             return updated_job
@@ -409,13 +537,7 @@ class ScanJobService:
         self, organization_id: uuid.UUID, job_id: uuid.UUID
     ) -> ScanJobProgress:
         """Fetch derived progress response for job using persisted database counters."""
-        job = await self.job_repo.get_job(organization_id, job_id)
-        if job is None:
-            raise ServiceError(
-                ServiceErrorCode.JOB_NOT_FOUND,
-                f"Scan job {job_id} was not found for organization {organization_id}.",
-            )
-
+        job = await self.get_job(organization_id, job_id)
         return ScanJobProgress.from_counts(
             job_id=job.id,
             status=ScanJobStatus(job.status),

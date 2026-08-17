@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from email_discovery_api.api.errors import register_error_handlers
 from email_discovery_api.api.router import api_router
 from email_discovery_api.config import Settings, get_settings
 from email_discovery_api.database import DatabaseManager
@@ -13,6 +14,14 @@ from email_discovery_api.logging import RequestIdMiddleware, setup_logging
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Application factory initializing FastAPI instance with lifecycle and middleware."""
     app_settings = settings or get_settings()
+
+    if (
+        app_settings.allow_dev_identity_headers
+        and app_settings.environment.lower() != "development"
+    ):
+        raise ValueError(
+            "ALLOW_DEV_IDENTITY_HEADERS cannot be enabled outside development environment."
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -37,6 +46,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Attach request ID and structured logging middleware
     app.add_middleware(RequestIdMiddleware)
+
+    # Register error response envelope handlers
+    register_error_handlers(app)
 
     # Include API routes
     app.include_router(api_router)

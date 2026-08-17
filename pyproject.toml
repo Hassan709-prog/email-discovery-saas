@@ -18,6 +18,7 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]
 
 [tool.pyright]
 pythonVersion = "3.14"

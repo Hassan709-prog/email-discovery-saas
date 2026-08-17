@@ -71,3 +71,12 @@ class ScanURLStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DUPLICATE = "DUPLICATE"
+
+
+class RefreshSessionStatus(StrEnum):
+    """Refresh session security lifecycle status."""
+
+    ACTIVE = "ACTIVE"
+    ROTATED = "ROTATED"
+    REVOKED = "REVOKED"
+    COMPROMISED = "COMPROMISED"

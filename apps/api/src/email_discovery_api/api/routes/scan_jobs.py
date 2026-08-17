@@ -27,7 +27,6 @@ from email_discovery_api.schemas.api_scan_jobs import (
     ScanURLApiResponse,
 )
 from email_discovery_api.schemas.scan_jobs import CreateScanJobCommand
-from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.policies import ScanCreationPolicy
 from email_discovery_api.services.scan_jobs import ScanJobService, preview_scan_inputs
 
@@ -273,28 +272,5 @@ async def cancel_scan_job(
     service: ScanJobService = Depends(get_scan_job_service),
 ) -> ScanJobApiResponse:
     """Request job cancellation from QUEUED or RUNNING states."""
-    job = await service.get_job(principal.organization_id, job_id)
-    current_status = ScanJobStatus(job.status)
-
-    if current_status == ScanJobStatus.DRAFT:
-        raise ServiceError(
-            ServiceErrorCode.INVALID_STATE_TRANSITION,
-            f"Scan job {job_id} is in DRAFT state and cannot be cancelled.",
-        )
-
-    if current_status == ScanJobStatus.QUEUED:
-        target_status = ScanJobStatus.CANCELLED
-    elif current_status == ScanJobStatus.RUNNING:
-        target_status = ScanJobStatus.CANCELLING
-    elif current_status in (ScanJobStatus.CANCELLING, ScanJobStatus.CANCELLED):
-        target_status = current_status
-    else:
-        raise ServiceError(
-            ServiceErrorCode.INVALID_STATE_TRANSITION,
-            f"Job {job_id} is in terminal state {current_status.value}.",
-        )
-
-    updated_job = await service.transition_job_status(
-        principal.organization_id, job_id, target_status
-    )
-    return ScanJobApiResponse.from_orm_model(updated_job)
+    job = await service.cancel_job(principal.organization_id, job_id)
+    return ScanJobApiResponse.from_orm_model(job)

@@ -395,12 +395,19 @@ def test_queue_and_cancel_status_transitions(
 
     # 1. Queue draft job -> 200
     mock_service.transition_job_status = AsyncMock(return_value=queued_job)
+    mock_service.queue_job = AsyncMock(return_value=queued_job)
     res_queue = client.post(f"/api/v1/scan-jobs/{job_id}/queue")
     assert res_queue.status_code == 200
     assert res_queue.json()["status"] == "QUEUED"
 
     # 2. Cancel DRAFT job -> 409 INVALID_STATE_TRANSITION
     mock_service.get_job = AsyncMock(return_value=draft_job)
+    mock_service.cancel_job = AsyncMock(
+        side_effect=ServiceError(
+            ServiceErrorCode.INVALID_STATE_TRANSITION,
+            f"Scan job {job_id} is in DRAFT state and cannot be cancelled.",
+        )
+    )
     res_cancel_draft = client.post(f"/api/v1/scan-jobs/{job_id}/cancel")
     assert res_cancel_draft.status_code == 409
     assert res_cancel_draft.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
@@ -427,9 +434,31 @@ def test_queue_and_cancel_status_transitions(
     )
     mock_service.get_job = AsyncMock(return_value=queued_job)
     mock_service.transition_job_status = AsyncMock(return_value=cancelled_job)
+    mock_service.cancel_job = AsyncMock(return_value=cancelled_job)
     res_cancel_queued = client.post(f"/api/v1/scan-jobs/{job_id}/cancel")
     assert res_cancel_queued.status_code == 200
     assert res_cancel_queued.json()["status"] == "CANCELLED"
+
+
+def test_queue_job_zero_valid_inputs_rejected(
+    test_app: FastAPI, client: Any, test_principal: RequestPrincipal
+) -> None:
+    """Verify queueing job with zero valid inputs returns HTTP 409 NO_VALID_INPUTS."""
+    mock_service = MagicMock(spec=ScanJobService)
+    test_app.dependency_overrides[get_current_principal] = lambda: test_principal
+    test_app.dependency_overrides[get_scan_job_service] = lambda: mock_service
+
+    job_id = uuid.uuid4()
+    err = ServiceError(
+        ServiceErrorCode.NO_VALID_INPUTS,
+        "Cannot queue scan job with zero valid target URLs.",
+    )
+    mock_service.transition_job_status = AsyncMock(side_effect=err)
+    mock_service.queue_job = AsyncMock(side_effect=err)
+
+    response = client.post(f"/api/v1/scan-jobs/{job_id}/queue")
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "NO_VALID_INPUTS"
 
 
 def test_unhandled_exception_returns_sanitized_500(

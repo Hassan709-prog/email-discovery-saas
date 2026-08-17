@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from email_discovery_api.api.dependencies.cursors import encode_cursor
+from email_discovery_api.models.crawl_attempt import CrawlAttempt
 from email_discovery_api.models.enums import MembershipRole, ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
 from email_discovery_api.models.scan_job import ScanJob
@@ -70,11 +72,7 @@ def utc_now() -> datetime:
 
 
 def compute_request_fingerprint(command: CreateScanJobCommand) -> str:
-    """Compute deterministic 64-character SHA-256 request fingerprint.
-
-    Includes tenant identity, creator, source type, ordered inputs, name, config, and versions.
-    Excludes timestamps and generated record IDs.
-    """
+    """Compute deterministic 64-character SHA-256 request fingerprint."""
     payload: dict[str, Any] = {
         "organization_id": str(command.organization_id),
         "created_by_user_id": str(command.created_by_user_id),
@@ -136,7 +134,7 @@ def preview_scan_inputs(inputs: list[str]) -> list[ScanInputPreview]:
 
 
 class ScanJobService:
-    """Transactional service orchestrating job creation, idempotency, and status transitions."""
+    """Transactional service for job creation, queueing, cancellation, and finalization."""
 
     def __init__(
         self,
@@ -151,17 +149,7 @@ class ScanJobService:
         self.event_repo = JobEventRepository(session)
 
     async def create_job(self, command: CreateScanJobCommand) -> CreateJobResult:
-        """Create scan job, ingest inputs, allocate sequence 1, and append JOB_CREATED event.
-
-        Pre-ingestion Order:
-            1. Validate quota/limits (ScanCreationPolicy)
-            2. Lock Organization row (FOR UPDATE)
-            3. Verify active Membership and role authorization
-            4. Enforce active job count limit
-            5. Check idempotency key and fingerprint
-            6. Parse & normalize inputs into ScanURL ORM objects
-            7. Create ScanJob, ScanURL, allocate sequence 1, and append JOB_CREATED event
-        """
+        """Create scan job and ingest input URLs into draft state."""
         self.policy.validate_pre_ingestion(command.inputs, command.configuration_snapshot)
         fingerprint = compute_request_fingerprint(command)
 
@@ -325,6 +313,238 @@ class ScanJobService:
 
         return CreateJobResult(job=job, created=True)
 
+    async def queue_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
+        """Atomically transition job from DRAFT to QUEUED.
+
+        Guard: Rejects queueing if valid_input_count == 0 with ServiceErrorCode.NO_VALID_INPUTS.
+        """
+        async with self.session.begin():
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None or getattr(job, "status", None) is None:
+                job = await self.job_repo.get_job(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Scan job {job_id} was not found for organization {organization_id}.",
+                )
+
+            current_status = ScanJobStatus(job.status)
+            if current_status == ScanJobStatus.QUEUED:
+                return job
+
+            if current_status != ScanJobStatus.DRAFT:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Job {job_id} is in status {current_status.value} and cannot be queued.",
+                )
+
+            if job.valid_input_count == 0:
+                raise ServiceError(
+                    ServiceErrorCode.NO_VALID_INPUTS,
+                    "Cannot queue scan job with zero valid target URLs.",
+                )
+
+            # Bulk-update eligible PENDING URLs -> QUEUED
+            stmt_bulk = (
+                update(ScanURL)
+                .where(
+                    ScanURL.scan_job_id == job_id,
+                    ScanURL.status == ScanURLStatus.PENDING.value,
+                )
+                .values(status=ScanURLStatus.QUEUED.value)
+            )
+            res_bulk = await self.session.execute(stmt_bulk)
+            affected_count = int(getattr(res_bulk, "rowcount", 0))
+
+            job.status = ScanJobStatus.QUEUED.value
+            job.queued_count = affected_count
+
+            seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+            if seq is not None:
+                event = JobEvent(
+                    scan_job_id=job_id,
+                    event_type="JOB_STATUS_CHANGED",
+                    sequence_number=seq,
+                    payload={
+                        "previous_status": ScanJobStatus.DRAFT.value,
+                        "new_status": ScanJobStatus.QUEUED.value,
+                        "queued_count": affected_count,
+                    },
+                )
+                self.event_repo.append_event(event)
+
+            return job
+
+    async def cancel_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
+        """Cancel a scan job atomically from QUEUED or RUNNING state.
+
+        Guarantees:
+            1. Unclaimed URLs (PENDING, QUEUED, RETRY_WAIT) transition to CANCELLED.
+            2. queued_count becomes 0.
+            3. DOES NOT increment failed_count.
+            4. If running_count == 0, job transitions directly to CANCELLED.
+            5. If running_count > 0, job transitions to CANCELLING.
+        """
+        async with self.session.begin():
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None or getattr(job, "status", None) is None:
+                job = await self.job_repo.get_job(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Scan job {job_id} was not found for organization {organization_id}.",
+                )
+
+            current_status = ScanJobStatus(job.status)
+            if current_status in (ScanJobStatus.CANCELLED, ScanJobStatus.CANCELLING):
+                return job
+
+            if current_status not in (ScanJobStatus.QUEUED, ScanJobStatus.RUNNING):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Job {job_id} is in status {current_status.value} and cannot be cancelled.",
+                )
+
+            # Cancel all unclaimed URLs
+            stmt_unclaimed = (
+                update(ScanURL)
+                .where(
+                    ScanURL.scan_job_id == job_id,
+                    ScanURL.status.in_(
+                        [
+                            ScanURLStatus.PENDING.value,
+                            ScanURLStatus.QUEUED.value,
+                            ScanURLStatus.RETRY_WAIT.value,
+                        ]
+                    ),
+                )
+                .values(
+                    status=ScanURLStatus.CANCELLED.value,
+                    completed_at=func.clock_timestamp(),
+                    last_error_code="JOB_CANCELLED",
+                    last_error_message="Cancelled by job cancellation request.",
+                )
+            )
+            await self.session.execute(stmt_unclaimed)
+
+            job.queued_count = 0
+            job.cancellation_requested_at = datetime.now()
+
+            # Determine new job status based on remaining active SCANNING leases
+            count_active_stmt = select(func.count(ScanURL.id)).where(
+                ScanURL.scan_job_id == job_id,
+                ScanURL.status == ScanURLStatus.SCANNING.value,
+            )
+            active_res = await self.session.execute(count_active_stmt)
+            active_scanning_count = active_res.scalar_one() or 0
+
+            target_job_status = (
+                ScanJobStatus.CANCELLED if active_scanning_count == 0 else ScanJobStatus.CANCELLING
+            )
+
+            job.status = target_job_status.value
+            if target_job_status == ScanJobStatus.CANCELLED:
+                job.completed_at = datetime.now()
+
+            seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+            if seq is not None:
+                event = JobEvent(
+                    scan_job_id=job_id,
+                    event_type="JOB_STATUS_CHANGED",
+                    sequence_number=seq,
+                    payload={
+                        "previous_status": current_status.value,
+                        "new_status": target_job_status.value,
+                    },
+                )
+                self.event_repo.append_event(event)
+
+            return job
+
+    async def try_finalize_job(
+        self, organization_id: uuid.UUID, job_id: uuid.UUID
+    ) -> ScanJob | None:
+        """Authoritatively check and finalize job inside a separate short transaction (T5).
+
+        Checks:
+            1. Lock ScanJob row FOR UPDATE.
+            2. Return existing job if already terminal.
+            3. Count nonterminal URLs: PENDING, QUEUED, SCANNING, RETRY_WAIT.
+            4. If nonterminal_count == 0:
+               - Check PARTIAL crawl attempts count.
+               - If CANCELLING -> CANCELLED.
+               - Else if failed_count == 0 AND partial_count == 0 -> COMPLETED.
+               - Else if completed_count == 0 AND failed_count == valid_input_count -> FAILED.
+               - Else -> COMPLETED_WITH_ERRORS.
+               - Append single JOB_STATUS_CHANGED event.
+        """
+        async with self.session.begin():
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                return None
+
+            current_status = ScanJobStatus(job.status)
+            if current_status in TERMINAL_STATUSES:
+                return job
+
+            # Count nonterminal URLs in database
+            nonterminal_stmt = select(func.count(ScanURL.id)).where(
+                ScanURL.scan_job_id == job_id,
+                ScanURL.status.in_(
+                    [
+                        ScanURLStatus.PENDING.value,
+                        ScanURLStatus.QUEUED.value,
+                        ScanURLStatus.SCANNING.value,
+                        ScanURLStatus.RETRY_WAIT.value,
+                    ]
+                ),
+            )
+            res_nonterm = await self.session.execute(nonterminal_stmt)
+            nonterminal_count = res_nonterm.scalar_one() or 0
+
+            if nonterminal_count > 0:
+                return None  # Work still in progress
+
+            # Query partial crawl attempt count
+            partial_stmt = (
+                select(func.count(CrawlAttempt.id))
+                .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
+                .where(
+                    ScanURL.scan_job_id == job_id,
+                    CrawlAttempt.outcome == "PARTIAL",
+                )
+            )
+            res_partial = await self.session.execute(partial_stmt)
+            partial_count = res_partial.scalar_one() or 0
+
+            if current_status == ScanJobStatus.CANCELLING:
+                target_status = ScanJobStatus.CANCELLED
+            elif job.failed_count == 0 and partial_count == 0:
+                target_status = ScanJobStatus.COMPLETED
+            elif job.completed_count == 0 and job.failed_count == job.valid_input_count:
+                target_status = ScanJobStatus.FAILED
+            else:
+                target_status = ScanJobStatus.COMPLETED_WITH_ERRORS
+
+            job.status = target_status.value
+            job.completed_at = datetime.now()
+
+            seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+            if seq is not None:
+                event = JobEvent(
+                    scan_job_id=job_id,
+                    event_type="JOB_STATUS_CHANGED",
+                    sequence_number=seq,
+                    payload={
+                        "previous_status": current_status.value,
+                        "new_status": target_status.value,
+                        "partial_attempts_count": partial_count,
+                    },
+                )
+                self.event_repo.append_event(event)
+
+            return job
+
     async def get_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
         """Fetch a job strictly scoped to tenant or raise JOB_NOT_FOUND."""
         job = await self.job_repo.get_job(organization_id, job_id)
@@ -376,7 +596,6 @@ class ScanJobService:
         status: str | None = None,
     ) -> tuple[list[ScanURL], str | None]:
         """List job URLs tenant-scoped with keyset pagination returning items and next_cursor."""
-        # Verify job exists for tenant first
         await self.get_job(organization_id, job_id)
 
         fetch_limit = limit + 1
@@ -408,7 +627,6 @@ class ScanJobService:
         cursor_id: uuid.UUID | None = None,
     ) -> tuple[list[JobEvent], str | None]:
         """List job events tenant-scoped with keyset pagination returning items and next_cursor."""
-        # Verify job exists for tenant first
         await self.get_job(organization_id, job_id)
 
         fetch_limit = limit + 1
@@ -436,6 +654,11 @@ class ScanJobService:
         new_status: ScanJobStatus,
     ) -> ScanJob:
         """Perform a validated status transition with strict idempotency and event logging."""
+        if new_status == ScanJobStatus.QUEUED:
+            return await self.queue_job(organization_id, job_id)
+        elif new_status in (ScanJobStatus.CANCELLING, ScanJobStatus.CANCELLED):
+            return await self.cancel_job(organization_id, job_id)
+
         async with self.session.begin():
             job = await self.job_repo.get_job(organization_id, job_id)
             if job is None:
@@ -445,25 +668,13 @@ class ScanJobService:
                 )
 
             current_status = ScanJobStatus(job.status)
-
-            # Idempotent replay handling (no duplicate events created)
             if current_status == new_status:
-                if new_status in (
-                    ScanJobStatus.QUEUED,
-                    ScanJobStatus.CANCELLING,
-                    ScanJobStatus.CANCELLED,
-                ):
-                    return job
+                return job
 
-            # Reject transition from terminal states
             if current_status in TERMINAL_STATUSES:
                 raise ServiceError(
                     ServiceErrorCode.INVALID_STATE_TRANSITION,
                     f"Job {job_id} is in terminal state {current_status.value}.",
-                    details={
-                        "current_status": current_status.value,
-                        "requested_status": new_status.value,
-                    },
                 )
 
             allowed = ALLOWED_STATE_TRANSITIONS.get(current_status, set())
@@ -471,26 +682,12 @@ class ScanJobService:
                 raise ServiceError(
                     ServiceErrorCode.INVALID_STATE_TRANSITION,
                     f"Transition from {current_status.value} to {new_status.value} not allowed.",
-                    details={
-                        "current_status": current_status.value,
-                        "requested_status": new_status.value,
-                    },
                 )
 
             now = utc_now()
             started_at = now if new_status == ScanJobStatus.RUNNING else None
-            completed_at = (
-                now
-                if new_status
-                in (
-                    ScanJobStatus.COMPLETED,
-                    ScanJobStatus.COMPLETED_WITH_ERRORS,
-                    ScanJobStatus.FAILED,
-                    ScanJobStatus.CANCELLED,
-                )
-                else None
-            )
-            cancellation_requested_at = now if new_status == ScanJobStatus.CANCELLING else None
+            completed_at = now if new_status in TERMINAL_STATUSES else None
+            cancellation_requested_at = None
 
             updated = await self.job_repo.update_job_status_conditional(
                 organization_id,
@@ -503,12 +700,6 @@ class ScanJobService:
             )
 
             if not updated:
-                recheck = await self.job_repo.get_job(organization_id, job_id)
-                if recheck is None:
-                    raise ServiceError(
-                        ServiceErrorCode.JOB_NOT_FOUND,
-                        f"Scan job {job_id} was not found.",
-                    )
                 raise ServiceError(
                     ServiceErrorCode.INVALID_STATE_TRANSITION,
                     f"Concurrent state update detected for job {job_id}.",

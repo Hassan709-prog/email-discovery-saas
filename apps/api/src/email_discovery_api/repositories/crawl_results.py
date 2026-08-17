@@ -171,7 +171,7 @@ class EmailFindingRepository:
             res = await self._session.execute(stmt_select)
             existing = res.scalar_one_or_none()
 
-            if existing is None:
+            if existing is None or getattr(existing, "last_found_at", None) is None:
                 new_finding = EmailFinding(
                     scan_job_id=job_id,
                     canonical_email=f.canonical_email,

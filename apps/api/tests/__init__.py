@@ -1,1 +1,1 @@
-"""Test suite for email_discovery_api."""
+"""Test package for email_discovery_api."""

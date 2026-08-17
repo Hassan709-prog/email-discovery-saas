@@ -41,6 +41,13 @@ class ScanJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         Index("ix_scan_jobs_org_created", "organization_id", "created_at"),
         Index("ix_scan_jobs_org_status", "organization_id", "status"),
+        Index(
+            "uq_scan_jobs_org_idempotency",
+            "organization_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
         CheckConstraint(
             "status IN ('DRAFT', 'QUEUED', 'RUNNING', 'CANCELLING', 'CANCELLED', "
             "'COMPLETED', 'COMPLETED_WITH_ERRORS', 'FAILED')",
@@ -74,6 +81,19 @@ class ScanJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             "queued_count + running_count + completed_count + failed_count <= valid_input_count",
             name="ck_scan_jobs_processed_le_valid",
         ),
+        CheckConstraint(
+            "next_event_sequence >= 1",
+            name="ck_scan_jobs_next_event_seq_positive",
+        ),
+        CheckConstraint(
+            "request_fingerprint IS NULL OR "
+            "(length(request_fingerprint) = 64 AND request_fingerprint ~ '^[0-9a-f]{64}$')",
+            name="ck_scan_jobs_fingerprint_hex",
+        ),
+        CheckConstraint(
+            "idempotency_key IS NULL OR request_fingerprint IS NOT NULL",
+            name="ck_scan_jobs_idempotency_fingerprint_pair",
+        ),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
@@ -105,6 +125,13 @@ class ScanJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
         default=dict,
         server_default=text("'{}'::jsonb"),
+    )
+
+    # Idempotency & Event Sequencing
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    next_event_sequence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
     )
 
     # Counters

@@ -11,6 +11,7 @@ from sqlalchemy import (
     CheckConstraint,
     Float,
     ForeignKey,
+    Index,
     String,
     Text,
     UniqueConstraint,
@@ -51,6 +52,7 @@ class EmailEvidence(Base, UUIDPrimaryKeyMixin):
             "candidate_hash ~ '^[0-9a-f]{64}$'",
             name="ck_email_evidence_candidate_hash_hex",
         ),
+        Index("ix_email_evidence_finding_created_id", "email_finding_id", "created_at", "id"),
     )
 
     email_finding_id: Mapped[uuid.UUID] = mapped_column(

@@ -5,9 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from email_discovery_api.mappers.crawl_results import (
     MappedAttempt,
@@ -208,13 +208,32 @@ class EmailFindingRepository:
         )
         await self._session.execute(stmt)
 
-    async def list_findings_for_job(
+    async def count_findings_for_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> int:
+        """Count total tenant-scoped EmailFindings for a ScanJob."""
+        stmt = (
+            select(func.count(EmailFinding.id))
+            .join(ScanJob, EmailFinding.scan_job_id == ScanJob.id)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+            )
+        )
+        res = await self._session.execute(stmt)
+        return res.scalar_one() or 0
+
+    async def list_findings_keyset(
         self,
         organization_id: uuid.UUID,
         job_id: uuid.UUID,
+        limit: int = 50,
+        cursor_email: str | None = None,
+        cursor_id: uuid.UUID | None = None,
         classification: str | None = None,
-    ) -> list[EmailFinding]:
-        """List tenant-scoped EmailFindings for a ScanJob."""
+        validation_status: str | None = None,
+        email_domain: str | None = None,
+        search_prefix: str | None = None,
+    ) -> tuple[list[EmailFinding], bool]:
+        """Fetch limit + 1 tenant-scoped EmailFindings using keyset pagination."""
         stmt = (
             select(EmailFinding)
             .join(ScanJob, EmailFinding.scan_job_id == ScanJob.id)
@@ -223,16 +242,103 @@ class EmailFindingRepository:
                 ScanJob.id == job_id,
             )
         )
+
         if classification:
             stmt = stmt.where(EmailFinding.classification == classification)
-        stmt = stmt.order_by(EmailFinding.canonical_email.asc())
+        if validation_status:
+            stmt = stmt.where(EmailFinding.validation_status == validation_status)
+        if email_domain:
+            stmt = stmt.where(EmailFinding.email_domain == email_domain)
+        if search_prefix:
+            # Escape SQL LIKE wildcards % and _ and \
+            escaped = search_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            stmt = stmt.where(EmailFinding.canonical_email.like(f"{escaped}%", escape="\\"))
+
+        if cursor_email is not None and cursor_id is not None:
+            stmt = stmt.where(
+                tuple_(EmailFinding.canonical_email, EmailFinding.id) > (cursor_email, cursor_id)
+            )
+
+        stmt = stmt.order_by(EmailFinding.canonical_email.asc(), EmailFinding.id.asc()).limit(
+            limit + 1
+        )
+
         res = await self._session.execute(stmt)
-        return list(res.scalars().all())
+        rows = list(res.scalars().all())
+
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        return items, has_more
+
+    async def get_representative_evidence_for_findings(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        finding_ids: list[uuid.UUID],
+        max_per_finding: int = 3,
+    ) -> dict[uuid.UUID, list[EmailEvidence]]:
+        """Fetch top N representative evidence items per finding using 1 SQL window query."""
+        if not finding_ids:
+            return {}
+
+        rank_col = (
+            func.row_number()
+            .over(
+                partition_by=EmailEvidence.email_finding_id,
+                order_by=(EmailEvidence.created_at.asc(), EmailEvidence.id.asc()),
+            )
+            .label("rank")
+        )
+
+        subq = (
+            select(EmailEvidence, rank_col)
+            .join(EmailFinding, EmailEvidence.email_finding_id == EmailFinding.id)
+            .join(ScanJob, EmailFinding.scan_job_id == ScanJob.id)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+                EmailEvidence.email_finding_id.in_(finding_ids),
+            )
+            .subquery()
+        )
+
+        aliased_ev = aliased(EmailEvidence, subq)
+        stmt = (
+            select(aliased_ev)
+            .where(subq.c.rank <= max_per_finding)
+            .order_by(
+                subq.c.email_finding_id.asc(),
+                subq.c.rank.asc(),
+                aliased_ev.id.asc(),
+            )
+        )
+        res = await self._session.execute(stmt)
+        evidence_rows = list(res.scalars().all())
+
+        grouped: dict[uuid.UUID, list[EmailEvidence]] = {fid: [] for fid in finding_ids}
+        for ev in evidence_rows:
+            grouped[ev.email_finding_id].append(ev)
+        return grouped
+
+    async def list_findings_for_job(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        classification: str | None = None,
+    ) -> list[EmailFinding]:
+        """List tenant-scoped EmailFindings for a ScanJob."""
+        items, _ = await self.list_findings_keyset(
+            organization_id=organization_id,
+            job_id=job_id,
+            limit=10000,
+            classification=classification,
+        )
+        return items
 
     async def get_finding_detail(
         self, organization_id: uuid.UUID, job_id: uuid.UUID, finding_id: uuid.UUID
     ) -> EmailFinding | None:
-        """Retrieve tenant-scoped EmailFinding detail with evidence list."""
+        """Retrieve tenant-scoped EmailFinding detail."""
         stmt = (
             select(EmailFinding)
             .join(ScanJob, EmailFinding.scan_job_id == ScanJob.id)
@@ -241,17 +347,54 @@ class EmailFindingRepository:
                 ScanJob.id == job_id,
                 EmailFinding.id == finding_id,
             )
-            .options(selectinload(EmailFinding.evidence_items))
         )
         res = await self._session.execute(stmt)
         return res.scalar_one_or_none()
 
 
 class EmailEvidenceRepository:
-    """Repository for EmailEvidence entity persistence."""
+    """Repository for EmailEvidence entity persistence and tenant-scoped reads."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def list_evidence_keyset(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        finding_id: uuid.UUID,
+        limit: int = 50,
+        cursor_created_at: datetime | None = None,
+        cursor_id: uuid.UUID | None = None,
+    ) -> tuple[list[EmailEvidence], bool]:
+        """Fetch limit + 1 tenant-scoped EmailEvidence for a finding using keyset pagination."""
+        stmt = (
+            select(EmailEvidence)
+            .join(EmailFinding, EmailEvidence.email_finding_id == EmailFinding.id)
+            .join(ScanJob, EmailFinding.scan_job_id == ScanJob.id)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+                EmailEvidence.email_finding_id == finding_id,
+            )
+            .options(selectinload(EmailEvidence.crawled_page))
+        )
+
+        if cursor_created_at is not None and cursor_id is not None:
+            stmt = stmt.where(
+                tuple_(EmailEvidence.created_at, EmailEvidence.id) > (cursor_created_at, cursor_id)
+            )
+
+        stmt = stmt.order_by(EmailEvidence.created_at.asc(), EmailEvidence.id.asc()).limit(
+            limit + 1
+        )
+
+        res = await self._session.execute(stmt)
+        rows = list(res.scalars().all())
+
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        return items, has_more
 
     async def add_evidence(
         self,

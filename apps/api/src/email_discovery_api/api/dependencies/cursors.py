@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -12,6 +13,8 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 MAX_CURSOR_BYTES = 512
+CursorResourceType = Literal["jobs", "urls", "events", "results", "evidence"]
+URLSAFE_BASE64_REGEX = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class CursorPayload(BaseModel):
@@ -20,25 +23,29 @@ class CursorPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: Literal[1] = Field(..., description="Cursor format version number")
-    resource: Literal["jobs", "urls", "events"] = Field(..., description="Resource entity type")
+    resource: CursorResourceType = Field(..., description="Resource entity type")
     values: list[Any] = Field(..., min_length=1, max_length=5)
 
 
-def encode_cursor(resource: Literal["jobs", "urls", "events"], values: list[Any]) -> str:
+def encode_cursor(resource: CursorResourceType, values: list[Any]) -> str:
     """Encode cursor values into a deterministic URL-safe base64 JSON string."""
     payload = CursorPayload(version=1, resource=resource, values=values)
     raw_json = payload.model_dump_json(by_alias=True)
     return base64.urlsafe_b64encode(raw_json.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def decode_cursor(
-    cursor_str: str, expected_resource: Literal["jobs", "urls", "events"]
-) -> list[Any]:
+def decode_cursor(cursor_str: str, expected_resource: CursorResourceType) -> list[Any]:
     """Decode and validate a URL-safe base64 cursor for a specific expected resource type."""
     if not cursor_str or len(cursor_str.encode("utf-8")) > MAX_CURSOR_BYTES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cursor exceeds maximum allowed size or is empty.",
+        )
+
+    if not URLSAFE_BASE64_REGEX.match(cursor_str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed or invalid pagination cursor.",
         )
 
     # Re-pad base64 string if trimmed
@@ -85,7 +92,10 @@ def parse_job_cursor(cursor_str: str | None) -> tuple[datetime | None, UUID | No
             detail="Invalid job cursor values length.",
         )
     try:
-        created_at = datetime.fromisoformat(str(values[0])).astimezone(UTC)
+        dt = datetime.fromisoformat(str(values[0]))
+        if dt.tzinfo is None:
+            raise ValueError("Timezone-naive datetime is forbidden in cursor.")
+        created_at = dt.astimezone(UTC)
         job_id = UUID(str(values[1]))
         return created_at, job_id
     except ValueError as err:
@@ -134,4 +144,49 @@ def parse_event_cursor(cursor_str: str | None) -> tuple[int | None, UUID | None]
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid event cursor value format.",
+        ) from err
+
+
+def parse_results_cursor(cursor_str: str | None) -> tuple[str | None, UUID | None]:
+    """Parse a results pagination cursor returning (cursor_canonical_email, cursor_finding_id)."""
+    if not cursor_str:
+        return None, None
+    values = decode_cursor(cursor_str, "results")
+    if len(values) != 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid results cursor values length.",
+        )
+    try:
+        email = str(values[0]).strip().lower()
+        finding_id = UUID(str(values[1]))
+        return email, finding_id
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid results cursor value format.",
+        ) from err
+
+
+def parse_evidence_cursor(cursor_str: str | None) -> tuple[datetime | None, UUID | None]:
+    """Parse an evidence pagination cursor returning (cursor_created_at, cursor_evidence_id)."""
+    if not cursor_str:
+        return None, None
+    values = decode_cursor(cursor_str, "evidence")
+    if len(values) != 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid evidence cursor values length.",
+        )
+    try:
+        dt = datetime.fromisoformat(str(values[0]))
+        if dt.tzinfo is None:
+            raise ValueError("Timezone-naive datetime is forbidden in cursor.")
+        created_at = dt.astimezone(UTC)
+        evidence_id = UUID(str(values[1]))
+        return created_at, evidence_id
+    except ValueError as err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid evidence cursor value format.",
         ) from err

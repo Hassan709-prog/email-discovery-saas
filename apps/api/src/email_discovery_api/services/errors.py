@@ -26,6 +26,7 @@ class ServiceErrorCode(StrEnum):
     INVALID_RESULT_STATE = "INVALID_RESULT_STATE"
     NO_VALID_INPUTS = "NO_VALID_INPUTS"
     LEASE_LOST = "LEASE_LOST"
+    EXPORT_TOO_LARGE = "EXPORT_TOO_LARGE"
 
 
 class ServiceError(Exception):

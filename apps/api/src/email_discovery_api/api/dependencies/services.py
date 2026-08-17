@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from email_discovery_api.database import get_db_session
 from email_discovery_api.services.auth import AuthService
+from email_discovery_api.services.results import ScanJobResultsService
 from email_discovery_api.services.scan_jobs import ScanJobService
 
 
@@ -17,8 +18,20 @@ async def get_scan_job_service(
     return ScanJobService(session)
 
 
+async def get_scan_job_results_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> ScanJobResultsService:
+    """Dependency injecting a request-scoped ScanJobResultsService."""
+    return ScanJobResultsService(session)
+
+
 async def get_auth_service(
     session: AsyncSession = Depends(get_db_session),
 ) -> AuthService:
     """Dependency injecting a request-scoped AuthService."""
     return AuthService(session)
+
+
+def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+    """Dependency injecting the application-owned shared async_sessionmaker."""
+    return request.app.state.db_manager.session_factory

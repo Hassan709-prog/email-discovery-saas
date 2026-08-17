@@ -33,6 +33,20 @@ FastAPI and PostgreSQL application service for Email Discovery SaaS.
   ```
 - **State Transition Matrix**: State transitions (`DRAFT` $\rightarrow$ `QUEUED` $\rightarrow$ `RUNNING` $\rightarrow$ `COMPLETED` / `CANCELLED` / `FAILED`) are validated by policy and executed via conditional SQL updates (`WHERE status = expected_status`). Successful transitions append `JOB_STATUS_CHANGED` events within the same transaction.
 
+### Crawl Result Persistence & Findings Mapper (Phase 2F)
+- **Entities & Tables**:
+  - `CrawlAttempt` (`crawl_attempts`): Durably records attempt metadata (`outcome`, `retryable`, `result_checksum`, timing, byte counts).
+  - `CrawledPage` (`crawled_pages`): Records processed page outcomes (`requested_url`, `final_url`, `status_code`, `page_score`, `fetch_result`, `robots_decision`). Raw HTML bodies are strictly omitted.
+  - `EmailFinding` (`email_findings`): Canonical job-scoped email storage (`canonical_email`, `domain`, `classification`, `validation_status`, `evidence_count`). Uses `ON CONFLICT (scan_job_id, canonical_email) DO NOTHING` so job counter `ScanJob.email_finding_count` increments strictly for newly discovered canonical emails.
+  - `EmailEvidence` (`email_evidence`): Fine-grained proof tying findings to crawled pages (`source_type`, `evidence_snippet`, `candidate_hash`). Uses `ON CONFLICT DO NOTHING` and increments `EmailFinding.evidence_count` only for genuine insertions.
+  - `RejectedEmailCandidate` (`rejected_email_candidates`): Bounded record of masked rejected candidates (e.g. `j***e@domain.com`). Raw candidates are never logged or stored in `__repr__`.
+- **URL Privacy Policy**: URLs stripped of userinfo credentials (`user:pass@`), query parameters (`?param=...`), and fragments (`#frag`) before digest computation and storage.
+- **Idempotent Replay & Serialized Locking**:
+  - `ResultPersistenceService.persist_site_scan_result` locks `ScanURL` via `SELECT ... FOR UPDATE` tenant-scoped.
+  - Replaying an attempt with identical `result_checksum` returns `is_replay=True` without duplicate rows or counter increments.
+  - Replaying an attempt with a conflicting `result_checksum` raises `RESULT_CONFLICT`.
+  - ScanJob completion/failed counters and `SCAN_URL_COMPLETED` / `SCAN_URL_FAILED` events emit ONLY on initial transition `SCANNING` $\rightarrow$ terminal state.
+
 ---
 
 ## HTTP API Contracts (`/api/v1/scan-jobs`)

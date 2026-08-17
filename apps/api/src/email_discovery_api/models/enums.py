@@ -80,3 +80,49 @@ class RefreshSessionStatus(StrEnum):
     ROTATED = "ROTATED"
     REVOKED = "REVOKED"
     COMPROMISED = "COMPROMISED"
+
+
+class CrawlAttemptOutcome(StrEnum):
+    """Execution outcome of a single crawl attempt."""
+
+    COMPLETED = "COMPLETED"
+    COMPLETED_NO_EMAILS = "COMPLETED_NO_EMAILS"
+    PARTIAL = "PARTIAL"
+    ROBOTS_BLOCKED = "ROBOTS_BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class CrawledPageOutcome(StrEnum):
+    """Processing outcome of an individual page within a crawl attempt."""
+
+    FETCHED = "FETCHED"
+    ROBOTS_BLOCKED = "ROBOTS_BLOCKED"
+    FETCH_FAILED = "FETCH_FAILED"
+    SKIPPED = "SKIPPED"
+    PARSE_FAILED = "PARSE_FAILED"
+
+
+class EmailClassification(StrEnum):
+    """Classification category of a discovered email address."""
+
+    ROLE_BASED = "ROLE_BASED"
+    PERSONAL_OR_NAMED = "PERSONAL_OR_NAMED"
+    NO_REPLY = "NO_REPLY"
+    UNKNOWN = "UNKNOWN"
+
+
+class EmailValidationStatus(StrEnum):
+    """Validation state of a canonical email finding."""
+
+    VALID = "VALID"
+    UNVERIFIED = "UNVERIFIED"
+    INVALID = "INVALID"
+
+
+class EmailSourceType(StrEnum):
+    """Source origin of an extracted email candidate."""
+
+    VISIBLE_TEXT = "VISIBLE_TEXT"
+    MAILTO = "MAILTO"
+    OBFUSCATED_TEXT = "OBFUSCATED_TEXT"

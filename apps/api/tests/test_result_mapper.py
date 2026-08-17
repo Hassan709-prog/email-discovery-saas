@@ -1,0 +1,230 @@
+"""Unit tests for deterministic scanner result mapper, URL privacy, and candidate masking."""
+
+from datetime import UTC, datetime
+
+from email_discovery_api.mappers.crawl_results import (
+    map_site_scan_result,
+    mask_email_candidate,
+    sanitize_text,
+    sanitize_url,
+)
+from email_scanner.errors import (
+    EmailRejectionCode,
+    FetchOutcomeCode,
+    PageScanOutcome,
+    RobotsDecisionCode,
+    SiteScanOutcome,
+)
+from email_scanner.models import (
+    DomainAffinity,
+    EmailCategory,
+    EmailSourceKind,
+    FetchResult,
+    PageScanRecord,
+    RedirectHop,
+    RobotsDecision,
+    SiteScanResult,
+    SiteScanStatistics,
+)
+from email_scanner.models import (
+    EmailFinding as ScannerEmailFinding,
+)
+from email_scanner.models import (
+    RejectedEmailCandidate as ScannerRejectedCandidate,
+)
+
+
+def test_sanitize_text_normalizes_whitespace_and_removes_control_chars() -> None:
+    """Verify control characters and whitespace runs are sanitized and truncated."""
+    raw = "Hello\r\n\t World!\x00\x1f   This is a   test.   "
+    clean = sanitize_text(raw, max_length=20)
+    assert clean == "Hello World! This is"
+
+
+def test_sanitize_url_removes_userinfo_query_and_fragment() -> None:
+    """Verify URL privacy rules strip sensitive userinfo, query strings, and fragments."""
+    sensitive_url = (
+        "HTTPS://user:password@Sub.Example.com:8080/path/to/page?token=secret123#section2"
+    )
+    clean_url = sanitize_url(sensitive_url)
+    assert clean_url == "https://sub.example.com:8080/path/to/page"
+
+    standard_https = "https://example.com:443/about?query=param#top"
+    assert sanitize_url(standard_https) == "https://example.com/about"
+
+
+def test_mask_email_candidate_privacy_formatting() -> None:
+    """Verify candidate email addresses are masked without exposing raw local parts."""
+    assert mask_email_candidate("john.doe@company.com") == "j***e@company.com"
+    assert mask_email_candidate("abc@company.com") == "a*c@company.com"
+    assert mask_email_candidate("ab@company.com") == "a*@company.com"
+    assert mask_email_candidate("a@company.com") == "*@company.com"
+    assert mask_email_candidate("invalid-no-at-sign") == "***"
+    assert mask_email_candidate(None) is None
+
+
+def test_result_mapper_deterministic_checksum_and_ordering() -> None:
+    """Verify identical scanner output produces identical result_checksum and DTO ordering."""
+    now = datetime.now(UTC)
+    result = SiteScanResult(
+        starting_url="https://user:secret@example.com/start?token=xyz#top",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=2,
+            pages_attempted=2,
+            pages_fetched=2,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=5,
+            accepted_email_findings=2,
+            rejected_email_candidates=1,
+            elapsed_seconds=3.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(
+            PageScanRecord(
+                requested_url="https://example.com/start?token=xyz",
+                final_url="https://example.com/start",
+                depth=0,
+                outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+                status_code=200,
+                robots_decision=RobotsDecision(
+                    target_url="https://example.com/start",
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="OK",
+                ),
+                fetch_result=FetchResult(
+                    final_url="https://example.com/start",
+                    status_code=200,
+                    content_type="text/html; charset=utf-8",
+                    body_text="<html>contact info</html>",
+                    redirect_history=(
+                        RedirectHop(
+                            url="http://example.com/start?token=xyz",
+                            status_code=301,
+                            location="https://example.com/start?token=xyz",
+                        ),
+                    ),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                emails_found_count=2,
+                links_discovered_count=1,
+            ),
+        ),
+        email_findings=(
+            ScannerEmailFinding(
+                source_url="https://example.com/start",
+                raw_candidate="sales@example.com",
+                canonical_email="sales@example.com",
+                local_part="sales",
+                domain="example.com",
+                source_kind=EmailSourceKind.VISIBLE_TEXT,
+                category=EmailCategory.ROLE_BASED,
+                domain_affinity=DomainAffinity.EXACT_HOST,
+                evidence_snippet="Contact us at sales@example.com",
+            ),
+            ScannerEmailFinding(
+                source_url="https://example.com/start",
+                raw_candidate="john.doe@example.com",
+                canonical_email="john.doe@example.com",
+                local_part="john.doe",
+                domain="example.com",
+                source_kind=EmailSourceKind.MAILTO,
+                category=EmailCategory.PERSONAL_OR_NAMED,
+                domain_affinity=DomainAffinity.EXACT_HOST,
+                evidence_snippet="Email john.doe@example.com directly",
+            ),
+        ),
+        rejected_email_candidates=(
+            ScannerRejectedCandidate(
+                source_url="https://example.com/start",
+                raw_candidate="test@dummy.com",
+                rejection_code=EmailRejectionCode.DUMMY_TEST_ADDRESS,
+                reason="Dummy candidate",
+                source_kind=EmailSourceKind.VISIBLE_TEXT,
+                evidence_snippet="test@dummy.com",
+            ),
+        ),
+    )
+
+    attempt1, _pages1, findings1, _evidence1, rejected1 = map_site_scan_result(
+        result, attempt_number=1, now=now
+    )
+    attempt2, _pages2, _findings2, _evidence2, _rejected2 = map_site_scan_result(
+        result, attempt_number=1, now=now
+    )
+
+    # Checksum equality
+    assert attempt1.result_checksum == attempt2.result_checksum
+    assert len(attempt1.result_checksum) == 64
+
+    # Verification of URL privacy in DTOs
+    assert attempt1.requested_url == "https://example.com/start"
+    assert attempt1.redirect_history == [
+        {
+            "url": "http://example.com/start",
+            "status_code": 301,
+            "location": "https://example.com/start",
+        }
+    ]
+
+    # Findings sorted deterministically by canonical_email
+    assert [f.canonical_email for f in findings1] == ["john.doe@example.com", "sales@example.com"]
+
+    # Rejected candidate masked
+    assert rejected1[0].masked_candidate == "t***t@dummy.com"
+    assert "test@dummy.com" not in repr(rejected1[0])
+
+
+def test_no_html_body_in_mapped_dtos() -> None:
+    """Verify HTML body is completely absent from mapped persistence DTOs."""
+    now = datetime.now(UTC)
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(
+            PageScanRecord(
+                requested_url="https://example.com",
+                final_url="https://example.com",
+                depth=0,
+                outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+                status_code=200,
+                robots_decision=RobotsDecision(
+                    target_url="https://example.com",
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="OK",
+                ),
+                fetch_result=FetchResult(
+                    final_url="https://example.com",
+                    status_code=200,
+                    content_type="text/html",
+                    body_text="<html>secret html body payload</html>",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                emails_found_count=0,
+                links_discovered_count=0,
+            ),
+        ),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    _attempt, pages, _, _, _ = map_site_scan_result(result, attempt_number=1, now=now)
+    assert not hasattr(pages[0], "body_text")
+    assert not hasattr(pages[0], "html")
+    assert pages[0].content_sha256 is None

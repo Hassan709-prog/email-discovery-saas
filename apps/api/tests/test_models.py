@@ -27,7 +27,7 @@ def test_mapper_configuration() -> None:
 
 
 def test_metadata_tables_exist() -> None:
-    """Verify Base.metadata contains all 8 required core database tables."""
+    """Verify Base.metadata contains all core database tables including auth and crawl results."""
     table_names = set(Base.metadata.tables.keys())
     expected_tables = {
         "organizations",
@@ -38,6 +38,11 @@ def test_metadata_tables_exist() -> None:
         "job_events",
         "audit_logs",
         "refresh_sessions",
+        "crawl_attempts",
+        "crawled_pages",
+        "email_findings",
+        "email_evidence",
+        "rejected_email_candidates",
     }
     assert expected_tables.issubset(table_names)
 
@@ -155,7 +160,7 @@ def test_alembic_single_head_revision() -> None:
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "20260816_0003"
+    assert heads[0] == "20260816_0004"
 
 
 def test_enum_values_synchronized() -> None:

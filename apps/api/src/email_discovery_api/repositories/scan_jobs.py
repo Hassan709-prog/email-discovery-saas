@@ -134,4 +134,61 @@ class ScanJobRepository:
             .values(**values)
         )
         result = await self.session.execute(stmt)
-        return getattr(result, "rowcount", 0) == 1
+        return int(getattr(result, "rowcount", 0)) == 1
+
+    async def get_job_for_update(self, organization_id: UUID, job_id: UUID) -> ScanJob | None:
+        """Lock and fetch scan job for tenant using SELECT ... FOR UPDATE."""
+        stmt = (
+            select(ScanJob)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+            )
+            .with_for_update()
+        )
+        res = await self.session.execute(stmt)
+        return res.scalar_one_or_none()
+
+    async def increment_completed_urls(
+        self, organization_id: UUID, job_id: UUID, delta: int = 1
+    ) -> None:
+        """Atomically increment completed_count for job."""
+        stmt = (
+            update(ScanJob)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+            )
+            .values(completed_count=ScanJob.completed_count + delta)
+        )
+        await self.session.execute(stmt)
+
+    async def increment_failed_urls(
+        self, organization_id: UUID, job_id: UUID, delta: int = 1
+    ) -> None:
+        """Atomically increment failed_count for job."""
+        stmt = (
+            update(ScanJob)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+            )
+            .values(failed_count=ScanJob.failed_count + delta)
+        )
+        await self.session.execute(stmt)
+
+    async def increment_email_findings(
+        self, organization_id: UUID, job_id: UUID, delta: int
+    ) -> None:
+        """Atomically increment email_finding_count by delta for job."""
+        if delta <= 0:
+            return
+        stmt = (
+            update(ScanJob)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanJob.id == job_id,
+            )
+            .values(email_finding_count=ScanJob.email_finding_count + delta)
+        )
+        await self.session.execute(stmt)

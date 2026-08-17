@@ -232,6 +232,36 @@ def compute_result_checksum(
     return hashlib.sha256(json_bytes).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class CrawlAttemptResult:
+    """Result container for CrawlAttempt persistence operations."""
+
+    attempt: Any
+    is_replay: bool
+
+
+def compute_transient_attempt_checksum(
+    scan_url_id: Any,
+    attempt_number: int,
+    outcome: str,
+    error_code: str,
+    retryable: bool,
+    requested_url: str,
+) -> str:
+    """Compute canonical SHA-256 checksum for a transient failure attempt."""
+    payload = {
+        "schema_version": "v1",
+        "scan_url_id": str(scan_url_id),
+        "attempt_number": attempt_number,
+        "outcome": outcome,
+        "error_code": error_code,
+        "retryable": retryable,
+        "requested_url": sanitize_url(requested_url),
+    }
+    json_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(json_bytes).hexdigest()
+
+
 def map_site_scan_result(
     site_scan_result: SiteScanResult,
     attempt_number: int,

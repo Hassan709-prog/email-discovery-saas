@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "email-discovery-crawl-worker"
+version = "0.1.0"
+description = "Local PostgreSQL-backed crawl worker process for Email Discovery SaaS"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "email-discovery-scanner",
+    "email-discovery-api",
+]
+
+[project.scripts]
+email-discovery-crawl-worker = "email_discovery_crawl_worker.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/email_discovery_crawl_worker"]

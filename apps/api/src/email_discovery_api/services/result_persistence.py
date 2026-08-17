@@ -1,17 +1,24 @@
-"""Transactional result persistence service for scanner SiteScanResult ingestion."""
+"""Transactional service for persisting scan results and fenced cancellations."""
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from email_discovery_api.mappers.crawl_results import map_site_scan_result
-from email_discovery_api.models.crawl_attempt import CrawlAttempt
+from email_discovery_api.mappers.crawl_results import (
+    CrawlAttemptResult,
+    MappedAttempt,
+    compute_transient_attempt_checksum,
+    map_site_scan_result,
+    sanitize_text,
+    sanitize_url,
+)
 from email_discovery_api.models.enums import ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
+from email_discovery_api.models.scan_url import ScanURL
 from email_discovery_api.repositories.crawl_results import (
     CrawlAttemptRepository,
     CrawledPageRepository,
@@ -24,32 +31,27 @@ from email_discovery_api.repositories.scan_jobs import ScanJobRepository
 from email_discovery_api.repositories.scan_urls import ScanURLRepository
 from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.result_policies import ResultPersistencePolicy
+from email_discovery_api.services.retry_policy import RetryBackoffPolicy
+from email_discovery_api.services.worker_contracts import LeaseLostError, URLClaim
+from email_scanner.errors import SiteScanOutcome
 from email_scanner.models import SiteScanResult
 
 
-@dataclass(frozen=True, slots=True)
-class CrawlAttemptResult:
-    """Result container returned by result persistence service."""
-
-    attempt: CrawlAttempt
-    is_replay: bool
-
-
-def map_outcome_to_url_status(outcome: str, findings_count: int) -> ScanURLStatus:
-    """Map pure scanner outcome string and findings count to target ScanURLStatus."""
-    outcome_upper = outcome.strip().upper()
-    if outcome_upper == "COMPLETED":
-        return ScanURLStatus.COMPLETED if findings_count > 0 else ScanURLStatus.NO_EMAIL
-    elif outcome_upper == "COMPLETED_NO_EMAILS":
-        return ScanURLStatus.NO_EMAIL
-    elif outcome_upper == "PARTIAL":
-        return ScanURLStatus.COMPLETED if findings_count > 0 else ScanURLStatus.FAILED
-    elif outcome_upper == "ROBOTS_BLOCKED":
-        return ScanURLStatus.NO_EMAIL
-    elif outcome_upper == "CANCELLED":
-        return ScanURLStatus.CANCELLED
-    else:
-        return ScanURLStatus.FAILED
+def map_outcome_to_url_status(
+    outcome: SiteScanOutcome, email_findings_count: int
+) -> tuple[ScanURLStatus, str | None]:
+    """Pure mapping of scanner outcome to terminal ScanURLStatus and error_code."""
+    if outcome in (SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS):
+        if email_findings_count > 0:
+            return ScanURLStatus.COMPLETED, None
+        return ScanURLStatus.NO_EMAIL, None
+    if outcome == SiteScanOutcome.PARTIAL:
+        return ScanURLStatus.COMPLETED, "PARTIAL_SCAN"
+    if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        return ScanURLStatus.FAILED, "ROBOTS_BLOCKED"
+    if outcome == SiteScanOutcome.CANCELLED:
+        return ScanURLStatus.CANCELLED, "JOB_CANCELLED"
+    return ScanURLStatus.FAILED, "SCAN_FAILED"
 
 
 class ResultPersistenceService:
@@ -59,9 +61,11 @@ class ResultPersistenceService:
         self,
         session: AsyncSession,
         policy: ResultPersistencePolicy | None = None,
+        retry_policy: RetryBackoffPolicy | None = None,
     ) -> None:
         self._session = session
         self._policy = policy or ResultPersistencePolicy()
+        self._retry_policy = retry_policy or RetryBackoffPolicy()
         self._scan_job_repo = ScanJobRepository(session)
         self._scan_url_repo = ScanURLRepository(session)
         self._event_repo = JobEventRepository(session)
@@ -80,18 +84,90 @@ class ResultPersistenceService:
         site_scan_result: SiteScanResult,
         now: datetime | None = None,
     ) -> CrawlAttemptResult:
-        """Persist scanner SiteScanResult within a single database transaction.
+        """Deprecated adapter for persisting scan results using a pre-existing active lease.
 
         Guarantees:
-            1. Validates tenant scope and locks ScanURL via SELECT ... FOR UPDATE.
-            2. Idempotent replay returns existing attempt without duplicate rows or counter changes.
-            3. Conflicting attempt replay raises RESULT_CONFLICT.
-            4. EmailFinding & evidence counts increment precisely without duplicates.
-            5. ScanJob counters & events trigger ONLY on initial SCANNING -> terminal transition.
+            1. Runs inside exactly ONE transaction.
+            2. Never creates or repairs a lease; requires active SCANNING status with valid owner.
+            3. Never extends lease expiry or alters attempt_count.
+            4. Does not swallow exceptions.
         """
-        current_time = now or datetime.now(UTC)
+        async with self._session.begin():
+            raw_url = await self._scan_url_repo.get_url_for_update(
+                organization_id=organization_id, job_id=job_id, scan_url_id=scan_url_id
+            )
+            if raw_url is None:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {scan_url_id} not found.",
+                )
 
-        # Validate result size limits against policy prior to database interaction
+            if raw_url.status != ScanURLStatus.SCANNING.value:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {scan_url_id} is in status {raw_url.status}, expected SCANNING.",
+                )
+
+            if not raw_url.lease_owner:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {scan_url_id} has no active lease owner.",
+                )
+
+            current_time = now or datetime.now(UTC)
+            if raw_url.lease_expires_at is not None and raw_url.lease_expires_at <= current_time:
+                raise ServiceError(
+                    ServiceErrorCode.LEASE_LOST,
+                    f"ScanURL {scan_url_id} lease expired at {raw_url.lease_expires_at}.",
+                )
+
+            claim = URLClaim(
+                scan_url_id=scan_url_id,
+                organization_id=organization_id,
+                job_id=job_id,
+                original_input=raw_url.original_input,
+                normalized_url=raw_url.normalized_url,
+                normalized_domain=raw_url.normalized_domain,
+                lease_owner=raw_url.lease_owner,
+                attempt_count=raw_url.attempt_count,
+                max_attempts=raw_url.max_attempts,
+                lease_expires_at=raw_url.lease_expires_at
+                or (current_time + timedelta(seconds=120)),
+            )
+
+            return await self._persist_fenced_result_in_transaction(
+                claim=claim, site_scan_result=site_scan_result, now=now
+            )
+
+    async def persist_fenced_result(
+        self,
+        claim: URLClaim,
+        site_scan_result: SiteScanResult,
+        now: datetime | None = None,
+    ) -> CrawlAttemptResult:
+        """Persist scanner SiteScanResult using strict lease_owner + attempt_count fencing.
+
+        Fencing predicate enforced in SQL:
+            status = 'SCANNING'
+            AND lease_owner = claim.lease_owner
+            AND attempt_count = claim.attempt_count
+            AND lease_expires_at > clock_timestamp()
+
+        Raises LeaseLostError if fencing check fails.
+        """
+        async with self._session.begin():
+            return await self._persist_fenced_result_in_transaction(
+                claim=claim, site_scan_result=site_scan_result, now=now
+            )
+
+    async def _persist_fenced_result_in_transaction(
+        self,
+        claim: URLClaim,
+        site_scan_result: SiteScanResult,
+        now: datetime | None = None,
+    ) -> CrawlAttemptResult:
+        """Internal helper executing persistence within an active transaction."""
+        current_time = now or datetime.now(UTC)
         self._policy.validate_site_scan_result(site_scan_result)
 
         (
@@ -102,144 +178,283 @@ class ResultPersistenceService:
             mapped_rejected,
         ) = map_site_scan_result(
             site_scan_result=site_scan_result,
-            attempt_number=attempt_number,
+            attempt_number=claim.attempt_count,
             now=current_time,
             policy=self._policy,
         )
 
-        async with self._session.begin():
-            # 1. Lock ScanURL tenant-scoped using SELECT ... FOR UPDATE
-            scan_url = await self._scan_url_repo.get_url_for_update(
-                organization_id=organization_id,
-                job_id=job_id,
-                scan_url_id=scan_url_id,
+        # Check existing attempt for idempotent replay
+        existing_attempt = await self._attempt_repo.get_by_scan_url_and_attempt(
+            scan_url_id=claim.scan_url_id, attempt_number=claim.attempt_count
+        )
+        if existing_attempt:
+            if existing_attempt.result_checksum == mapped_attempt.result_checksum:
+                return CrawlAttemptResult(attempt=existing_attempt, is_replay=True)
+            raise ServiceError(
+                ServiceErrorCode.RESULT_CONFLICT,
+                f"ScanURL attempt {claim.attempt_count} exists with different result checksum",
             )
-            if not scan_url:
-                raise ServiceError(
-                    ServiceErrorCode.SCAN_URL_NOT_FOUND,
-                    f"ScanURL {scan_url_id} not found for job {job_id}",
-                )
 
-            # Check existing attempt for replay check
+        # Strict fencing check requiring lease_expires_at > clock_timestamp()
+        stmt_check = (
+            update(ScanURL)
+            .where(
+                ScanURL.id == claim.scan_url_id,
+                ScanURL.status == ScanURLStatus.SCANNING.value,
+                ScanURL.lease_owner == claim.lease_owner,
+                ScanURL.attempt_count == claim.attempt_count,
+                ScanURL.lease_expires_at > func.clock_timestamp(),
+            )
+            .values(updated_at=func.clock_timestamp())
+        )
+        fence_res = await self._session.execute(stmt_check)
+        if int(getattr(fence_res, "rowcount", 0)) == 0:
+            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
+
+        target_status, err_code = map_outcome_to_url_status(
+            site_scan_result.outcome, len(mapped_findings)
+        )
+
+        # 1. Save CrawlAttempt
+        attempt_obj = await self._attempt_repo.create(claim.scan_url_id, mapped_attempt)
+
+        # 2. Save CrawledPages
+        page_id_map = await self._page_repo.create_many(
+            crawl_attempt_id=attempt_obj.id,
+            scan_url_id=claim.scan_url_id,
+            mapped_pages=mapped_pages,
+        )
+
+        # 3. Upsert EmailFindings
+        newly_inserted, existing_updated = await self._finding_repo.upsert_findings(
+            job_id=claim.job_id,
+            mapped_findings=mapped_findings,
+            now=current_time,
+        )
+        new_findings_count = len(newly_inserted)
+
+        finding_id_map: dict[str, uuid.UUID] = {f.canonical_email: f.id for f in newly_inserted}
+        finding_id_map.update({f.canonical_email: f.id for f in existing_updated})
+
+        # 4. Insert EmailEvidence idempotently
+        inserted_evidence = await self._evidence_repo.add_evidence(
+            mapped_evidence=mapped_evidence,
+            finding_id_map=finding_id_map,
+            page_id_map=page_id_map,
+        )
+
+        evidence_counts: dict[uuid.UUID, int] = {}
+        for ev in inserted_evidence:
+            evidence_counts[ev.email_finding_id] = evidence_counts.get(ev.email_finding_id, 0) + 1
+
+        for finding_id, added_count in evidence_counts.items():
+            await self._finding_repo.increment_evidence_count(finding_id, added_count)
+
+        # 5. Add bounded RejectedEmailCandidates
+        await self._rejected_repo.add_rejected_candidates(
+            job_id=claim.job_id,
+            scan_url_id=claim.scan_url_id,
+            page_id_map=page_id_map,
+            mapped_rejected=mapped_rejected,
+        )
+
+        # 6. Update ScanURL to target terminal status and clear lease
+        stmt_url_final = (
+            update(ScanURL)
+            .where(ScanURL.id == claim.scan_url_id)
+            .values(
+                status=target_status.value,
+                completed_at=current_time,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error_code=err_code,
+                last_error_message=site_scan_result.error_message,
+            )
+        )
+        await self._session.execute(stmt_url_final)
+
+        # 7. Counter updates on ScanJob
+        job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
+        if job is not None and getattr(job, "running_count", None) is not None:
+            if job.running_count > 0:
+                job.running_count = job.running_count - 1
+
+            if target_status in (ScanURLStatus.COMPLETED, ScanURLStatus.NO_EMAIL):
+                job.completed_count = job.completed_count + 1
+            elif target_status == ScanURLStatus.FAILED:
+                job.failed_count = job.failed_count + 1
+
+            if new_findings_count > 0:
+                job.email_finding_count = job.email_finding_count + new_findings_count
+
+            seq = await self._scan_job_repo.allocate_event_sequence(
+                claim.organization_id, claim.job_id
+            )
+            event_type = (
+                "SCAN_URL_COMPLETED" if target_status != ScanURLStatus.FAILED else "SCAN_URL_FAILED"
+            )
+            if seq is not None:
+                job_event = JobEvent(
+                    scan_job_id=claim.job_id,
+                    scan_url_id=claim.scan_url_id,
+                    sequence_number=seq,
+                    event_type=event_type,
+                    payload={
+                        "attempt_number": claim.attempt_count,
+                        "scan_url_id": str(claim.scan_url_id),
+                        "target_status": target_status.value,
+                        "total_findings": len(mapped_findings),
+                        "new_findings": new_findings_count,
+                    },
+                )
+                self._event_repo.append_event(job_event)
+
+        return CrawlAttemptResult(attempt=attempt_obj, is_replay=False)
+
+    async def persist_transient_failure(
+        self,
+        claim: URLClaim,
+        error_code: str,
+        error_message: str,
+        now: datetime | None = None,
+    ) -> CrawlAttemptResult:
+        """Record transient failure CrawlAttempt and schedule RETRY_WAIT or mark FAILED.
+
+        Enforces strict fencing requirement: lease_expires_at > clock_timestamp().
+        Uses injectable RetryBackoffPolicy and claim.max_attempts.
+        """
+        current_time = now or datetime.now(UTC)
+        sanitized_requested_url = sanitize_url(claim.original_input)
+        sanitized_err_msg = sanitize_text(
+            error_message, max_length=self._policy.max_error_message_length
+        )
+
+        retryable = claim.attempt_count < claim.max_attempts
+        delay_seconds = self._retry_policy.compute_delay_seconds(claim.attempt_count)
+
+        checksum = compute_transient_attempt_checksum(
+            scan_url_id=claim.scan_url_id,
+            attempt_number=claim.attempt_count,
+            outcome="FAILED",
+            error_code=error_code,
+            retryable=retryable,
+            requested_url=sanitized_requested_url,
+        )
+
+        async with self._session.begin():
             existing_attempt = await self._attempt_repo.get_by_scan_url_and_attempt(
-                scan_url_id=scan_url_id, attempt_number=attempt_number
+                scan_url_id=claim.scan_url_id, attempt_number=claim.attempt_count
             )
             if existing_attempt:
-                if existing_attempt.result_checksum == mapped_attempt.result_checksum:
+                if existing_attempt.result_checksum == checksum:
                     return CrawlAttemptResult(attempt=existing_attempt, is_replay=True)
-                else:
-                    raise ServiceError(
-                        ServiceErrorCode.RESULT_CONFLICT,
-                        f"ScanURL attempt {attempt_number} exists with different result checksum",
-                    )
-
-            # Enforce requirement 1: ScanURL must be in SCANNING state for first result submission
-            if scan_url.status != ScanURLStatus.SCANNING.value:
-                if scan_url.status == ScanURLStatus.CANCELLED.value:
-                    raise ServiceError(
-                        ServiceErrorCode.INVALID_RESULT_STATE,
-                        f"ScanURL {scan_url_id} is CANCELLED and cannot accept results",
-                    )
                 raise ServiceError(
-                    ServiceErrorCode.INVALID_RESULT_STATE,
-                    f"ScanURL {scan_url_id} is in status {scan_url.status}, expected SCANNING",
+                    ServiceErrorCode.RESULT_CONFLICT,
+                    f"ScanURL attempt {claim.attempt_count} exists with different checksum",
                 )
 
-            # 2. Save CrawlAttempt
-            attempt_obj = await self._attempt_repo.create(scan_url_id, mapped_attempt)
-
-            # 3. Save CrawledPages
-            page_id_map = await self._page_repo.create_many(
-                crawl_attempt_id=attempt_obj.id,
-                scan_url_id=scan_url_id,
-                mapped_pages=mapped_pages,
-            )
-
-            # 4. Upsert EmailFindings
-            newly_inserted, existing_updated = await self._finding_repo.upsert_findings(
-                job_id=job_id,
-                mapped_findings=mapped_findings,
-                now=current_time,
-            )
-            new_findings_count = len(newly_inserted)
-
-            # Build map of canonical_email -> finding_id
-            finding_id_map: dict[str, uuid.UUID] = {f.canonical_email: f.id for f in newly_inserted}
-            finding_id_map.update({f.canonical_email: f.id for f in existing_updated})
-
-            # 5. Insert EmailEvidence idempotently
-            inserted_evidence = await self._evidence_repo.add_evidence(
-                mapped_evidence=mapped_evidence,
-                finding_id_map=finding_id_map,
-                page_id_map=page_id_map,
-            )
-
-            # Increment evidence_count on EmailFinding ONLY by count of actually inserted evidence
-            evidence_counts: dict[uuid.UUID, int] = {}
-            for ev in inserted_evidence:
-                evidence_counts[ev.email_finding_id] = (
-                    evidence_counts.get(ev.email_finding_id, 0) + 1
+            stmt_fence = (
+                update(ScanURL)
+                .where(
+                    ScanURL.id == claim.scan_url_id,
+                    ScanURL.status == ScanURLStatus.SCANNING.value,
+                    ScanURL.lease_owner == claim.lease_owner,
+                    ScanURL.attempt_count == claim.attempt_count,
+                    ScanURL.lease_expires_at > func.clock_timestamp(),
                 )
-
-            for finding_id, added_count in evidence_counts.items():
-                await self._finding_repo.increment_evidence_count(finding_id, added_count)
-
-            # 6. Add bounded RejectedEmailCandidates
-            await self._rejected_repo.add_rejected_candidates(
-                job_id=job_id,
-                scan_url_id=scan_url_id,
-                page_id_map=page_id_map,
-                mapped_rejected=mapped_rejected,
+                .values(updated_at=func.clock_timestamp())
             )
+            fence_res = await self._session.execute(stmt_fence)
+            if int(getattr(fence_res, "rowcount", 0)) == 0:
+                raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
 
-            # 7. Transition ScanURL SCANNING -> terminal
-            target_status = map_outcome_to_url_status(
-                site_scan_result.outcome, len(mapped_findings)
+            mapped_attempt = MappedAttempt(
+                attempt_number=claim.attempt_count,
+                outcome="FAILED",
+                retryable=retryable,
+                requested_url=sanitized_requested_url,
+                final_url=sanitized_requested_url,
+                status_code=None,
+                error_code=error_code,
+                error_message=sanitized_err_msg,
+                redirect_history=None,
+                connection_attempts=None,
+                started_at=current_time,
+                completed_at=current_time,
+                elapsed_seconds=0.0,
+                result_checksum=checksum,
             )
-            transitioned = await self._scan_url_repo.update_status_conditional(
-                organization_id=organization_id,
-                job_id=job_id,
-                scan_url_id=scan_url_id,
-                expected_status=ScanURLStatus.SCANNING.value,
-                new_status=target_status.value,
-            )
+            attempt_obj = await self._attempt_repo.create(claim.scan_url_id, mapped_attempt)
 
-            if transitioned:
-                # 8. Increment counters & dispatch event ONLY on first terminal transition
-                if target_status in (ScanURLStatus.COMPLETED, ScanURLStatus.NO_EMAIL):
-                    await self._scan_job_repo.increment_completed_urls(
-                        organization_id, job_id, delta=1
-                    )
-                elif target_status == ScanURLStatus.FAILED:
-                    await self._scan_job_repo.increment_failed_urls(
-                        organization_id, job_id, delta=1
-                    )
+            target_status = ScanURLStatus.RETRY_WAIT if retryable else ScanURLStatus.FAILED
 
-                if new_findings_count > 0:
-                    await self._scan_job_repo.increment_email_findings(
-                        organization_id, job_id, delta=new_findings_count
-                    )
-
-                seq = await self._scan_job_repo.allocate_event_sequence(organization_id, job_id)
-                event_type = (
-                    "SCAN_URL_COMPLETED"
-                    if target_status != ScanURLStatus.FAILED
-                    else "SCAN_URL_FAILED"
+            stmt_url_update = (
+                update(ScanURL)
+                .where(ScanURL.id == claim.scan_url_id)
+                .values(
+                    status=target_status.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error_code=error_code,
+                    last_error_message=sanitized_err_msg,
+                    completed_at=current_time if not retryable else None,
+                    next_retry_at=(func.clock_timestamp() + timedelta(seconds=delay_seconds))
+                    if retryable
+                    else None,
                 )
-                if seq is not None:
-                    job_event = JobEvent(
-                        scan_job_id=job_id,
-                        scan_url_id=scan_url_id,
-                        sequence_number=seq,
-                        event_type=event_type,
-                        payload={
-                            "attempt_number": attempt_number,
-                            "scan_url_id": str(scan_url_id),
-                            "target_status": target_status.value,
-                            "total_findings": len(mapped_findings),
-                            "new_findings": new_findings_count,
-                        },
-                    )
-                    self._event_repo.append_event(job_event)
+            )
+            await self._session.execute(stmt_url_update)
+
+            job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
+            if job is not None and getattr(job, "running_count", None) is not None:
+                if job.running_count > 0:
+                    job.running_count = job.running_count - 1
+
+                if retryable:
+                    job.queued_count = job.queued_count + 1
+                else:
+                    job.failed_count = job.failed_count + 1
 
             return CrawlAttemptResult(attempt=attempt_obj, is_replay=False)
+
+    async def persist_fenced_cancellation(self, claim: URLClaim) -> bool:
+        """Persist fenced URL cancellation during active scan when cancellation requested.
+
+        Guarantees:
+            1. Verifies lease_expires_at > clock_timestamp().
+            2. Transitions ScanURL to CANCELLED.
+            3. Decrements running_count on ScanJob.
+            4. DOES NOT increment failed_count.
+        """
+        async with self._session.begin():
+            stmt_cancel = (
+                update(ScanURL)
+                .where(
+                    ScanURL.id == claim.scan_url_id,
+                    ScanURL.status == ScanURLStatus.SCANNING.value,
+                    ScanURL.lease_owner == claim.lease_owner,
+                    ScanURL.attempt_count == claim.attempt_count,
+                    ScanURL.lease_expires_at > func.clock_timestamp(),
+                )
+                .values(
+                    status=ScanURLStatus.CANCELLED.value,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    completed_at=func.clock_timestamp(),
+                    last_error_code="JOB_CANCELLED",
+                    last_error_message="Scan URL cancelled by user job cancellation request.",
+                )
+            )
+            res = await self._session.execute(stmt_cancel)
+            if int(getattr(res, "rowcount", 0)) == 0:
+                raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
+
+            job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
+            if (
+                job is not None
+                and getattr(job, "running_count", None) is not None
+                and job.running_count > 0
+            ):
+                job.running_count = job.running_count - 1
+
+            return True

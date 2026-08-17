@@ -6,10 +6,13 @@ requires-python = ">=3.14,<3.15"
 dependencies = [
     "email-discovery-scanner",
     "email-discovery-api",
+    "email-discovery-crawl-worker",
 ]
 
+
 [tool.pytest.ini_options]
-testpaths = ["packages/scanner/tests", "apps/api/tests", "tests"]
+testpaths = ["packages/scanner/tests", "apps/api/tests", "workers/crawl/tests", "tests"]
+pythonpath = [".", "apps/api", "workers/crawl"]
 addopts = "-ra --strict-markers"
 
 [tool.ruff]
@@ -23,18 +26,22 @@ ignore = ["B008"]
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
-include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests"]
-extraPaths = ["packages/scanner/src", "apps/api/src"]
+include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests", "workers/crawl/src", "workers/crawl/tests"]
+extraPaths = ["packages/scanner/src", "apps/api/src", "workers/crawl/src"]
+
 
 [tool.uv.workspace]
 members = [
     "packages/scanner",
     "apps/api",
+    "workers/crawl",
 ]
 
 [tool.uv.sources]
 email-discovery-scanner = { workspace = true, editable = true }
 email-discovery-api = { workspace = true, editable = true }
+email-discovery-crawl-worker = { workspace = true, editable = true }
+
 
 [dependency-groups]
 dev = [

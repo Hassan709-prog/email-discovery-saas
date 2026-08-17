@@ -1,17 +1,13 @@
-"""Pytest fixtures shared across apps/api unit and integration tests."""
+"""Pytest configuration for workers/crawl package tests."""
 
 from apps.api.tests.support.postgres import (
-    DEFAULT_TEST_PG_URL,
     isolated_db_engine,
     test_settings,
     test_user_and_token,
-    validate_test_database_url,
 )
 
 __all__ = [
-    "DEFAULT_TEST_PG_URL",
     "isolated_db_engine",
     "test_settings",
     "test_user_and_token",
-    "validate_test_database_url",
 ]

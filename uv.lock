@@ -5,6 +5,7 @@ requires-python = "==3.14.*"
 [manifest]
 members = [
     "email-discovery-api",
+    "email-discovery-crawl-worker",
     "email-discovery-saas",
     "email-discovery-scanner",
 ]
@@ -338,11 +339,27 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [[package]]
+name = "email-discovery-crawl-worker"
+version = "0.1.0"
+source = { editable = "workers/crawl" }
+dependencies = [
+    { name = "email-discovery-api" },
+    { name = "email-discovery-scanner" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "email-discovery-api", editable = "apps/api" },
+    { name = "email-discovery-scanner", editable = "packages/scanner" },
+]
+
+[[package]]
 name = "email-discovery-saas"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "email-discovery-api" },
+    { name = "email-discovery-crawl-worker" },
     { name = "email-discovery-scanner" },
 ]
 
@@ -358,6 +375,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "email-discovery-api", editable = "apps/api" },
+    { name = "email-discovery-crawl-worker", editable = "workers/crawl" },
     { name = "email-discovery-scanner", editable = "packages/scanner" },
 ]
 

@@ -89,10 +89,10 @@ describe('Phase 3C: Email Findings List & Filtering', () => {
       expect(screen.getByText('support@acme.com')).toBeInTheDocument();
     });
 
-    expect(screen.getAllByText('Personal/Named').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Role-based').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Valid').length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Unverified').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Named contact').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Role address').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Format accepted').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Not independently verified').length).toBeGreaterThan(0);
   });
 
   it('renders empty findings state when zero email findings discovered', async () => {

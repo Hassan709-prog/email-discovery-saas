@@ -65,14 +65,14 @@ describe('JobDetailPage', () => {
     vi.useRealTimers();
   });
 
-  it('maps COMPLETED_WITH_ERRORS to Partial status badge', async () => {
+  it('maps COMPLETED_WITH_ERRORS to Completed with Some Issues status badge', async () => {
     vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(mockJobDetail('COMPLETED_WITH_ERRORS'));
     vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({ items: [], next_cursor: null });
 
     render(<JobDetailPage />);
 
     await waitFor(() => {
-      expect(screen.getByText('Partial')).toBeInTheDocument();
+      expect(screen.getByText('Completed with Some Issues')).toBeInTheDocument();
     });
   });
 
@@ -84,7 +84,7 @@ describe('JobDetailPage', () => {
     render(<JobDetailPage />);
 
     await waitFor(() => {
-      expect(screen.getByText('Draft')).toBeInTheDocument();
+      expect(screen.getByText('Not Started')).toBeInTheDocument();
     });
 
     // Advance 10 seconds
@@ -117,7 +117,7 @@ describe('JobDetailPage', () => {
     render(<JobDetailPage />);
 
     await waitFor(() => {
-      expect(screen.getAllByText('Running').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('Scanning').length).toBeGreaterThan(0);
     });
 
     // Initial load calls URLs once
@@ -161,7 +161,7 @@ describe('JobDetailPage', () => {
     render(<JobDetailPage />);
 
     await waitFor(() => {
-      expect(screen.getAllByText('Running').length).toBeGreaterThan(0);
+      expect(screen.getAllByText('Scanning').length).toBeGreaterThan(0);
     });
 
     // Advance 3 seconds -> Polls progress and gets COMPLETED status

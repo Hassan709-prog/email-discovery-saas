@@ -1,4 +1,5 @@
 import {
+  AnalyticsOverviewResponse,
   ApiError,
   ApiErrorEnvelope,
   AuthSuccessResponse,
@@ -226,6 +227,14 @@ export async function logoutAllUser(): Promise<void> {
   } finally {
     setAccessToken(null);
   }
+}
+
+export async function getAnalyticsOverview(
+  period: string = '30d'
+): Promise<AnalyticsOverviewResponse> {
+  return apiFetch<AnalyticsOverviewResponse>(`/api/v1/analytics/overview?period=${encodeURIComponent(period)}`, {
+    method: 'GET',
+  });
 }
 
 // Scan Jobs API methods

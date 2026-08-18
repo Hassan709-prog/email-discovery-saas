@@ -111,8 +111,15 @@ class AuthService:
             raise AuthServiceError(ServiceErrorCode.PASSWORD_POLICY_VIOLATION, str(exc)) from exc
 
         norm_email = normalize_email(str(command.email))
-        raw_slug = command.organization_slug or command.organization_name
-        norm_slug = normalize_org_slug(raw_slug)
+        if command.organization_name and command.organization_name.strip():
+            org_name = command.organization_name.strip()
+        elif command.display_name and command.display_name.strip():
+            org_name = f"{command.display_name.strip()}'s Workspace"
+        else:
+            org_name = "Personal Workspace"
+
+        # Server-side generated random slug with 128 bits of entropy (full UUID hex)
+        norm_slug = normalize_org_slug(f"workspace-{uuid.uuid4().hex}")
 
         # Hash password before database transaction
         pwd_hash = await self._password_service.hash_password(command.password)
@@ -129,7 +136,7 @@ class AuthService:
 
             # 2. Create Organization
             org = await self._user_repo.create_organization(
-                name=command.organization_name,
+                name=org_name,
                 slug=norm_slug,
                 status=OrganizationStatus.ACTIVE.value,
             )
@@ -179,9 +186,15 @@ class AuthService:
 
         except IntegrityError as exc:
             await self._session.rollback()
+            existing_user = await self._user_repo.get_by_email(norm_email)
+            if existing_user is not None:
+                raise AuthServiceError(
+                    ServiceErrorCode.EMAIL_OR_SLUG_CONFLICT,
+                    "User with this email address already exists.",
+                ) from exc
             raise AuthServiceError(
                 ServiceErrorCode.EMAIL_OR_SLUG_CONFLICT,
-                "User with this email or organization slug already exists.",
+                "Organization workspace identifier conflict.",
             ) from exc
 
         # Create JWT access token

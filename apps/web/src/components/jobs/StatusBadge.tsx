@@ -12,19 +12,19 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, className = ''
 
   switch (status) {
     case 'DRAFT':
-      label = 'Draft';
+      label = 'Not Started';
       styleClasses = 'bg-slate-100 text-slate-700 border-slate-200';
       break;
     case 'QUEUED':
-      label = 'Queued';
+      label = 'Waiting';
       styleClasses = 'bg-amber-50 text-amber-800 border-amber-200';
       break;
     case 'RUNNING':
-      label = 'Running';
-      styleClasses = 'bg-blue-50 text-blue-700 border-blue-200';
+      label = 'Scanning';
+      styleClasses = 'bg-indigo-50 text-indigo-700 border-indigo-200';
       break;
     case 'CANCELLING':
-      label = 'Cancelling...';
+      label = 'Cancelling';
       styleClasses = 'bg-orange-50 text-orange-800 border-orange-200';
       break;
     case 'CANCELLED':
@@ -36,8 +36,8 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, className = ''
       styleClasses = 'bg-emerald-50 text-emerald-800 border-emerald-200';
       break;
     case 'COMPLETED_WITH_ERRORS':
-      label = 'Partial';
-      styleClasses = 'bg-indigo-50 text-indigo-800 border-indigo-200';
+      label = 'Completed with Some Issues';
+      styleClasses = 'bg-amber-50 text-amber-800 border-amber-200';
       break;
     case 'FAILED':
       label = 'Failed';

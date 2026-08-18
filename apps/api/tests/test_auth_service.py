@@ -71,6 +71,46 @@ async def test_register_creates_user_org_membership_session_in_one_transaction(
 
 
 @pytest.mark.anyio
+async def test_register_without_organization_name_uses_display_name_and_random_uuid_slug(
+    test_settings: Settings, fast_password_service: PasswordService
+) -> None:
+    """Verify registration without org name auto-creates personal workspace with random slug."""
+    mock_session = AsyncMock(spec=AsyncSession)
+    mock_session.commit = AsyncMock()
+
+    service = AuthService(
+        session=mock_session,
+        settings=test_settings,
+        password_service=fast_password_service,
+    )
+
+    mock_user = MagicMock(id=uuid.uuid4(), auth_version=1)
+    mock_org = MagicMock(id=uuid.uuid4())
+
+    service._user_repo.create_user = AsyncMock(return_value=mock_user)  # pyright: ignore[reportPrivateUsage]
+    service._user_repo.create_organization = AsyncMock(return_value=mock_org)  # pyright: ignore[reportPrivateUsage]
+    service._user_repo.create_membership = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    service._refresh_repo.create_session = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+
+    req = RegisterRequest(
+        email="personal@example.com",
+        password="SecurePassword123!",
+        display_name="Hassan Malik",
+    )
+
+    result = await service.register(req)
+
+    assert isinstance(result, AuthSuccessResult)
+    mock_session.commit.assert_awaited_once()
+
+    # Check create_organization was called with personal workspace name and random slug
+    _args, kwargs = service._user_repo.create_organization.call_args  # pyright: ignore[reportPrivateUsage]
+    assert kwargs["name"] == "Hassan Malik's Workspace"
+    assert kwargs["slug"].startswith("workspace-")
+    assert len(kwargs["slug"]) >= 40  # 'workspace-' + 32 hex chars
+
+
+@pytest.mark.anyio
 async def test_register_uniqueness_conflict_recovers_gracefully(
     test_settings: Settings, fast_password_service: PasswordService
 ) -> None:

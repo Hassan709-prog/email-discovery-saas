@@ -4,9 +4,9 @@ test.describe('Authentication Smoke Tests', () => {
   test('landing page loads and links to register and login', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveTitle(/Email Discovery/);
-    await expect(page.getByRole('heading', { name: /Discover publicly listed business emails/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /Find publicly listed business emails/i })).toBeVisible();
 
-    const getStartedBtn = page.getByRole('link', { name: /Get Started/i });
+    const getStartedBtn = page.getByRole('link', { name: /Start Finding Emails/i });
     await expect(getStartedBtn).toBeVisible();
     await getStartedBtn.click();
 

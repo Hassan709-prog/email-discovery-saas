@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { AuthProvider } from '@/context/auth-context';
 import { Navbar } from '@/components/layout/Navbar';
+import { OnboardingTutorialModal } from '@/components/tutorial/OnboardingTutorialModal';
 
 export const metadata: Metadata = {
   title: 'Email Discovery SaaS',
@@ -19,6 +20,7 @@ export default function RootLayout({
         <AuthProvider>
           <Navbar />
           <main className="flex-1">{children}</main>
+          <OnboardingTutorialModal />
         </AuthProvider>
       </body>
     </html>

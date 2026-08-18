@@ -158,10 +158,10 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
         <div className="p-6 bg-slate-50 border-b border-slate-200 flex items-start justify-between">
           <div className="space-y-1">
             <h2 id="evidence-dialog-title" className="text-xl font-bold text-slate-900 tracking-tight">
-              Finding Evidence Details
+              Where this email was found
             </h2>
             {detail && (
-              <p className="text-sm font-mono text-brand-700 font-semibold break-all">
+              <p className="text-sm font-mono text-indigo-700 font-semibold break-all">
                 {detail.canonical_email}
               </p>
             )}
@@ -268,7 +268,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
                           </div>
                         </div>
 
-                        {/* Source Page URL - Plain Text Safe Rendering */}
+                        {/* Source Page URL */}
                         <div>
                           <p className="text-slate-500 font-medium">Source Web Page URL:</p>
                           <p className="font-mono text-slate-900 whitespace-pre-wrap break-all mt-0.5 bg-slate-50 p-2 rounded border border-slate-200">
@@ -276,22 +276,29 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
                           </p>
                         </div>
 
-                        {/* Evidence Snippet - Plain Text Safe Rendering (NO dangerouslySetInnerHTML) */}
+                        {/* Evidence Snippet */}
                         {ev.snippet && (
                           <div>
-                            <p className="text-slate-500 font-medium">Surrounding Text Context Snippet:</p>
+                            <p className="text-slate-500 font-medium">Matching Text Context:</p>
                             <p className="font-mono text-slate-800 whitespace-pre-wrap break-all mt-0.5 bg-slate-900 text-slate-100 p-3 rounded-lg text-[11px] leading-relaxed">
                               {ev.snippet}
                             </p>
                           </div>
                         )}
 
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 pt-1 border-t border-slate-100">
-                          <p>
-                            HTTP Status: {ev.crawled_page_status_code ?? '—'} • Crawl Depth: {ev.crawled_page_depth ?? '—'}
-                          </p>
-                          <p>{new Date(ev.created_at).toLocaleString()}</p>
-                        </div>
+                        {/* Collapsible Technical Details */}
+                        <details className="pt-1 text-[11px] text-slate-500 border-t border-slate-100 group">
+                          <summary className="cursor-pointer font-semibold text-slate-600 hover:text-indigo-600 select-none py-0.5">
+                            Technical details
+                          </summary>
+                          <div className="pt-2 pl-2 space-y-1 text-[11px] font-mono text-slate-600">
+                            <p>Discovery Method: {ev.source_type}</p>
+                            <p>Confidence Score: {(ev.confidence * 100).toFixed(0)}%</p>
+                            <p>HTTP Status Code: {ev.crawled_page_status_code ?? '—'}</p>
+                            <p>Crawl Depth: {ev.crawled_page_depth ?? '—'}</p>
+                            <p>First Seen: {new Date(ev.created_at).toLocaleString()}</p>
+                          </div>
+                        </details>
                       </div>
                     ))}
                   </div>

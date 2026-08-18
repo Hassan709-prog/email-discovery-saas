@@ -12,6 +12,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from email_discovery_api.services.result_policies import ResultPersistencePolicy
+from email_scanner.errors import SiteScanOutcome
 from email_scanner.models import (
     SiteScanResult,
 )
@@ -415,7 +416,21 @@ def map_site_scan_result(
                 )
 
     attempt_outcome = str(site_scan_result.outcome)
-    retryable = attempt_outcome in ("FAILED", "ROBOTS_BLOCKED")
+    if site_scan_result.outcome in (
+        SiteScanOutcome.COMPLETED,
+        SiteScanOutcome.COMPLETED_NO_EMAILS,
+        SiteScanOutcome.CANCELLED,
+    ):
+        retryable = False
+    elif site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        retryable = False
+    else:
+        # For FAILED or PARTIAL outcomes, evaluate retryability from page records
+        from email_discovery_crawl_worker.outcome_classifier import (
+            classify_error_code_and_retryability,
+        )
+
+        _, retryable = classify_error_code_and_retryability(site_scan_result)
     err_msg = sanitize_text(site_scan_result.error_message, max_length=pol.max_error_message_length)
     elapsed = site_scan_result.statistics.elapsed_seconds if site_scan_result.statistics else 0.0
 

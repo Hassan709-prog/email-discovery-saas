@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -285,9 +285,18 @@ class CrawlWorkService:
                 if job.running_count > 0:
                     job.running_count = job.running_count - 1
 
-                if scan_url.attempt_count < scan_url.max_attempts:
+                if job.status in (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value):
+                    scan_url.status = ScanURLStatus.CANCELLED.value
+                    scan_url.completed_at = datetime.now(UTC)
+                    scan_url.lease_owner = None
+                    scan_url.lease_expires_at = None
+                    scan_url.last_error_code = "JOB_CANCELLED"
+                    scan_url.last_error_message = (
+                        "Cancelled by job cancellation request during lease recovery."
+                    )
+                elif scan_url.attempt_count < scan_url.max_attempts:
                     scan_url.status = ScanURLStatus.RETRY_WAIT.value
-                    scan_url.next_retry_at = datetime.now()
+                    scan_url.next_retry_at = datetime.now(UTC)
                     scan_url.lease_owner = None
                     scan_url.lease_expires_at = None
                     scan_url.last_error_code = "LEASE_EXPIRED"
@@ -295,7 +304,7 @@ class CrawlWorkService:
                     job.queued_count = job.queued_count + 1
                 else:
                     scan_url.status = ScanURLStatus.FAILED.value
-                    scan_url.completed_at = datetime.now()
+                    scan_url.completed_at = datetime.now(UTC)
                     scan_url.lease_owner = None
                     scan_url.lease_expires_at = None
                     scan_url.last_error_code = "LEASE_EXPIRED_MAX_ATTEMPTS"

@@ -405,17 +405,23 @@ class ScanJobService:
                     f"Job {job_id} is in status {current_status.value} and cannot be cancelled.",
                 )
 
-            # Cancel all unclaimed URLs
+            # Cancel all unclaimed or expired SCANNING URLs
             stmt_unclaimed = (
                 update(ScanURL)
                 .where(
                     ScanURL.scan_job_id == job_id,
-                    ScanURL.status.in_(
-                        [
-                            ScanURLStatus.PENDING.value,
-                            ScanURLStatus.QUEUED.value,
-                            ScanURLStatus.RETRY_WAIT.value,
-                        ]
+                    (
+                        ScanURL.status.in_(
+                            [
+                                ScanURLStatus.PENDING.value,
+                                ScanURLStatus.QUEUED.value,
+                                ScanURLStatus.RETRY_WAIT.value,
+                            ]
+                        )
+                        | (
+                            (ScanURL.status == ScanURLStatus.SCANNING.value)
+                            & (ScanURL.lease_expires_at <= func.clock_timestamp())
+                        )
                     ),
                 )
                 .values(
@@ -428,23 +434,25 @@ class ScanJobService:
             await self.session.execute(stmt_unclaimed)
 
             job.queued_count = 0
-            job.cancellation_requested_at = datetime.now()
+            job.cancellation_requested_at = utc_now()
 
-            # Determine new job status based on remaining active SCANNING leases
+            # Determine new job status based on remaining active UNEXPIRED SCANNING leases
             count_active_stmt = select(func.count(ScanURL.id)).where(
                 ScanURL.scan_job_id == job_id,
                 ScanURL.status == ScanURLStatus.SCANNING.value,
+                ScanURL.lease_expires_at > func.clock_timestamp(),
             )
             active_res = await self.session.execute(count_active_stmt)
             active_scanning_count = active_res.scalar_one() or 0
+            job.running_count = active_scanning_count
 
             target_job_status = (
                 ScanJobStatus.CANCELLED if active_scanning_count == 0 else ScanJobStatus.CANCELLING
             )
 
             job.status = target_job_status.value
-            if target_job_status == ScanJobStatus.CANCELLED:
-                job.completed_at = datetime.now()
+            if target_job_status == ScanJobStatus.CANCELLED and job.completed_at is None:
+                job.completed_at = utc_now()
 
             seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
             if seq is not None:
@@ -505,6 +513,31 @@ class ScanJobService:
             if nonterminal_count > 0:
                 return None  # Work still in progress
 
+            # Reconcile actual ScanURL status counts
+            st_counts_stmt = (
+                select(ScanURL.status, func.count(ScanURL.id))
+                .where(ScanURL.scan_job_id == job_id)
+                .group_by(ScanURL.status)
+            )
+            res_st = await self.session.execute(st_counts_stmt)
+            counts = dict(res_st.tuples().all())
+
+            completed_actual = counts.get(ScanURLStatus.COMPLETED.value, 0) + counts.get(
+                ScanURLStatus.NO_EMAIL.value, 0
+            )
+            failed_actual = counts.get(ScanURLStatus.FAILED.value, 0) + counts.get(
+                ScanURLStatus.INVALID.value, 0
+            )
+            queued_actual = counts.get(ScanURLStatus.QUEUED.value, 0) + counts.get(
+                ScanURLStatus.RETRY_WAIT.value, 0
+            )
+            running_actual = counts.get(ScanURLStatus.SCANNING.value, 0)
+
+            job.queued_count = queued_actual
+            job.running_count = running_actual
+            job.completed_count = completed_actual
+            job.failed_count = failed_actual
+
             # Query partial crawl attempt count
             partial_stmt = (
                 select(func.count(CrawlAttempt.id))
@@ -519,15 +552,16 @@ class ScanJobService:
 
             if current_status == ScanJobStatus.CANCELLING:
                 target_status = ScanJobStatus.CANCELLED
-            elif job.failed_count == 0 and partial_count == 0:
+            elif failed_actual == 0 and partial_count == 0:
                 target_status = ScanJobStatus.COMPLETED
-            elif job.completed_count == 0 and job.failed_count == job.valid_input_count:
+            elif completed_actual == 0 and failed_actual == job.valid_input_count:
                 target_status = ScanJobStatus.FAILED
             else:
                 target_status = ScanJobStatus.COMPLETED_WITH_ERRORS
 
             job.status = target_status.value
-            job.completed_at = datetime.now()
+            if job.completed_at is None:
+                job.completed_at = utc_now()
 
             seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
             if seq is not None:
@@ -544,6 +578,178 @@ class ScanJobService:
                 self.event_repo.append_event(event)
 
             return job
+
+    async def finalize_eligible_stuck_jobs(self, limit: int = 50) -> int:
+        """Find and finalize RUNNING or CANCELLING jobs that have 0 nonterminal ScanURL child rows.
+
+        Runs inside a bounded transaction, locking jobs FOR UPDATE SKIP LOCKED.
+        Returns the number of jobs finalized.
+        """
+        finalized_count = 0
+        async with self.session.begin():
+            subq = select(ScanURL.id).where(
+                ScanURL.scan_job_id == ScanJob.id,
+                ScanURL.status.in_(
+                    [
+                        ScanURLStatus.PENDING.value,
+                        ScanURLStatus.QUEUED.value,
+                        ScanURLStatus.SCANNING.value,
+                        ScanURLStatus.RETRY_WAIT.value,
+                    ]
+                ),
+            )
+            stmt = (
+                select(ScanJob)
+                .where(
+                    ScanJob.status.in_(
+                        [ScanJobStatus.RUNNING.value, ScanJobStatus.CANCELLING.value]
+                    ),
+                    ~subq.exists(),
+                )
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+            )
+            res = await self.session.execute(stmt)
+            eligible_jobs = list(res.scalars().all())
+
+            for job in eligible_jobs:
+                st_counts_stmt = (
+                    select(ScanURL.status, func.count(ScanURL.id))
+                    .where(ScanURL.scan_job_id == job.id)
+                    .group_by(ScanURL.status)
+                )
+                res_st = await self.session.execute(st_counts_stmt)
+                counts = dict(res_st.tuples().all())
+
+                completed_actual = counts.get(ScanURLStatus.COMPLETED.value, 0) + counts.get(
+                    ScanURLStatus.NO_EMAIL.value, 0
+                )
+                failed_actual = counts.get(ScanURLStatus.FAILED.value, 0) + counts.get(
+                    ScanURLStatus.INVALID.value, 0
+                )
+
+                job.queued_count = 0
+                job.running_count = 0
+                job.completed_count = completed_actual
+                job.failed_count = failed_actual
+
+                partial_stmt = (
+                    select(func.count(CrawlAttempt.id))
+                    .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
+                    .where(
+                        ScanURL.scan_job_id == job.id,
+                        CrawlAttempt.outcome == "PARTIAL",
+                    )
+                )
+                res_partial = await self.session.execute(partial_stmt)
+                partial_count = res_partial.scalar_one() or 0
+
+                cur_st = ScanJobStatus(job.status)
+                if cur_st == ScanJobStatus.CANCELLING:
+                    target_st = ScanJobStatus.CANCELLED
+                elif failed_actual == 0 and partial_count == 0:
+                    target_st = ScanJobStatus.COMPLETED
+                elif completed_actual == 0 and failed_actual == job.valid_input_count:
+                    target_st = ScanJobStatus.FAILED
+                else:
+                    target_st = ScanJobStatus.COMPLETED_WITH_ERRORS
+
+                job.status = target_st.value
+                if job.completed_at is None:
+                    job.completed_at = utc_now()
+
+                seq = await self.job_repo.allocate_event_sequence(job.organization_id, job.id)
+                if seq is not None:
+                    event = JobEvent(
+                        scan_job_id=job.id,
+                        event_type="JOB_STATUS_CHANGED",
+                        sequence_number=seq,
+                        payload={
+                            "previous_status": cur_st.value,
+                            "new_status": target_st.value,
+                            "partial_attempts_count": partial_count,
+                        },
+                    )
+                    self.event_repo.append_event(event)
+
+                finalized_count += 1
+
+        return finalized_count
+
+    async def reconcile_and_recover_stuck_job(
+        self, organization_id: uuid.UUID, job_id: uuid.UUID
+    ) -> ScanJob | None:
+        """Tenant-safe, idempotent maintenance method to reconcile counters and finalize stuck jobs.
+
+        Guarantees:
+            1. Recovers expired leases using CrawlWorkService.
+            2. Reconciles persisted ScanJob counters against actual ScanURL rows.
+            3. Cancels leftover nonterminal URLs if job is in CANCELLING state.
+            4. Authoritatively attempts job finalization.
+        """
+        from email_discovery_api.services.crawl_work import CrawlWorkService
+
+        # 1. Recover expired leases
+        crawl_work = CrawlWorkService(self.session)
+        await crawl_work.recover_expired_leases()
+
+        async with self.session.begin():
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                return None
+
+            # 2. Count actual ScanURL rows grouped by status
+            st_counts_stmt = (
+                select(ScanURL.status, func.count(ScanURL.id))
+                .where(ScanURL.scan_job_id == job_id)
+                .group_by(ScanURL.status)
+            )
+            res = await self.session.execute(st_counts_stmt)
+            counts = dict(res.tuples().all())
+
+            queued_actual = counts.get(ScanURLStatus.QUEUED.value, 0) + counts.get(
+                ScanURLStatus.RETRY_WAIT.value, 0
+            )
+            running_actual = counts.get(ScanURLStatus.SCANNING.value, 0)
+            completed_actual = counts.get(ScanURLStatus.COMPLETED.value, 0) + counts.get(
+                ScanURLStatus.NO_EMAIL.value, 0
+            )
+            failed_actual = counts.get(ScanURLStatus.FAILED.value, 0) + counts.get(
+                ScanURLStatus.INVALID.value, 0
+            )
+
+            # If CANCELLING or CANCELLED, clean up leftover nonterminal rows
+            if job.status in (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value):
+                stmt_cancel_leftovers = (
+                    update(ScanURL)
+                    .where(
+                        ScanURL.scan_job_id == job_id,
+                        ScanURL.status.in_(
+                            [
+                                ScanURLStatus.PENDING.value,
+                                ScanURLStatus.QUEUED.value,
+                                ScanURLStatus.RETRY_WAIT.value,
+                            ]
+                        ),
+                    )
+                    .values(
+                        status=ScanURLStatus.CANCELLED.value,
+                        completed_at=func.clock_timestamp(),
+                        last_error_code="JOB_CANCELLED",
+                        last_error_message="Cancelled by job cancellation recovery.",
+                    )
+                )
+                await self.session.execute(stmt_cancel_leftovers)
+                queued_actual = 0
+
+            # Reconcile counters
+            job.queued_count = queued_actual
+            job.running_count = running_actual
+            job.completed_count = completed_actual
+            job.failed_count = failed_actual
+
+        # 3. Attempt finalization
+        return await self.try_finalize_job(organization_id, job_id)
 
     async def get_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
         """Fetch a job strictly scoped to tenant or raise JOB_NOT_FOUND."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -40,6 +41,7 @@ class CrawlWorker:
         lease_duration_seconds: float = 120.0,
         heartbeat_interval_seconds: float = 30.0,
         max_scans: int | None = None,
+        recovery_interval_seconds: float = 15.0,
         orchestrator_factory: Any | None = None,
     ) -> None:
         if concurrency < 1:
@@ -62,6 +64,7 @@ class CrawlWorker:
         self.lease_duration = lease_duration_seconds
         self.heartbeat_interval = heartbeat_interval_seconds
         self.max_scans = max_scans
+        self.recovery_interval = recovery_interval_seconds
         self.orchestrator_factory = orchestrator_factory
 
         self._running = False
@@ -69,6 +72,7 @@ class CrawlWorker:
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._claimed_count = 0
         self._processed_count = 0
+        self._last_recovery_at = 0.0
 
     @property
     def claimed_count(self) -> int:
@@ -84,6 +88,8 @@ class CrawlWorker:
         """Start worker claim polling and background tasks."""
         self._running = True
         self._shutdown_event.clear()
+        now = time.monotonic()
+        self._last_recovery_at = now
 
         # Run initial lease recovery on startup
         async with self.session_factory() as session:
@@ -93,10 +99,10 @@ class CrawlWorker:
                 logger.info("Startup recovered %d expired leases.", recovered)
 
         logger.info(
-            "Crawl worker %s started (concurrency=%d, max_scans=%s).",
+            "CrawlWorker %s started (concurrency=%d, poll=%.2fs).",
             self.worker_id,
             self.concurrency,
-            self.max_scans,
+            self.poll_interval,
         )
 
         try:
@@ -109,6 +115,19 @@ class CrawlWorker:
                     self._running = False
                     break
                 if not claimed_any:
+                    now = time.monotonic()
+                    if now - self._last_recovery_at >= self.recovery_interval:
+                        self._last_recovery_at = now
+                        try:
+                            async with self.session_factory() as session:
+                                work_service = CrawlWorkService(session)
+                                await work_service.recover_expired_leases()
+                                job_service = ScanJobService(session)
+                                await job_service.finalize_eligible_stuck_jobs()
+                        except Exception:
+                            logger.warning(
+                                "Periodic lease recovery encountered an exception.", exc_info=True
+                            )
                     await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             logger.info("Worker run loop cancelled.")

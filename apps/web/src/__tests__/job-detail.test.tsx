@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import JobDetailPage from '@/app/scans/[id]/page';
 import * as apiClient from '@/lib/api-client';
-import { ScanJobApiResponse } from '@/types/api';
+import { ScanJobApiResponse, ScanURLApiResponse } from '@/types/api';
 
 vi.mock('next/navigation', () => ({
   useParams: () => ({ id: 'job-detail-123' }),
@@ -57,6 +57,7 @@ describe('JobDetailPage', () => {
     vi.restoreAllMocks();
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.spyOn(apiClient, 'getAccessToken').mockReturnValue('valid-jwt');
+    vi.spyOn(apiClient, 'listScanJobResults').mockResolvedValue({ items: [], next_cursor: null });
     localStorage.clear();
     sessionStorage.clear();
   });
@@ -72,7 +73,7 @@ describe('JobDetailPage', () => {
     render(<JobDetailPage />);
 
     await waitFor(() => {
-      expect(screen.getByText('Completed with Some Issues')).toBeInTheDocument();
+      expect(screen.getAllByText('Completed with Some Issues').length).toBeGreaterThan(0);
     });
   });
 
@@ -196,6 +197,87 @@ describe('JobDetailPage', () => {
 
     await waitFor(() => {
       expect(queueSpy).toHaveBeenCalledWith('job-detail-123');
+    });
+  });
+
+  it('proves CSV export is hidden for RUNNING job and visible/enabled for COMPLETED_WITH_ERRORS job', async () => {
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(mockJobDetail('RUNNING'));
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({ items: [], next_cursor: null });
+
+    const { unmount } = render(<JobDetailPage />);
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /Export Findings \(CSV\)/i })).not.toBeInTheDocument();
+    });
+    unmount();
+
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(mockJobDetail('COMPLETED_WITH_ERRORS'));
+    render(<JobDetailPage />);
+    await waitFor(() => {
+      const exportBtn = screen.getByRole('button', { name: /Export Findings \(CSV\)/i });
+      expect(exportBtn).toBeInTheDocument();
+      expect(exportBtn).not.toBeDisabled();
+    });
+  });
+
+  it('renders dynamic one-line explanation sentence for COMPLETED_WITH_ERRORS', async () => {
+    const jobData = {
+      ...mockJobDetail('COMPLETED_WITH_ERRORS'),
+      completed_count: 35,
+      failed_count: 59,
+      valid_input_count: 94,
+      total_input_count: 100,
+    };
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(jobData);
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({ items: [], next_cursor: null });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Completed with some issues — 35 websites processed successfully and 59 could not be scanned\./i)
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('displays complete total_input_count on Target URLs tab header and "Showing 50 of 100" in summary', async () => {
+    const jobData = {
+      ...mockJobDetail('COMPLETED_WITH_ERRORS'),
+      total_input_count: 100,
+      valid_input_count: 94,
+      duplicate_input_count: 6,
+    };
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(jobData);
+
+    const mockUrls = Array.from({ length: 50 }, (_, i) => ({
+      id: `url-${i}`,
+      scan_job_id: 'job-detail-123',
+      original_index: i,
+      original_input: `https://site${i}.org/`,
+      normalized_url: `https://site${i}.org/`,
+      normalized_domain: `site${i}.org`,
+      status: 'COMPLETED' as ScanURLApiResponse['status'],
+      duplicate_of_scan_url_id: null,
+      last_error_code: null,
+      created_at: new Date().toISOString(),
+    }));
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: mockUrls,
+      next_cursor: 'cursor-page-2',
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (100)')).toBeInTheDocument();
+    });
+
+    // Switch to URLS tab
+    fireEvent.click(screen.getByText('Target URLs (100)'));
+
+    await waitFor(() => {
+      expect(screen.getByText('Showing 50 of 100')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Load More URLs/i })).toBeInTheDocument();
     });
   });
 

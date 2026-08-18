@@ -298,17 +298,25 @@ export default function JobDetailPage() {
     };
   }, [jobId, jobStatus, fetchResults, appliedFilters, refreshUrls]);
 
+  const isLoadingMoreUrlsRef = useRef(false);
+
   const loadMoreUrls = async () => {
-    if (!jobId || !urlsNextCursor || isLoadingUrls) return;
+    if (!jobId || !urlsNextCursor || isLoadingUrls || isLoadingMoreUrlsRef.current) return;
     try {
+      isLoadingMoreUrlsRef.current = true;
       setIsLoadingUrls(true);
       const res = await listScanJobUrls(jobId, { limit: 50, cursor: urlsNextCursor });
-      setUrls((prev) => [...prev, ...res.items]);
+      setUrls((prev) => {
+        const existingIds = new Set(prev.map((u) => u.id));
+        const newItems = res.items.filter((u) => !existingIds.has(u.id));
+        return [...prev, ...newItems];
+      });
       setUrlsNextCursor(res.next_cursor);
     } catch (err) {
       if (err instanceof ApiError) setError(err);
     } finally {
       setIsLoadingUrls(false);
+      isLoadingMoreUrlsRef.current = false;
     }
   };
 
@@ -467,6 +475,19 @@ export default function JobDetailPage() {
           </div>
         )}
 
+        {/* COMPLETED_WITH_ERRORS Terminal Status Notice */}
+        {job.status === 'COMPLETED_WITH_ERRORS' && (
+          <div className="bg-amber-50 border border-amber-200 text-amber-900 p-4 rounded-xl text-sm flex items-start space-x-3">
+            <Info className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <p className="font-bold text-amber-900">Completed with Some Issues</p>
+              <p className="text-xs text-amber-800">
+                Completed with some issues — {progress?.completed_count ?? job.completed_count} websites processed successfully and {progress?.failed_count ?? job.failed_count} could not be scanned.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Active Job Warning Notice */}
         {isJobActive && (
           <div className="bg-blue-50 border border-blue-200 text-blue-900 p-4 rounded-xl text-sm flex items-start space-x-3">
@@ -564,7 +585,7 @@ export default function JobDetailPage() {
             }`}
           >
             <FileText className="w-4 h-4" />
-            <span>Target URLs ({urls.length})</span>
+            <span>Target URLs ({job.total_input_count})</span>
           </button>
         </div>
 
@@ -781,19 +802,32 @@ export default function JobDetailPage() {
         {/* Tab Content: URLS */}
         {activeTab === 'URLS' && (
           <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden space-y-4 p-6">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center space-x-2">
                 <FileText className="w-5 h-5 text-slate-500" />
-                <h3 className="text-base font-bold text-slate-900">Target URLs ({urls.length})</h3>
+                <h3 className="text-base font-bold text-slate-900">Target URLs ({job.total_input_count})</h3>
               </div>
               <button
                 onClick={refreshUrls}
                 disabled={isLoadingUrls}
-                className="inline-flex items-center text-xs font-medium text-slate-600 hover:text-slate-900 px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors"
+                className="inline-flex items-center text-xs font-medium text-slate-600 hover:text-slate-900 px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors shrink-0"
               >
                 <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isLoadingUrls ? 'animate-spin' : ''}`} />
                 Refresh URL List
               </button>
+            </div>
+
+            {/* Non-technical input count explanation summary card */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs">
+              <p className="font-semibold text-slate-700">
+                Showing {urls.length} of {job.total_input_count}
+              </p>
+              <div className="flex flex-wrap items-center gap-3 text-slate-600 font-medium">
+                <span>Submitted inputs: <strong className="text-slate-900">{job.total_input_count}</strong></span>
+                <span>Unique valid websites: <strong className="text-emerald-700">{job.valid_input_count}</strong></span>
+                <span>Duplicate inputs: <strong className="text-slate-700">{job.duplicate_input_count}</strong></span>
+                <span>Displayed rows: <strong className="text-slate-900">{urls.length}</strong></span>
+              </div>
             </div>
 
             {urls.length === 0 ? (

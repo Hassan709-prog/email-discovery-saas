@@ -49,7 +49,7 @@ def set_auth_cookies(
         key=settings.csrf_cookie_name,
         value=raw_csrf_token,
         max_age=max_age,
-        path="/api/v1/auth",
+        path="/",
         domain=settings.cookie_domain,
         secure=settings.cookie_secure,
         httponly=False,
@@ -73,7 +73,7 @@ def clear_auth_cookies(
     )
     response.delete_cookie(
         key=settings.csrf_cookie_name,
-        path="/api/v1/auth",
+        path="/",
         domain=settings.cookie_domain,
         secure=settings.cookie_secure,
         httponly=False,
@@ -170,7 +170,8 @@ async def logout(
     raw_refresh_token = request.cookies.get(settings.refresh_cookie_name)
     await auth_service.logout(raw_refresh_token, csrf_header)
     clear_auth_cookies(response, settings)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @router.post(
@@ -187,7 +188,8 @@ async def logout_all(
     """Increment user auth_version and revoke all user refresh sessions across all devices."""
     await auth_service.logout_all(principal.user_id)
     clear_auth_cookies(response, settings)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
 
 
 @router.get(

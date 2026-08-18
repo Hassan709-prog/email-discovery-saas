@@ -50,7 +50,7 @@ describe('api-client.ts', () => {
     const [url, options] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/v1/test');
     expect(options.credentials).toBe('same-origin');
-    expect(options.headers.get('Authorization')).toBe('Bearer jwt-test-123');
+    expect((options.headers as Record<string, string>)['Authorization']).toBe('Bearer jwt-test-123');
   });
 
   it('includes X-CSRF-Token header on refresh and logout calls', async () => {
@@ -172,8 +172,6 @@ describe('api-client.ts', () => {
       access_token: 'acc-123',
       token_type: 'Bearer',
       expires_in_seconds: 900,
-      user: { id: 'u1', email: 'test@ex.com', display_name: 'Test', status: 'ACTIVE' },
-      organization: { id: 'o1', name: 'Org', slug: 'org', role: 'OWNER' },
     };
 
     // Register
@@ -193,7 +191,7 @@ describe('api-client.ts', () => {
       organization_selection_required: true,
       organizations: [{ id: 'o1', name: 'Org 1', slug: 'org-1', role: 'OWNER' }],
     };
-    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(orgChoiceResponse), { status: 400 }));
+    mockFetch.mockResolvedValueOnce(new Response(JSON.stringify(orgChoiceResponse), { status: 200 }));
 
     const loginRes = await loginUser({ email: 'test@ex.com', password: 'Password123!' });
     expect('organization_selection_required' in loginRes).toBe(true);

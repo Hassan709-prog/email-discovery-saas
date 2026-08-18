@@ -2,151 +2,42 @@ import {
   ApiError,
   ApiErrorEnvelope,
   AuthSuccessResponse,
+  CreateScanJobApiRequest,
   LoginRequest,
   OrganizationSelectionRequiredResponse,
+  PaginatedResponse,
+  PreviewScanInputsApiRequest,
+  PreviewScanInputsApiResponse,
   RegisterRequest,
+  ScanJobApiResponse,
+  ScanJobProgressApiResponse,
+  ScanURLApiResponse,
   UserProfileResponse,
 } from '@/types/api';
 
-// In-memory access token storage (NEVER written to localStorage or sessionStorage)
 let inMemoryAccessToken: string | null = null;
+let sessionExpiredListener: (() => void) | null = null;
 
-// Shared single-flight refresh promise to coalesce concurrent 401 requests
+export const setAccessToken = (token: string | null): void => {
+  inMemoryAccessToken = token;
+};
+
+export const getAccessToken = (): string | null => {
+  return inMemoryAccessToken;
+};
+
+export const setOnSessionExpired = (listener: (() => void) | null): void => {
+  sessionExpiredListener = listener;
+};
+
+export const getCsrfToken = (): string | null => {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(/(?:^|; )csrf_token=([^;]*)/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
 let sharedRefreshPromise: Promise<string> | null = null;
 
-// Global callback for refresh failure to clear AuthContext state
-let onSessionExpiredCallback: (() => void) | null = null;
-
-export function getAccessToken(): string | null {
-  return inMemoryAccessToken;
-}
-
-export function setAccessToken(token: string | null): void {
-  inMemoryAccessToken = token;
-}
-
-export function setOnSessionExpired(callback: (() => void) | null): void {
-  onSessionExpiredCallback = callback;
-}
-
-/**
- * Extracts readable CSRF token from document.cookie.
- */
-export function getCsrfToken(): string {
-  if (typeof document === 'undefined') return '';
-  const cookies = document.cookie.split(';');
-  for (const cookie of cookies) {
-    const [name, value] = cookie.trim().split('=');
-    if (name === 'csrf_token') {
-      return decodeURIComponent(value || '');
-    }
-  }
-  return '';
-}
-
-/**
- * Parses HTTP response error envelope into typed ApiError.
- */
-async function parseErrorResponse(response: Response): Promise<ApiError> {
-  const status = response.status;
-  try {
-    const data = (await response.json()) as ApiErrorEnvelope | Record<string, unknown>;
-    if (data && typeof data === 'object' && 'error' in data && data.error) {
-      const err = data.error as { code?: string; message?: string; details?: unknown; request_id?: string };
-      return new ApiError(status, {
-        code: err.code || 'API_ERROR',
-        message: err.message || `Request failed with status ${status}`,
-        details: err.details,
-        request_id: err.request_id,
-      });
-    }
-    if (data && typeof data === 'object' && 'detail' in data && typeof data.detail === 'string') {
-      return new ApiError(status, {
-        code: 'API_ERROR',
-        message: data.detail,
-      });
-    }
-  } catch {
-    // Non-JSON error body
-  }
-  return new ApiError(status, {
-    code: 'HTTP_ERROR',
-    message: `Request failed with HTTP status ${status}`,
-  });
-}
-
-/**
- * Core fetch wrapper with automatic Bearer token, CSRF header, 401 single-flight refresh, and error parsing.
- */
-export async function apiFetch<T>(
-  endpoint: string,
-  options: RequestInit = {},
-  isRetry = false
-): Promise<T> {
-  const headers = new Headers(options.headers || {});
-  headers.set('Accept', 'application/json');
-
-  // Inject Bearer access token if available
-  if (inMemoryAccessToken && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${inMemoryAccessToken}`);
-  }
-
-  // Inject CSRF header for auth endpoints requiring CSRF validation
-  if (endpoint.includes('/auth/refresh') || endpoint.includes('/auth/logout')) {
-    const csrfToken = getCsrfToken();
-    if (csrfToken && !headers.has('X-CSRF-Token')) {
-      headers.set('X-CSRF-Token', csrfToken);
-    }
-  }
-
-  const fetchOptions: RequestInit = {
-    ...options,
-    headers,
-    credentials: 'same-origin',
-  };
-
-  const response = await fetch(endpoint, fetchOptions);
-
-  // Handle 401 Unauthorized for ordinary requests
-  if (response.status === 401 && !endpoint.includes('/auth/refresh') && !isRetry) {
-    try {
-      const newToken = await performSilentRefresh();
-      // Retry original request exactly once with new token
-      const retryHeaders = new Headers(options.headers || {});
-      retryHeaders.set('Accept', 'application/json');
-      retryHeaders.set('Authorization', `Bearer ${newToken}`);
-      
-      if (endpoint.includes('/auth/logout')) {
-        const csrfToken = getCsrfToken();
-        if (csrfToken) retryHeaders.set('X-CSRF-Token', csrfToken);
-      }
-
-      return await apiFetch<T>(endpoint, { ...options, headers: retryHeaders }, true);
-    } catch {
-      // Refresh failed: clear session state and reject with original/refresh error
-      setAccessToken(null);
-      if (onSessionExpiredCallback) {
-        onSessionExpiredCallback();
-      }
-      throw await parseErrorResponse(response);
-    }
-  }
-
-  if (!response.ok) {
-    throw await parseErrorResponse(response);
-  }
-
-  // 204 No Content handling
-  if (response.status === 204) {
-    return {} as T;
-  }
-
-  return (await response.json()) as T;
-}
-
-/**
- * Performs silent refresh. Coalesces concurrent calls into a single flight promise.
- */
 export async function performSilentRefresh(): Promise<string> {
   if (sharedRefreshPromise) {
     return sharedRefreshPromise;
@@ -155,9 +46,7 @@ export async function performSilentRefresh(): Promise<string> {
   sharedRefreshPromise = (async () => {
     try {
       const csrfToken = getCsrfToken();
-      const headers: Record<string, string> = {
-        Accept: 'application/json',
-      };
+      const headers: Record<string, string> = {};
       if (csrfToken) {
         headers['X-CSRF-Token'] = csrfToken;
       }
@@ -169,12 +58,20 @@ export async function performSilentRefresh(): Promise<string> {
       });
 
       if (!res.ok) {
-        const error = await parseErrorResponse(res);
-        setAccessToken(null);
-        throw error;
+        let errorData: ApiErrorEnvelope | null = null;
+        try {
+          errorData = await res.json();
+        } catch {
+          // Response body empty or non-JSON
+        }
+        const detail = errorData?.error || {
+          code: 'REFRESH_FAILED',
+          message: 'Silent refresh failed.',
+        };
+        throw new ApiError(res.status, detail);
       }
 
-      const data = (await res.json()) as AuthSuccessResponse;
+      const data: AuthSuccessResponse = await res.json();
       setAccessToken(data.access_token);
       return data.access_token;
     } finally {
@@ -185,12 +82,93 @@ export async function performSilentRefresh(): Promise<string> {
   return sharedRefreshPromise;
 }
 
-// Typed API Authentication Service Calls
+export async function apiFetch<T>(
+  endpoint: string,
+  options: RequestInit = {},
+  allowRetryOn401 = true
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string>),
+  };
 
+  const token = getAccessToken();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(endpoint, {
+    ...options,
+    headers,
+    credentials: 'same-origin',
+  });
+
+  if (res.status === 401 && allowRetryOn401 && !endpoint.includes('/auth/refresh')) {
+    try {
+      const newAccessToken = await performSilentRefresh();
+      headers['Authorization'] = `Bearer ${newAccessToken}`;
+      const retryRes = await fetch(endpoint, {
+        ...options,
+        headers,
+        credentials: 'same-origin',
+      });
+
+      if (!retryRes.ok) {
+        let errorEnvelope: ApiErrorEnvelope | null = null;
+        try {
+          errorEnvelope = await retryRes.json();
+        } catch {
+          // Ignore parse errors
+        }
+        const detail = errorEnvelope?.error || {
+          code: 'UNAUTHORIZED',
+          message: 'Authentication failed after token refresh.',
+        };
+        if (retryRes.status === 401 && sessionExpiredListener) {
+          sessionExpiredListener();
+        }
+        throw new ApiError(retryRes.status, detail);
+      }
+
+      if (retryRes.status === 204) {
+        return {} as T;
+      }
+
+      return (await retryRes.json()) as T;
+    } catch (refreshErr) {
+      setAccessToken(null);
+      if (sessionExpiredListener) {
+        sessionExpiredListener();
+      }
+      throw refreshErr;
+    }
+  }
+
+  if (!res.ok) {
+    let errorEnvelope: ApiErrorEnvelope | null = null;
+    try {
+      errorEnvelope = await res.json();
+    } catch {
+      // Ignore parse errors
+    }
+    const detail = errorEnvelope?.error || {
+      code: 'HTTP_ERROR',
+      message: `Request failed with status ${res.status}`,
+    };
+    throw new ApiError(res.status, detail);
+  }
+
+  if (res.status === 204) {
+    return {} as T;
+  }
+
+  return (await res.json()) as T;
+}
+
+// Authentication API methods
 export async function registerUser(payload: RegisterRequest): Promise<AuthSuccessResponse> {
   const data = await apiFetch<AuthSuccessResponse>('/api/v1/auth/register', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
   setAccessToken(data.access_token);
@@ -200,38 +178,38 @@ export async function registerUser(payload: RegisterRequest): Promise<AuthSucces
 export async function loginUser(
   payload: LoginRequest
 ): Promise<AuthSuccessResponse | OrganizationSelectionRequiredResponse> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  
-  const res = await fetch('/api/v1/auth/login', {
-    method: 'POST',
-    headers,
-    credentials: 'same-origin',
-    body: JSON.stringify(payload),
-  });
-
-  if (res.status === 400) {
-    const data = await res.json();
-    if (data && typeof data === 'object' && 'organization_selection_required' in data && data.organization_selection_required) {
-      return data as OrganizationSelectionRequiredResponse;
+  const data = await apiFetch<AuthSuccessResponse | OrganizationSelectionRequiredResponse>(
+    '/api/v1/auth/login',
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }
-  }
+  );
 
-  if (!res.ok) {
-    throw await parseErrorResponse(res);
+  if ('access_token' in data && data.access_token) {
+    setAccessToken(data.access_token);
   }
-
-  const data = (await res.json()) as AuthSuccessResponse;
-  setAccessToken(data.access_token);
   return data;
 }
 
 export async function getCurrentUser(): Promise<UserProfileResponse> {
-  return await apiFetch<UserProfileResponse>('/api/v1/auth/me');
+  return apiFetch<UserProfileResponse>('/api/v1/auth/me', {
+    method: 'GET',
+  });
 }
 
 export async function logoutUser(): Promise<void> {
+  const csrfToken = getCsrfToken();
+  const headers: Record<string, string> = {};
+  if (csrfToken) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
+
   try {
-    await apiFetch<void>('/api/v1/auth/logout', { method: 'POST' });
+    await apiFetch<void>('/api/v1/auth/logout', {
+      method: 'POST',
+      headers,
+    });
   } finally {
     setAccessToken(null);
   }
@@ -239,8 +217,91 @@ export async function logoutUser(): Promise<void> {
 
 export async function logoutAllUser(): Promise<void> {
   try {
-    await apiFetch<void>('/api/v1/auth/logout-all', { method: 'POST' });
+    await apiFetch<void>('/api/v1/auth/logout-all', {
+      method: 'POST',
+    });
   } finally {
     setAccessToken(null);
   }
+}
+
+// Scan Jobs API methods
+export async function listScanJobs(params?: {
+  limit?: number;
+  cursor?: string;
+  status?: string;
+}): Promise<PaginatedResponse<ScanJobApiResponse>> {
+  const query = new URLSearchParams();
+  if (params?.limit) query.set('limit', params.limit.toString());
+  if (params?.cursor) query.set('cursor', params.cursor);
+  if (params?.status) query.set('status', params.status);
+
+  const url = `/api/v1/scan-jobs${query.toString() ? `?${query.toString()}` : ''}`;
+  return apiFetch<PaginatedResponse<ScanJobApiResponse>>(url, { method: 'GET' });
+}
+
+export async function previewScanInputs(
+  payload: PreviewScanInputsApiRequest
+): Promise<PreviewScanInputsApiResponse> {
+  return apiFetch<PreviewScanInputsApiResponse>('/api/v1/scan-jobs/preview', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function createScanJob(
+  payload: CreateScanJobApiRequest,
+  idempotencyKey?: string
+): Promise<ScanJobApiResponse> {
+  const headers: Record<string, string> = {};
+  if (idempotencyKey) {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+
+  return apiFetch<ScanJobApiResponse>('/api/v1/scan-jobs', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getScanJob(jobId: string): Promise<ScanJobApiResponse> {
+  return apiFetch<ScanJobApiResponse>(`/api/v1/scan-jobs/${jobId}`, {
+    method: 'GET',
+  });
+}
+
+export async function getScanJobProgress(
+  jobId: string,
+  signal?: AbortSignal
+): Promise<ScanJobProgressApiResponse> {
+  return apiFetch<ScanJobProgressApiResponse>(`/api/v1/scan-jobs/${jobId}/progress`, {
+    method: 'GET',
+    signal,
+  });
+}
+
+export async function listScanJobUrls(
+  jobId: string,
+  params?: { limit?: number; cursor?: string; status?: string }
+): Promise<PaginatedResponse<ScanURLApiResponse>> {
+  const query = new URLSearchParams();
+  if (params?.limit) query.set('limit', params.limit.toString());
+  if (params?.cursor) query.set('cursor', params.cursor);
+  if (params?.status) query.set('status', params.status);
+
+  const url = `/api/v1/scan-jobs/${jobId}/urls${query.toString() ? `?${query.toString()}` : ''}`;
+  return apiFetch<PaginatedResponse<ScanURLApiResponse>>(url, { method: 'GET' });
+}
+
+export async function queueScanJob(jobId: string): Promise<ScanJobApiResponse> {
+  return apiFetch<ScanJobApiResponse>(`/api/v1/scan-jobs/${jobId}/queue`, {
+    method: 'POST',
+  });
+}
+
+export async function cancelScanJob(jobId: string): Promise<ScanJobApiResponse> {
+  return apiFetch<ScanJobApiResponse>(`/api/v1/scan-jobs/${jobId}/cancel`, {
+    method: 'POST',
+  });
 }

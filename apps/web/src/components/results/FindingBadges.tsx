@@ -15,20 +15,20 @@ export const ClassificationBadge: React.FC<ClassificationBadgeProps> = ({
 
   switch (classification) {
     case 'ROLE_BASED':
-      label = 'Role-based';
-      styleClasses = 'bg-purple-50 text-purple-800 border-purple-200';
+      label = 'Role address';
+      styleClasses = 'bg-blue-50 text-blue-800 border-blue-200';
       break;
     case 'PERSONAL_OR_NAMED':
-      label = 'Personal/Named';
-      styleClasses = 'bg-emerald-50 text-emerald-800 border-emerald-200';
+      label = 'Named contact';
+      styleClasses = 'bg-indigo-50 text-indigo-800 border-indigo-200';
       break;
     case 'NO_REPLY':
-      label = 'No-reply';
-      styleClasses = 'bg-amber-50 text-amber-800 border-amber-200';
+      label = 'No-reply address';
+      styleClasses = 'bg-slate-100 text-slate-700 border-slate-200';
       break;
     case 'UNKNOWN':
-      label = 'Unknown';
-      styleClasses = 'bg-slate-100 text-slate-700 border-slate-200';
+      label = 'Other';
+      styleClasses = 'bg-slate-100 text-slate-600 border-slate-200';
       break;
   }
 
@@ -52,15 +52,15 @@ export const ValidationBadge: React.FC<ValidationBadgeProps> = ({ status, classN
 
   switch (status) {
     case 'VALID':
-      label = 'Valid';
+      label = 'Format accepted';
       styleClasses = 'bg-emerald-50 text-emerald-800 border-emerald-200';
       break;
     case 'UNVERIFIED':
-      label = 'Unverified';
+      label = 'Not independently verified';
       styleClasses = 'bg-amber-50 text-amber-800 border-amber-200';
       break;
     case 'INVALID':
-      label = 'Invalid';
+      label = 'Rejected format';
       styleClasses = 'bg-rose-50 text-rose-800 border-rose-200';
       break;
   }

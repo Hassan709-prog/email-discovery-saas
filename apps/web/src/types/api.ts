@@ -87,7 +87,8 @@ export interface RegisterRequest {
   email: string;
   password: string;
   display_name?: string | null;
-  organization_name: string;
+  organization_name?: string | null;
+  organization_slug?: string | null;
 }
 
 export interface LoginRequest {
@@ -274,4 +275,42 @@ export class ApiError extends Error {
     this.details = detail.details;
     this.requestId = detail.request_id;
   }
+}
+
+export type AnalyticsPeriodEnum = '7d' | '30d' | '90d' | 'all';
+
+export interface AnalyticsTimelinePoint {
+  date: string;
+  scans_created: number;
+  emails_found: number;
+}
+
+export interface RecentScanJobSummary {
+  id: string;
+  name: string | null;
+  status: ScanJobStatus;
+  completed_at: string;
+  valid_input_count: number;
+  completed_count: number;
+  failed_count: number;
+  email_finding_count: number;
+}
+
+export interface AnalyticsOverviewResponse {
+  period: AnalyticsPeriodEnum;
+  start_at: string | null;
+  end_at: string;
+  total_scans: number;
+  active_scans: number;
+  websites_submitted: number;
+  websites_processed: number;
+  websites_completed: number;
+  websites_failed: number;
+  emails_discovered: number;
+  successful_processing_rate: number;
+  status_distribution: Record<string, number>;
+  findings_by_classification: Record<string, number>;
+  findings_by_validation_status: Record<string, number>;
+  scan_activity_timeline: AnalyticsTimelinePoint[];
+  recent_completed_scans: RecentScanJobSummary[];
 }

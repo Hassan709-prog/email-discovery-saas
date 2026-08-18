@@ -54,8 +54,8 @@ describe('Phase 3C: EvidencePanel Drawer', () => {
       expect(screen.getByText('security@target-company.com')).toBeInTheDocument();
     });
 
-    expect(screen.getByText('Role-based')).toBeInTheDocument();
-    expect(screen.getByText('Valid')).toBeInTheDocument();
+    expect(screen.getByText('Role address')).toBeInTheDocument();
+    expect(screen.getByText('Format accepted')).toBeInTheDocument();
 
     // Verify safe plain-text rendering of malicious URL and snippet
     expect(screen.getByText('https://target-company.com/contact?param=<script>alert("xss")</script>')).toBeInTheDocument();

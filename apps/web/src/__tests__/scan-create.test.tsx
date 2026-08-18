@@ -101,16 +101,16 @@ describe('CreateScanPage', () => {
 
     render(<CreateScanPage />);
 
-    const textarea = screen.getByLabelText(/Target Web Page URLs/i);
+    const textarea = screen.getByLabelText(/Paste website addresses/i);
     fireEvent.change(textarea, {
       target: { value: 'https://example.com\nhttps://example.com\nnot-a-url' },
     });
 
-    const previewBtn = screen.getByRole('button', { name: /Preview Inputs/i });
+    const previewBtn = screen.getByRole('button', { name: /Review Websites/i });
     fireEvent.click(previewBtn);
 
     await waitFor(() => {
-      expect(screen.getByText('Total Inputs')).toBeInTheDocument();
+      expect(screen.getByText('Total Websites')).toBeInTheDocument();
       expect(screen.getByText('Invalid URL scheme or format')).toBeInTheDocument();
     });
   });
@@ -139,17 +139,17 @@ describe('CreateScanPage', () => {
 
     render(<CreateScanPage />);
 
-    const textarea = screen.getByLabelText(/Target Web Page URLs/i);
+    const textarea = screen.getByLabelText(/Paste website addresses/i);
     fireEvent.change(textarea, { target: { value: 'https://test.com' } });
 
-    fireEvent.click(screen.getByRole('button', { name: /Preview Inputs/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Review Websites/i }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Create & Queue Scan Job/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Save and Start Scan/i })).toBeInTheDocument();
     });
 
     // First create attempt
-    fireEvent.click(screen.getByRole('button', { name: /Create & Queue Scan Job/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save and Start Scan/i }));
 
     await waitFor(() => {
       expect(createSpy).toHaveBeenCalledTimes(1);
@@ -161,12 +161,12 @@ describe('CreateScanPage', () => {
     // Change input payload
     fireEvent.change(textarea, { target: { value: 'https://new-test.com' } });
 
-    fireEvent.click(screen.getByRole('button', { name: /Preview Inputs/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Review Websites/i }));
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Create & Queue Scan Job/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Save and Start Scan/i })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: /Create & Queue Scan Job/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save and Start Scan/i }));
 
     await waitFor(() => {
       expect(createSpy).toHaveBeenCalledTimes(2);
@@ -204,25 +204,25 @@ describe('CreateScanPage', () => {
 
     render(<CreateScanPage />);
 
-    fireEvent.change(screen.getByLabelText(/Target Web Page URLs/i), { target: { value: 'https://test.com' } });
-    fireEvent.click(screen.getByRole('button', { name: /Preview Inputs/i }));
+    fireEvent.change(screen.getByLabelText(/Paste website addresses/i), { target: { value: 'https://test.com' } });
+    fireEvent.click(screen.getByRole('button', { name: /Review Websites/i }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Create & Queue Scan Job/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Save and Start Scan/i })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole('button', { name: /Create & Queue Scan Job/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Save and Start Scan/i }));
 
-    // Queue fails -> Shows banner with "Retry Queueing Draft Job"
+    // Queue fails -> Shows banner with "Start Scan Again"
     await waitFor(() => {
-      expect(screen.getByText(/Scan job saved as DRAFT, but queueing failed/i)).toBeInTheDocument();
+      expect(screen.getByText(/Your scan was saved but has not started/i)).toBeInTheDocument();
     });
 
     expect(createSpy).toHaveBeenCalledTimes(1);
     expect(queueSpy).toHaveBeenCalledTimes(1);
 
     // Click retry queue button
-    const retryBtn = screen.getByRole('button', { name: /Retry Queueing Draft Job/i });
+    const retryBtn = screen.getByRole('button', { name: /Start Scan Again/i });
     fireEvent.click(retryBtn);
 
     await waitFor(() => {

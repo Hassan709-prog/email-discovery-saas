@@ -585,7 +585,7 @@ export default function JobDetailPage() {
                 {/* Search Prefix */}
                 <div>
                   <label htmlFor="filterSearchPrefix" className="block text-xs font-semibold text-slate-700 mb-1">
-                    Canonical Prefix (min 2 chars)
+                    Email starts with (min 2 chars)
                   </label>
                   <input
                     id="filterSearchPrefix"
@@ -593,7 +593,7 @@ export default function JobDetailPage() {
                     value={filterSearchPrefix}
                     onChange={(e) => setFilterSearchPrefix(e.target.value)}
                     placeholder="e.g. contact, info, sales"
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:ring-2 focus:ring-brand-500"
+                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:ring-2 focus:ring-indigo-500"
                   />
                 </div>
 
@@ -608,44 +608,44 @@ export default function JobDetailPage() {
                     value={filterEmailDomain}
                     onChange={(e) => setFilterEmailDomain(e.target.value)}
                     placeholder="e.g. example.com"
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:ring-2 focus:ring-brand-500"
+                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono text-slate-900 focus:ring-2 focus:ring-indigo-500"
                   />
                 </div>
 
                 {/* Classification Select */}
                 <div>
                   <label htmlFor="filterClassification" className="block text-xs font-semibold text-slate-700 mb-1">
-                    Classification
+                    Category
                   </label>
                   <select
                     id="filterClassification"
                     value={filterClassification}
                     onChange={(e) => setFilterClassification(e.target.value)}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-900 focus:ring-2 focus:ring-brand-500"
+                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-900 focus:ring-2 focus:ring-indigo-500"
                   >
                     <option value="ALL">All Categories</option>
-                    <option value="PERSONAL_OR_NAMED">Personal / Named</option>
-                    <option value="ROLE_BASED">Role-based</option>
-                    <option value="NO_REPLY">No-reply</option>
-                    <option value="UNKNOWN">Unknown</option>
+                    <option value="PERSONAL_OR_NAMED">Named Contact</option>
+                    <option value="ROLE_BASED">Role Address</option>
+                    <option value="NO_REPLY">No-Reply Address</option>
+                    <option value="UNKNOWN">Other</option>
                   </select>
                 </div>
 
                 {/* Validation Status Select */}
                 <div>
                   <label htmlFor="filterValidationStatus" className="block text-xs font-semibold text-slate-700 mb-1">
-                    Validation Status
+                    Email Check
                   </label>
                   <select
                     id="filterValidationStatus"
                     value={filterValidationStatus}
                     onChange={(e) => setFilterValidationStatus(e.target.value)}
-                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-900 focus:ring-2 focus:ring-brand-500"
+                    className="w-full px-3 py-1.5 border border-slate-300 rounded-lg text-xs text-slate-900 focus:ring-2 focus:ring-indigo-500"
                   >
                     <option value="ALL">All Statuses</option>
-                    <option value="VALID">Valid Syntax</option>
-                    <option value="UNVERIFIED">Unverified</option>
-                    <option value="INVALID">Invalid</option>
+                    <option value="VALID">Format Accepted</option>
+                    <option value="UNVERIFIED">Not Independently Verified</option>
+                    <option value="INVALID">Rejected Format</option>
                   </select>
                 </div>
               </div>
@@ -672,7 +672,7 @@ export default function JobDetailPage() {
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden space-y-4 p-6">
               <div className="flex items-center justify-between">
                 <h3 className="text-base font-bold text-slate-900">
-                  Discovered Email Findings ({results.length})
+                  Discovered Emails ({results.length})
                 </h3>
                 <button
                   onClick={() => fetchResults(appliedFilters, null, false)}
@@ -686,7 +686,7 @@ export default function JobDetailPage() {
 
               {isLoadingResults ? (
                 <div className="p-12 text-center space-y-3">
-                  <div className="w-8 h-8 border-4 border-brand-600 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <div className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mx-auto" />
                   <p className="text-sm font-medium text-slate-600">Loading email findings...</p>
                 </div>
               ) : results.length === 0 ? (
@@ -707,11 +707,11 @@ export default function JobDetailPage() {
                   <table className="w-full text-left border-collapse">
                     <thead>
                       <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600 uppercase tracking-wider">
-                        <th className="px-4 py-3">Canonical Email</th>
+                        <th className="px-4 py-3">Email Address</th>
                         <th className="px-4 py-3">Domain</th>
                         <th className="px-4 py-3">Category</th>
-                        <th className="px-4 py-3">Validation</th>
-                        <th className="px-4 py-3">Evidence</th>
+                        <th className="px-4 py-3">Email Check</th>
+                        <th className="px-4 py-3">Sources</th>
                         <th className="px-4 py-3">Last Found</th>
                         <th className="px-4 py-3 text-right">Actions</th>
                       </tr>
@@ -719,45 +719,40 @@ export default function JobDetailPage() {
                     <tbody className="divide-y divide-slate-200 text-xs font-mono">
                       {results.map((r) => (
                         <tr key={r.finding_id} className="hover:bg-slate-50 transition-colors">
-                          {/* Canonical Email - Safe Text Rendering */}
                           <td className="px-4 py-3 font-semibold text-slate-900 whitespace-pre-wrap break-all">
                             {r.canonical_email}
                           </td>
 
-                          {/* Domain */}
                           <td className="px-4 py-3 text-slate-600">{r.email_domain}</td>
 
-                          {/* Classification Badge */}
                           <td className="px-4 py-3 font-sans">
                             <ClassificationBadge classification={r.classification} />
                           </td>
 
-                          {/* Validation Badge */}
                           <td className="px-4 py-3 font-sans">
                             <ValidationBadge status={r.validation_status} />
                           </td>
 
-                          {/* Evidence Count */}
                           <td className="px-4 py-3 font-sans font-semibold text-slate-700">
-                            {r.evidence_count} records
+                            {r.evidence_count} sources
                           </td>
 
-                          {/* Last Found Date */}
                           <td className="px-4 py-3 font-sans text-slate-500">
                             {new Date(r.last_found_at).toLocaleString()}
                           </td>
 
-                          {/* Action Button: View Evidence */}
                           <td className="px-4 py-3 text-right font-sans">
                             <button
                               onClick={(e) => {
                                 findingTriggerRef.current = e.currentTarget;
                                 setSelectedFindingId(r.finding_id);
                               }}
-                              className="inline-flex items-center px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-700 font-semibold text-xs rounded border border-slate-300 transition-colors"
+                              disabled={r.evidence_count === 0}
+                              title={r.evidence_count === 0 ? "No web page sources available for this finding" : "View web page sources"}
+                              className="inline-flex items-center px-2.5 py-1 bg-white hover:bg-slate-100 text-slate-700 font-semibold text-xs rounded border border-slate-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                             >
                               <Eye className="w-3.5 h-3.5 mr-1 text-slate-500" />
-                              View Evidence
+                              View Sources
                             </button>
                           </td>
                         </tr>

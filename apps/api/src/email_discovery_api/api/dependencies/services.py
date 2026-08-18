@@ -6,6 +6,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from email_discovery_api.database import get_db_session
+from email_discovery_api.services.analytics import AnalyticsService
 from email_discovery_api.services.auth import AuthService
 from email_discovery_api.services.results import ScanJobResultsService
 from email_discovery_api.services.scan_jobs import ScanJobService
@@ -30,6 +31,13 @@ async def get_auth_service(
 ) -> AuthService:
     """Dependency injecting a request-scoped AuthService."""
     return AuthService(session)
+
+
+async def get_analytics_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> AnalyticsService:
+    """Dependency injecting a request-scoped AnalyticsService."""
+    return AnalyticsService(session)
 
 
 def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:

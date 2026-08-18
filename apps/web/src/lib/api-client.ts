@@ -3,6 +3,7 @@ import {
   ApiErrorEnvelope,
   AuthSuccessResponse,
   CreateScanJobApiRequest,
+  FindingEvidenceItemApiResponse,
   LoginRequest,
   OrganizationSelectionRequiredResponse,
   PaginatedResponse,
@@ -11,6 +12,8 @@ import {
   RegisterRequest,
   ScanJobApiResponse,
   ScanJobProgressApiResponse,
+  ScanJobResultDetailApiResponse,
+  ScanJobResultItemApiResponse,
   ScanURLApiResponse,
   UserProfileResponse,
 } from '@/types/api';
@@ -304,4 +307,188 @@ export async function cancelScanJob(jobId: string): Promise<ScanJobApiResponse> 
   return apiFetch<ScanJobApiResponse>(`/api/v1/scan-jobs/${jobId}/cancel`, {
     method: 'POST',
   });
+}
+
+// Phase 3C: Results, Evidence, and CSV Export methods
+export async function listScanJobResults(
+  jobId: string,
+  params?: {
+    limit?: number;
+    cursor?: string;
+    classification?: string;
+    validation_status?: string;
+    email_domain?: string;
+    search_prefix?: string;
+  },
+  signal?: AbortSignal
+): Promise<PaginatedResponse<ScanJobResultItemApiResponse>> {
+  const query = new URLSearchParams();
+  if (params?.limit) query.set('limit', params.limit.toString());
+  if (params?.cursor) query.set('cursor', params.cursor);
+  if (params?.classification) query.set('classification', params.classification);
+  if (params?.validation_status) query.set('validation_status', params.validation_status);
+  if (params?.email_domain) query.set('email_domain', params.email_domain);
+  if (params?.search_prefix) query.set('search_prefix', params.search_prefix);
+
+  const url = `/api/v1/scan-jobs/${jobId}/results${query.toString() ? `?${query.toString()}` : ''}`;
+  return apiFetch<PaginatedResponse<ScanJobResultItemApiResponse>>(url, { method: 'GET', signal });
+}
+
+export async function getScanJobResultDetail(
+  jobId: string,
+  findingId: string,
+  signal?: AbortSignal
+): Promise<ScanJobResultDetailApiResponse> {
+  return apiFetch<ScanJobResultDetailApiResponse>(
+    `/api/v1/scan-jobs/${jobId}/results/${findingId}`,
+    { method: 'GET', signal }
+  );
+}
+
+export async function listFindingEvidence(
+  jobId: string,
+  findingId: string,
+  params?: { limit?: number; cursor?: string },
+  signal?: AbortSignal
+): Promise<PaginatedResponse<FindingEvidenceItemApiResponse>> {
+  const query = new URLSearchParams();
+  if (params?.limit) query.set('limit', params.limit.toString());
+  if (params?.cursor) query.set('cursor', params.cursor);
+
+  const url = `/api/v1/scan-jobs/${jobId}/results/${findingId}/evidence${
+    query.toString() ? `?${query.toString()}` : ''
+  }`;
+  return apiFetch<PaginatedResponse<FindingEvidenceItemApiResponse>>(url, {
+    method: 'GET',
+    signal,
+  });
+}
+
+/**
+ * Safely parse filename from Content-Disposition header.
+ * Rejects path separators, control characters, unicode ambiguity, or non-CSV extension.
+ */
+export function parseSafeCsvFilename(dispositionHeader: string | null, fallbackFilename: string): string {
+  if (!dispositionHeader) return fallbackFilename;
+
+  // Match filename="..." or filename*=utf-8''...
+  let filename = '';
+  const utf8Match = dispositionHeader.match(/filename\*=utf-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      filename = decodeURIComponent(utf8Match[1]);
+    } catch {
+      filename = '';
+    }
+  }
+
+  if (!filename) {
+    const stdMatch = dispositionHeader.match(/filename="?([^";]+)"?/i);
+    if (stdMatch && stdMatch[1]) {
+      filename = stdMatch[1];
+    }
+  }
+
+  filename = filename.trim();
+
+  // Validate filename safety:
+  // Must end with .csv, no path separators (/ or \), no control chars, max length 128
+  if (
+    !filename ||
+    filename.length > 128 ||
+    /[\r\n\x00-\x1f\/\\]/.test(filename) ||
+    !filename.toLowerCase().endsWith('.csv') ||
+    !/^[a-zA-Z0-9._-]+$/.test(filename)
+  ) {
+    return fallbackFilename;
+  }
+
+  return filename;
+}
+
+export async function downloadScanJobCsv(jobId: string): Promise<string> {
+  const endpoint = `/api/v1/scan-jobs/${jobId}/export.csv`;
+  const defaultFilename = `scan-job-${jobId}-results.csv`;
+
+  const headers: Record<string, string> = {};
+  const token = getAccessToken();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  let res = await fetch(endpoint, {
+    method: 'GET',
+    headers,
+    credentials: 'same-origin',
+  });
+
+  // Handle 401 with silent refresh
+  if (res.status === 401 && !endpoint.includes('/auth/refresh')) {
+    try {
+      const newAccessToken = await performSilentRefresh();
+      headers['Authorization'] = `Bearer ${newAccessToken}`;
+      res = await fetch(endpoint, {
+        method: 'GET',
+        headers,
+        credentials: 'same-origin',
+      });
+    } catch (refreshErr) {
+      setAccessToken(null);
+      if (sessionExpiredListener) sessionExpiredListener();
+      throw refreshErr;
+    }
+  }
+
+  if (!res.ok) {
+    let errorEnvelope: ApiErrorEnvelope | null = null;
+    try {
+      errorEnvelope = await res.json();
+    } catch {
+      // Non-JSON error
+    }
+    const detail = errorEnvelope?.error || {
+      code: 'EXPORT_FAILED',
+      message: `CSV export failed with status ${res.status}`,
+    };
+    throw new ApiError(res.status, detail);
+  }
+
+  const contentType = (res.headers.get('Content-Type') || '').toLowerCase();
+  if (!contentType.startsWith('text/csv')) {
+    throw new ApiError(400, {
+      code: 'INVALID_CONTENT_TYPE',
+      message: `Expected text/csv response, but server returned Content-Type "${contentType}"`,
+    });
+  }
+
+  const blob = await res.blob();
+  const disposition = res.headers.get('Content-Disposition');
+  const filename = parseSafeCsvFilename(disposition, defaultFilename);
+
+  let objectUrl: string | null = null;
+  try {
+    const csvBlob = new Blob([blob], { type: 'text/csv; charset=utf-8' });
+    objectUrl = URL.createObjectURL(csvBlob);
+
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+
+    return filename;
+  } finally {
+    if (objectUrl) {
+      const targetUrl = objectUrl;
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(targetUrl);
+        } catch {
+          // Ignore revocation errors
+        }
+      }, 200);
+    }
+  }
 }

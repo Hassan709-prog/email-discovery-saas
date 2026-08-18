@@ -167,13 +167,16 @@ describe('JobDetailPage', () => {
     // Advance 3 seconds -> Polls progress and gets COMPLETED status
     await vi.advanceTimersByTimeAsync(3000);
 
+    await waitFor(() => {
+      expect(progressSpy).toHaveBeenCalled();
+    });
+
     const callCountAfterTerminal = progressSpy.mock.calls.length;
-    expect(callCountAfterTerminal).toBeGreaterThan(0);
 
     // Advance 10 seconds -> No further polling because status became terminal!
     await vi.advanceTimersByTimeAsync(10000);
 
-    expect(progressSpy).toHaveBeenCalledTimes(callCountAfterTerminal);
+    expect(progressSpy.mock.calls.length).toBe(callCountAfterTerminal);
   });
 
   it('allows queueing a DRAFT job directly from detail page', async () => {

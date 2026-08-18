@@ -27,6 +27,19 @@ export type ScanURLStatus =
   | 'CANCELLED'
   | 'DUPLICATE';
 
+export type EmailClassification =
+  | 'ROLE_BASED'
+  | 'PERSONAL_OR_NAMED'
+  | 'NO_REPLY'
+  | 'UNKNOWN';
+
+export type EmailValidationStatus = 'VALID' | 'UNVERIFIED' | 'INVALID';
+
+export type EmailSourceType =
+  | 'VISIBLE_TEXT'
+  | 'MAILTO'
+  | 'OBFUSCATED_TEXT';
+
 export interface OrganizationChoiceSchema {
   id: string;
   name: string;
@@ -137,6 +150,54 @@ export interface ScanURLApiResponse {
   status: ScanURLStatus;
   duplicate_of_scan_url_id: string | null;
   last_error_code: string | null;
+  created_at: string;
+}
+
+export interface RepresentativeEvidenceApiResponse {
+  evidence_id: string;
+  source_type: EmailSourceType | string;
+  sanitized_page_url: string;
+  snippet: string | null;
+  created_at: string;
+}
+
+export interface ScanJobResultItemApiResponse {
+  finding_id: string;
+  canonical_email: string;
+  email_domain: string;
+  classification: EmailClassification | string;
+  is_role_based: boolean;
+  validation_status: EmailValidationStatus | string;
+  evidence_count: number;
+  first_found_at: string;
+  last_found_at: string;
+  representative_evidence: RepresentativeEvidenceApiResponse[];
+}
+
+export interface ScanJobResultDetailApiResponse {
+  finding_id: string;
+  job_id: string;
+  canonical_email: string;
+  email_domain: string;
+  classification: EmailClassification | string;
+  is_role_based: boolean;
+  validation_status: EmailValidationStatus | string;
+  evidence_count: number;
+  first_found_at: string;
+  last_found_at: string;
+  created_at: string;
+  updated_at: string;
+  representative_evidence: RepresentativeEvidenceApiResponse[];
+}
+
+export interface FindingEvidenceItemApiResponse {
+  evidence_id: string;
+  source_type: EmailSourceType | string;
+  sanitized_page_url: string;
+  snippet: string | null;
+  confidence: number;
+  crawled_page_status_code: number | null;
+  crawled_page_depth: number | null;
   created_at: string;
 }
 

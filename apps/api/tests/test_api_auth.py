@@ -58,11 +58,22 @@ def test_register_route_sets_cookies_and_returns_201(test_app: FastAPI) -> None:
     assert data["access_token"] == access_token
     assert data["token_type"] == "Bearer"
 
-    # Verify cookies attached
+    # Verify cookies attached and paths/httponly attributes
     assert "refresh_token" in res.cookies
     assert "csrf_token" in res.cookies
     assert res.cookies["refresh_token"] == "mock-refresh-token-xyz"
     assert res.cookies["csrf_token"] == "mock-csrf-token-abc"
+
+    # Verify set-cookie headers contain exact security attributes
+    set_cookie_headers = res.headers.get_list("set-cookie")
+    refresh_header = next(h for h in set_cookie_headers if "refresh_token=" in h)
+    csrf_header = next(h for h in set_cookie_headers if "csrf_token=" in h)
+
+    assert "Path=/api/v1/auth" in refresh_header or "path=/api/v1/auth" in refresh_header
+    assert "httponly" in refresh_header.lower()
+
+    assert "Path=/" in csrf_header or "path=/" in csrf_header
+    assert "httponly" not in csrf_header.lower()
 
 
 def test_login_route_success(test_app: FastAPI) -> None:
@@ -131,12 +142,19 @@ def test_logout_returns_empty_204_and_clears_cookies(test_app: FastAPI) -> None:
 
     # Pass refresh cookie and CSRF header
     client.cookies.set("refresh_token", "old-refresh-token", path="/api/v1/auth")
-    client.cookies.set("csrf_token", "old-csrf-token", path="/api/v1/auth")
+    client.cookies.set("csrf_token", "old-csrf-token", path="/")
 
     res = client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": "old-csrf-token"})
 
     assert res.status_code == 204
     assert res.content == b""  # Empty 204 response body
+
+    set_cookie_headers = res.headers.get_list("set-cookie")
+    refresh_header = next(h for h in set_cookie_headers if "refresh_token=" in h)
+    csrf_header = next(h for h in set_cookie_headers if "csrf_token=" in h)
+
+    assert "Path=/api/v1/auth" in refresh_header or "path=/api/v1/auth" in refresh_header
+    assert "Path=/" in csrf_header or "path=/" in csrf_header
 
 
 def test_logout_all_returns_empty_204(test_app: FastAPI) -> None:

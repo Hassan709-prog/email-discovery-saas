@@ -16,6 +16,9 @@ build/
 # Node.js (future frontend)
 node_modules/
 .next/
+*.tsbuildinfo
+playwright-report/
+test-results/
 
 # Environment and secrets
 .env

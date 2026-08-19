@@ -263,6 +263,9 @@ class ResultPersistenceService:
         )
 
         # 6. Update ScanURL to target terminal status and clear lease
+        diag = getattr(site_scan_result, "diagnostics", None)
+        stats = getattr(site_scan_result, "statistics", None)
+
         stmt_url_final = (
             update(ScanURL)
             .where(ScanURL.id == claim.scan_url_id)
@@ -273,6 +276,11 @@ class ResultPersistenceService:
                 lease_expires_at=None,
                 last_error_code=err_code,
                 last_error_message=site_scan_result.error_message,
+                total_duration_seconds=diag.total_duration_seconds if diag else None,
+                pages_attempted=stats.pages_attempted if stats else None,
+                pages_fetched=stats.pages_fetched if stats else None,
+                retry_count=diag.retry_count if diag else None,
+                last_failure_code=diag.failure_code if diag else None,
             )
         )
         await self._session.execute(stmt_url_final)

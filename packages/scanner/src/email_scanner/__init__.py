@@ -35,9 +35,11 @@ from email_scanner.errors import (
     RobotsDecisionCode,
     SiteScanConfigError,
     SiteScanConfigErrorCode,
+    SiteScanFailureCode,
     SiteScanOutcome,
     URLNormalizationError,
     URLNormalizationErrorCode,
+    map_fetch_outcome_to_failure_code,
 )
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
@@ -72,6 +74,8 @@ from email_scanner.models import (
     RetryPolicy,
     RobotsDecision,
     SiteScanConfig,
+    SiteScanDiagnosticRecorder,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -177,6 +181,9 @@ __all__ = [
     "SiteScanConfig",
     "SiteScanConfigError",
     "SiteScanConfigErrorCode",
+    "SiteScanDiagnostics",
+    "SiteScanDiagnosticRecorder",
+    "SiteScanFailureCode",
     "SiteScanOrchestrator",
     "SiteScanOutcome",
     "SiteScanResult",
@@ -184,6 +191,7 @@ __all__ = [
     "SystemDNSResolver",
     "URLNormalizationError",
     "URLNormalizationErrorCode",
+    "map_fetch_outcome_to_failure_code",
     "calculate_backoff_delay",
     "calculate_domain_affinity",
     "calculate_page_score",

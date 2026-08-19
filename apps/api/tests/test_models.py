@@ -160,7 +160,7 @@ def test_alembic_single_head_revision() -> None:
     script = ScriptDirectory.from_config(alembic_cfg)
     heads = script.get_heads()
     assert len(heads) == 1
-    assert heads[0] == "20260818_0001"
+    assert heads[0] == "20260819_0001"
 
 
 def test_enum_values_synchronized() -> None:

@@ -349,6 +349,49 @@ def main(cli_args: list[str] | None = None) -> int:
         default=None,
         help="Path to an existing benchmark JSON file for performance comparison",
     )
+    # consistency-audit command
+    audit_parser = subparsers.add_parser(
+        "consistency-audit",
+        help="Run offline-first consistency audit comparing outputs across repeat executions",
+    )
+    audit_parser.add_argument(
+        "--size",
+        type=int,
+        default=100,
+        help="Number of input URLs to audit (default: 100)",
+    )
+    audit_parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Number of repeat scan executions per URL (default: 3)",
+    )
+    audit_parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random/fixture seed for offline audit (default: 42)",
+    )
+    audit_parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Enable live network audit mode (requires --input-file)",
+    )
+    audit_parser.add_argument(
+        "--input-file",
+        default=None,
+        help="Input file containing target URLs for live audit mode",
+    )
+    audit_parser.add_argument(
+        "--acknowledge-live-warning",
+        action="store_true",
+        help="Explicitly acknowledge live mode privacy/legal warning",
+    )
+    audit_parser.add_argument(
+        "--output-dir",
+        default=".consistency-audit-output",
+        help="Directory to save JSON audit report (default: .consistency-audit-output)",
+    )
 
     args = parser.parse_args(cli_args)
 
@@ -366,6 +409,13 @@ def main(cli_args: list[str] | None = None) -> int:
         from email_scanner.benchmarking import run_benchmark_cli
 
         exit_code, json_output = asyncio.run(run_benchmark_cli(args))
+        sys.stdout.write(json_output + "\n")
+        return exit_code
+
+    if args.command == "consistency-audit":
+        from email_scanner.consistency_audit import run_consistency_audit
+
+        exit_code, json_output = asyncio.run(run_consistency_audit(args))
         sys.stdout.write(json_output + "\n")
         return exit_code
 

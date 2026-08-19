@@ -43,11 +43,17 @@ class CrawlAttemptRepository:
             status_code=mapped.status_code,
             error_code=mapped.error_code,
             error_message=mapped.error_message,
+            failure_code=mapped.failure_code,
             redirect_history=mapped.redirect_history,
             connection_attempts=mapped.connection_attempts,
             started_at=mapped.started_at,
             completed_at=mapped.completed_at,
             elapsed_seconds=mapped.elapsed_seconds,
+            dns_duration_seconds=mapped.dns_duration_seconds,
+            gate_wait_seconds=mapped.gate_wait_seconds,
+            robots_duration_seconds=mapped.robots_duration_seconds,
+            http_duration_seconds=mapped.http_duration_seconds,
+            parse_duration_seconds=mapped.parse_duration_seconds,
             result_checksum=mapped.result_checksum,
         )
         self._session.add(attempt)

@@ -141,6 +141,18 @@ export interface ScanJobProgressApiResponse {
   completed_at: string | null;
 }
 
+export interface ScanURLDiagnosticsApiResponse {
+  total_duration_seconds: number | null;
+  pages_attempted: number | null;
+  pages_fetched: number | null;
+  retry_count: number | null;
+  last_failure_code: string | null;
+  selected_primary_email: string | null;
+  primary_email_selection_version: string | null;
+  plain_language_outcome: string | null;
+  failure_reason: string | null;
+}
+
 export interface ScanURLApiResponse {
   id: string;
   scan_job_id: string;
@@ -152,6 +164,14 @@ export interface ScanURLApiResponse {
   duplicate_of_scan_url_id: string | null;
   last_error_code: string | null;
   created_at: string;
+  processing_duration_seconds?: number | null;
+  retry_count?: number | null;
+  pages_checked?: number | null;
+  selected_primary_email?: string | null;
+  primary_email_selection_version?: string | null;
+  plain_language_outcome?: string | null;
+  failure_reason?: string | null;
+  diagnostics?: ScanURLDiagnosticsApiResponse | null;
 }
 
 export interface RepresentativeEvidenceApiResponse {

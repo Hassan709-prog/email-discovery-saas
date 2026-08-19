@@ -32,8 +32,11 @@ class ScanURLRepository:
         status: str | None = None,
     ) -> list[ScanURL]:
         """List scan URLs with tenant JOIN and deterministic ordering."""
+        from sqlalchemy.orm import selectinload
+
         stmt = (
             select(ScanURL)
+            .options(selectinload(ScanURL.email_finding))
             .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
             .where(
                 ScanJob.organization_id == organization_id,

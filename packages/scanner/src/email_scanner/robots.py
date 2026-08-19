@@ -9,6 +9,7 @@ import time
 import urllib.robotparser
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from email_scanner.errors import (
     FetchOutcomeCode,
@@ -121,18 +122,24 @@ class RobotsPolicyEvaluator:
         self,
         url: str | NormalizedURL,
         user_agent_token: str | None = None,
+        recorder: Any | None = None,
     ) -> RobotsDecision:
         """Evaluate robots.txt policy for a target URL asynchronously."""
+        eval_start_t = self._clock()
         if isinstance(url, str):
             try:
                 target_url = normalize_url(url)
             except URLNormalizationError as err:
-                return RobotsDecision(
+                decision = RobotsDecision(
                     target_url=url,
                     decision=RobotsDecisionCode.TEMPORARY_FAILURE,
                     crawl_delay=None,
                     reason=f"Invalid target URL: {err}",
                 )
+                if recorder is not None:
+                    dt = max(0.0, self._clock() - eval_start_t)
+                    recorder.robots_evaluation_duration_seconds += dt
+                return decision
         else:
             target_url = url
 
@@ -153,6 +160,7 @@ class RobotsPolicyEvaluator:
                 if cached_policy is None or now >= cached_policy.expires_at:
                     robots_url_str = f"{origin}/robots.txt"
 
+                    r_fetch_start = self._clock()
                     robots_result = await self._fetcher.fetch(
                         robots_url_str,
                         allowed_content_types=(
@@ -161,7 +169,11 @@ class RobotsPolicyEvaluator:
                             "text/html",
                             "application/xhtml+xml",
                         ),
+                        recorder=recorder,
                     )
+                    if recorder is not None:
+                        dt = max(0.0, self._clock() - r_fetch_start)
+                        recorder.robots_fetch_duration_seconds += dt
 
                     cached_policy = self._build_policy(robots_result, token, now)
                     self._cache[cache_key] = cached_policy
@@ -169,7 +181,10 @@ class RobotsPolicyEvaluator:
         if cached_policy.crawl_delay is not None:
             self._fetcher.request_gate.update_domain_interval(target_url, cached_policy.crawl_delay)
 
-        return self._evaluate_cached_policy(cached_policy, target_url.normalized_url, token)
+        res = self._evaluate_cached_policy(cached_policy, target_url.normalized_url, token)
+        if recorder is not None:
+            recorder.robots_evaluation_duration_seconds += max(0.0, self._clock() - eval_start_t)
+        return res
 
     def _build_policy(
         self,

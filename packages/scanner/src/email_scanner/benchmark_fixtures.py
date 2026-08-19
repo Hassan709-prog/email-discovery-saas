@@ -99,7 +99,7 @@ class OfflineBenchmarkNetworkStream(httpcore.AsyncNetworkStream):
             parts = first_line.split(" ")
             path = parts[1] if len(parts) > 1 else "/"
 
-            site_index = 0
+            site_index = None
             for line in lines[1:]:
                 line_str = line.decode("latin1", errors="ignore").lower()
                 if line_str.startswith("host:"):
@@ -109,8 +109,22 @@ class OfflineBenchmarkNetworkStream(httpcore.AsyncNetworkStream):
                             idx_str = host_val.split("site-")[1].split(".")[0]
                             site_index = int(idx_str)
                         except ValueError:
-                            site_index = 0
+                            pass
                     break
+
+            if site_index is None:
+                if "93.184.216." in self.target_host or "198.51.100." in self.target_host:
+                    try:
+                        site_index = int(self.target_host.split(".")[-1])
+                    except ValueError:
+                        site_index = 0
+                elif "site-" in self.target_host:
+                    try:
+                        site_index = int(self.target_host.split("site-")[1].split(".")[0])
+                    except ValueError:
+                        site_index = 0
+                else:
+                    site_index = 0
 
             status_code, headers, body_bytes = SyntheticSiteGenerator.get_page_content(
                 site_index, path
@@ -199,18 +213,29 @@ class OfflineBenchmarkNetworkBackend(httpcore.AsyncNetworkBackend):
 class OfflineBenchmarkDNSResolver(AsyncDNSResolver):
     """Async DNS resolver mapping site-{i}.example.org to synthetic public IP addresses."""
 
-    async def resolve(self, url: NormalizedURL) -> tuple[str, ...]:
-        return await self.resolve_host(url.hostname, url.port or 80)
+    async def resolve(
+        self,
+        url: NormalizedURL,
+        recorder: Any | None = None,
+        clock: Any | None = None,
+    ) -> tuple[str, ...]:
+        return await self.resolve_host(url.hostname, url.port or 80, recorder=recorder, clock=clock)
 
-    async def resolve_host(self, hostname: str, port: int = 80) -> tuple[str, ...]:
+    async def resolve_host(
+        self,
+        hostname: str,
+        port: int = 80,
+        recorder: Any | None = None,
+        clock: Any | None = None,
+    ) -> tuple[str, ...]:
         clean_host = hostname.strip().strip("[]")
         if "site-" in clean_host:
             try:
                 idx_str = clean_host.split("site-")[1].split(".")[0]
                 site_idx = int(idx_str)
                 # Map to public TEST-NET-2 IP range 198.51.100.X
-                ip_octet = (site_idx % 250) + 1
-                return (f"198.51.100.{ip_octet}",)
+                ip_octet = site_idx % 250
+                return (f"93.184.216.{ip_octet}",)
             except ValueError:
                 pass
-        return ("198.51.100.1",)
+        return ("93.184.216.0",)

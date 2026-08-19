@@ -9,6 +9,7 @@ import ssl
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpcore
 import httpx
@@ -19,6 +20,7 @@ from email_scanner.errors import (
     FetchOutcomeCode,
     HostSafetyError,
     HostSafetyErrorCode,
+    SiteScanFailureCode,
     URLNormalizationError,
 )
 from email_scanner.models import (
@@ -101,6 +103,7 @@ class AsyncHTTPFetcher:
         url: str | NormalizedURL,
         allowed_content_types: tuple[str, ...] | None = None,
         redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+        recorder: Any | None = None,
     ) -> FetchResult:
         """Fetch content for a URL safely, asynchronously, with DNS pinning and bounded retries."""
         effective_redirect_validator = (
@@ -139,6 +142,7 @@ class AsyncHTTPFetcher:
         global_start_time = self._clock()
         global_attempt_counter = 0
         hop_index = 0
+        status_code: int | None = None
 
         should_close_client = False
         client = self._client
@@ -198,13 +202,24 @@ class AsyncHTTPFetcher:
 
                 # Pre-validate host safety / DNS for current hop
                 try:
-                    await self._dns_resolver.resolve(current_url)
+                    try:
+                        await self._dns_resolver.resolve(
+                            current_url, recorder=recorder, clock=self._clock
+                        )
+                    except TypeError:
+                        await self._dns_resolver.resolve(current_url)
                 except HostSafetyError as err:
                     outcome = (
                         FetchOutcomeCode.DNS_RESOLUTION_FAILED
                         if err.code == HostSafetyErrorCode.NO_RESOLVED_ADDRESSES
                         else FetchOutcomeCode.UNSAFE_HOST
                     )
+                    if recorder is not None:
+                        recorder.failure_code = (
+                            SiteScanFailureCode.DNS_RESOLUTION_FAILED
+                            if outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED
+                            else SiteScanFailureCode.UNSAFE_HOST
+                        )
                     attempts.append(
                         FetchAttempt(
                             hop_index=hop_index,
@@ -239,6 +254,9 @@ class AsyncHTTPFetcher:
                 while True:
                     # Check global retry attempt limit and elapsed time budget
                     if global_attempt_counter >= retry_policy.max_total_fetch_attempts:
+                        if recorder is not None:
+                            recorder.retry_budget_exhausted = True
+                            recorder.failure_code = SiteScanFailureCode.RETRY_BUDGET_EXHAUSTED
                         return FetchResult(
                             final_url=current_url.normalized_url,
                             status_code=None,
@@ -251,6 +269,9 @@ class AsyncHTTPFetcher:
                         )
 
                     if (self._clock() - global_start_time) > retry_policy.max_elapsed_retry_seconds:
+                        if recorder is not None:
+                            recorder.time_budget_exhausted = True
+                            recorder.failure_code = SiteScanFailureCode.TOTAL_TIME_BUDGET_EXHAUSTED
                         return FetchResult(
                             final_url=current_url.normalized_url,
                             status_code=None,
@@ -266,7 +287,10 @@ class AsyncHTTPFetcher:
                     global_attempt_counter += 1
 
                     # Re-acquire domain rate-limiting gate permission before every request attempt
-                    await self._request_gate.acquire(current_url)
+                    try:
+                        await self._request_gate.acquire(current_url, recorder=recorder)
+                    except TypeError:
+                        await self._request_gate.acquire(current_url)
 
                     # Prepare request-scoped connection evidence collector
                     conn_list: list[IPConnectionAttempt] = []
@@ -411,18 +435,30 @@ class AsyncHTTPFetcher:
                                             attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                                             error_msg = f"Failed to decode response body: {dec_err}"
 
+                    except httpx.ConnectTimeout:
+                        attempt_outcome = FetchOutcomeCode.TIMEOUT
+                        error_msg = "Connection timed out"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.CONNECT_TIMEOUT
+                    except httpx.ReadTimeout:
+                        attempt_outcome = FetchOutcomeCode.TIMEOUT
+                        error_msg = "Read timed out"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.READ_TIMEOUT
                     except (
-                        httpx.ConnectTimeout,
-                        httpx.ReadTimeout,
                         httpx.WriteTimeout,
                         httpx.PoolTimeout,
                         httpcore.TimeoutException,
                     ):
                         attempt_outcome = FetchOutcomeCode.TIMEOUT
                         error_msg = "Request timed out"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.GENERIC_TIMEOUT
                     except ssl.SSLCertVerificationError, ssl.SSLError:
                         attempt_outcome = FetchOutcomeCode.TLS_VERIFICATION_FAILED
                         error_msg = "TLS certificate verification failed"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.TLS_VERIFICATION_FAILED
                     except (
                         httpx.ConnectError,
                         httpx.NetworkError,
@@ -431,9 +467,13 @@ class AsyncHTTPFetcher:
                     ) as net_err:
                         attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                         error_msg = f"Transport network error: {net_err}"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.TRANSPORT_ERROR
                     except Exception as gen_err:
                         attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                         error_msg = f"Unexpected network error: {gen_err}"
+                        if recorder is not None:
+                            recorder.failure_code = SiteScanFailureCode.UNEXPECTED_INTERNAL_ERROR
                     finally:
                         _connection_attempts_ctx.reset(token)
 
@@ -536,5 +576,12 @@ class AsyncHTTPFetcher:
                         )
 
         finally:
+            if recorder is not None:
+                fetch_elapsed = max(0.0, self._clock() - global_start_time)
+                recorder.http_fetch_duration_seconds += fetch_elapsed
+                recorder.retry_count += max(0, global_attempt_counter - 1)
+                recorder.redirect_count += len(redirect_history)
+                if status_code is not None:
+                    recorder.http_status = status_code
             if should_close_client and client:
                 await client.aclose()

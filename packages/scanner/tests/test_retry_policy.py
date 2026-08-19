@@ -1,6 +1,7 @@
 """Tests for retry policy, backoff calculation, Retry-After parsing, and fetch attempt history."""
 
 from collections.abc import Callable
+from typing import Any
 
 from email_scanner.errors import (
     DelaySource,
@@ -54,10 +55,13 @@ class MockHTTPFetcherWithResponses(AsyncHTTPFetcher):
         url: str | NormalizedURL,
         allowed_content_types: tuple[str, ...] | None = None,
         redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+        recorder: Any | None = None,
     ) -> FetchResult:
         # Override to simulate responses without real network calls
         # while retaining fetch wrapper behavior
-        return await super().fetch(url, allowed_content_types, redirect_validator)
+        return await super().fetch(
+            url, allowed_content_types, redirect_validator, recorder=recorder
+        )
 
 
 def test_parse_retry_after_header_delta_seconds_and_http_date() -> None:

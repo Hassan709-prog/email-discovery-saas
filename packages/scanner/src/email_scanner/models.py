@@ -574,6 +574,86 @@ class PageScanRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SiteScanDiagnostics:
+    """Immutable diagnostic breakdown of a single site scan execution."""
+
+    total_duration_seconds: float = 0.0
+    dns_resolution_duration_seconds: float = 0.0
+    gate_wait_duration_seconds: float = 0.0
+    robots_fetch_duration_seconds: float = 0.0
+    robots_evaluation_duration_seconds: float = 0.0
+    http_fetch_duration_seconds: float = 0.0
+    page_processing_duration_seconds: float = 0.0
+    retry_count: int = 0
+    total_retry_delay_seconds: float = 0.0
+    redirect_count: int = 0
+    http_status: int | None = None
+    failure_code: str | None = None
+    time_budget_exhausted: bool = False
+    cancellation_occurred: bool = False
+    retry_budget_exhausted: bool = False
+
+
+class SiteScanDiagnosticRecorder:
+    """Request-scoped mutable recorder passed through boundary executions."""
+
+    __slots__ = (
+        "total_duration_seconds",
+        "dns_resolution_duration_seconds",
+        "gate_wait_duration_seconds",
+        "robots_fetch_duration_seconds",
+        "robots_evaluation_duration_seconds",
+        "http_fetch_duration_seconds",
+        "page_processing_duration_seconds",
+        "retry_count",
+        "total_retry_delay_seconds",
+        "redirect_count",
+        "http_status",
+        "failure_code",
+        "time_budget_exhausted",
+        "cancellation_occurred",
+        "retry_budget_exhausted",
+    )
+
+    def __init__(self) -> None:
+        self.total_duration_seconds: float = 0.0
+        self.dns_resolution_duration_seconds: float = 0.0
+        self.gate_wait_duration_seconds: float = 0.0
+        self.robots_fetch_duration_seconds: float = 0.0
+        self.robots_evaluation_duration_seconds: float = 0.0
+        self.http_fetch_duration_seconds: float = 0.0
+        self.page_processing_duration_seconds: float = 0.0
+        self.retry_count: int = 0
+        self.total_retry_delay_seconds: float = 0.0
+        self.redirect_count: int = 0
+        self.http_status: int | None = None
+        self.failure_code: str | None = None
+        self.time_budget_exhausted: bool = False
+        self.cancellation_occurred: bool = False
+        self.retry_budget_exhausted: bool = False
+
+    def build_diagnostics(self) -> SiteScanDiagnostics:
+        """Create an immutable snapshot of current measurements."""
+        return SiteScanDiagnostics(
+            total_duration_seconds=round(self.total_duration_seconds, 4),
+            dns_resolution_duration_seconds=round(self.dns_resolution_duration_seconds, 4),
+            gate_wait_duration_seconds=round(self.gate_wait_duration_seconds, 4),
+            robots_fetch_duration_seconds=round(self.robots_fetch_duration_seconds, 4),
+            robots_evaluation_duration_seconds=round(self.robots_evaluation_duration_seconds, 4),
+            http_fetch_duration_seconds=round(self.http_fetch_duration_seconds, 4),
+            page_processing_duration_seconds=round(self.page_processing_duration_seconds, 4),
+            retry_count=self.retry_count,
+            total_retry_delay_seconds=round(self.total_retry_delay_seconds, 4),
+            redirect_count=self.redirect_count,
+            http_status=self.http_status,
+            failure_code=self.failure_code,
+            time_budget_exhausted=self.time_budget_exhausted,
+            cancellation_occurred=self.cancellation_occurred,
+            retry_budget_exhausted=self.retry_budget_exhausted,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SiteScanStatistics:
     """Deterministic counters and metrics for a site scan."""
 
@@ -600,6 +680,7 @@ class SiteScanResult:
     email_findings: tuple[EmailFinding, ...]
     rejected_email_candidates: tuple[RejectedEmailCandidate, ...]
     error_message: str | None = None
+    diagnostics: SiteScanDiagnostics | None = None
 
 
 @dataclass(frozen=True, slots=True)

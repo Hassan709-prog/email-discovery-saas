@@ -24,6 +24,7 @@ from email_discovery_api.models.enums import ScanURLStatus
 from email_discovery_api.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
+    from email_discovery_api.models.email_finding import EmailFinding
     from email_discovery_api.models.scan_job import ScanJob
 
 
@@ -55,6 +56,22 @@ class ScanURL(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         CheckConstraint(
             "duplicate_of_scan_url_id IS NULL OR duplicate_of_scan_url_id != id",
             name="ck_scan_urls_self_duplicate_prevented",
+        ),
+        CheckConstraint(
+            "total_duration_seconds IS NULL OR total_duration_seconds >= 0.0",
+            name="ck_scan_urls_total_duration_nonnegative",
+        ),
+        CheckConstraint(
+            "pages_attempted IS NULL OR pages_attempted >= 0",
+            name="ck_scan_urls_pages_attempted_nonnegative",
+        ),
+        CheckConstraint(
+            "pages_fetched IS NULL OR pages_fetched >= 0",
+            name="ck_scan_urls_pages_fetched_nonnegative",
+        ),
+        CheckConstraint(
+            "retry_count IS NULL OR retry_count >= 0",
+            name="ck_scan_urls_retry_count_nonnegative",
         ),
     )
 
@@ -90,6 +107,16 @@ class ScanURL(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
+    # Diagnostic summary fields
+    total_duration_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    pages_attempted: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pages_fetched: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_failure_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
     # Relationships
     scan_job: Mapped[ScanJob] = relationship(back_populates="scan_urls")
     duplicate_of: Mapped[ScanURL | None] = relationship(remote_side="ScanURL.id")
+    email_finding: Mapped[EmailFinding | None] = relationship(
+        back_populates="scan_url", uselist=False, overlaps="scan_job"
+    )

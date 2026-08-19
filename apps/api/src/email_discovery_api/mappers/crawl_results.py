@@ -152,6 +152,12 @@ class MappedAttempt:
     completed_at: datetime | None
     elapsed_seconds: float | None
     result_checksum: str
+    failure_code: str | None = None
+    dns_duration_seconds: float | None = None
+    gate_wait_seconds: float | None = None
+    robots_duration_seconds: float | None = None
+    http_duration_seconds: float | None = None
+    parse_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,6 +520,18 @@ def map_site_scan_result(
         else requested_url
     )
 
+    diag = getattr(site_scan_result, "diagnostics", None)
+    failure_code_val = diag.failure_code if diag else None
+    dns_sec = diag.dns_resolution_duration_seconds if diag else None
+    gate_sec = diag.gate_wait_duration_seconds if diag else None
+    robots_sec = (
+        (diag.robots_fetch_duration_seconds + diag.robots_evaluation_duration_seconds)
+        if diag
+        else None
+    )
+    http_sec = diag.http_fetch_duration_seconds if diag else None
+    parse_sec = diag.page_processing_duration_seconds if diag else None
+
     mapped_attempt = MappedAttempt(
         attempt_number=attempt_number,
         outcome=attempt_outcome,
@@ -529,6 +547,12 @@ def map_site_scan_result(
         completed_at=now,
         elapsed_seconds=elapsed,
         result_checksum=checksum,
+        failure_code=failure_code_val,
+        dns_duration_seconds=dns_sec,
+        gate_wait_seconds=gate_sec,
+        robots_duration_seconds=robots_sec,
+        http_duration_seconds=http_sec,
+        parse_duration_seconds=parse_sec,
     )
 
     return (

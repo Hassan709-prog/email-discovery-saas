@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -14,7 +17,10 @@ from email_discovery_api.api.dependencies.cursors import (
 )
 from email_discovery_api.api.dependencies.idempotency import validate_idempotency_key
 from email_discovery_api.api.dependencies.identity import RequestPrincipal, get_current_principal
-from email_discovery_api.api.dependencies.services import get_scan_job_service
+from email_discovery_api.api.dependencies.services import (
+    get_redis_publisher,
+    get_scan_job_service,
+)
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.schemas.api_scan_jobs import (
     CreateScanJobApiRequest,
@@ -30,6 +36,8 @@ from email_discovery_api.schemas.api_scan_jobs import (
 from email_discovery_api.schemas.scan_jobs import CreateScanJobCommand
 from email_discovery_api.services.policies import ScanCreationPolicy
 from email_discovery_api.services.scan_jobs import ScanJobService, preview_scan_inputs
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/scan-jobs", tags=["scan-jobs"])
 
@@ -266,12 +274,24 @@ async def queue_scan_job(
     job_id: UUID,
     principal: RequestPrincipal = Depends(get_current_principal),
     service: ScanJobService = Depends(get_scan_job_service),
+    publisher: Any = Depends(get_redis_publisher),
 ) -> ScanJobApiResponse:
     """Transition draft job to queued state for execution."""
-    job = await service.transition_job_status(
-        principal.organization_id, job_id, ScanJobStatus.QUEUED
-    )
-    return ScanJobApiResponse.from_orm_model(job)
+    result = await service.queue_job(principal.organization_id, job_id)
+
+    if result.transitioned_to_queued and publisher is not None:
+        try:
+            await asyncio.wait_for(
+                publisher.publish_work_available(),
+                timeout=0.25,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Redis wake-up publish failed [code=REDIS_PUBLISH_FAILED, error_type=%s]",
+                type(exc).__name__,
+            )
+
+    return ScanJobApiResponse.from_orm_model(result.job)
 
 
 @router.post(

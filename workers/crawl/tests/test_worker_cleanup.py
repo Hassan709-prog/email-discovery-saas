@@ -5,9 +5,9 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 
 from email_discovery_api.services.worker_contracts import URLClaim
+from email_discovery_crawl_worker.worker import CrawlWorker
 
 
 @pytest.mark.anyio

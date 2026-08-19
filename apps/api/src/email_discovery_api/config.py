@@ -67,6 +67,34 @@ class Settings(BaseSettings):
         default=10.0, description="Allowed clock skew in seconds for JWT verification"
     )
 
+    # Redis Coordination Settings
+    redis_url: SecretStr = Field(
+        default=SecretStr("redis://localhost:6379/0"),
+        description="Redis connection URL",
+    )
+    redis_required: bool = Field(
+        default=False, description="Whether Redis is strictly required for API readiness"
+    )
+    redis_max_connections: int = Field(default=20, description="Max Redis pool connections")
+    redis_connect_timeout: float = Field(
+        default=2.0, description="Redis connect timeout in seconds"
+    )
+    redis_socket_timeout: float = Field(
+        default=2.0, description="Redis socket read/write timeout in seconds"
+    )
+    redis_operation_timeout: float = Field(
+        default=0.5, description="Redis command operation timeout in seconds"
+    )
+    redis_publish_timeout: float = Field(
+        default=0.25, description="Redis wake-up publish operation timeout in seconds"
+    )
+    redis_health_timeout: float = Field(
+        default=1.0, description="Redis health probe timeout in seconds"
+    )
+    redis_key_prefix: str = Field(
+        default="email_discovery:v1:dev", description="Namespaced Redis key prefix"
+    )
+
     model_config = SettingsConfigDict(
         env_file=None,
         env_prefix="",

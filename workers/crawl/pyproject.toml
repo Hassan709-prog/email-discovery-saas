@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Local PostgreSQL-backed crawl worker process for Email Discovery SaaS"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "redis>=5.2.0,<6.0.0",
+    "pydantic-settings>=2.7.0",
     "email-discovery-scanner",
     "email-discovery-api",
 ]

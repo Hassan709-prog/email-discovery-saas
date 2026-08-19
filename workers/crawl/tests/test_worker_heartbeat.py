@@ -5,13 +5,13 @@ import uuid
 from typing import Any
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import select
 
 from email_discovery_api.models import ScanJob, ScanURL
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.services.worker_contracts import URLClaim
+from email_discovery_crawl_worker.worker import CrawlWorker
 
 pytestmark = pytest.mark.anyio
 

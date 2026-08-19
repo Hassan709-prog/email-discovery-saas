@@ -69,6 +69,14 @@ class CreateJobResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class QueueJobResult:
+    """Result of job queueing distinguishing first transitions from idempotent replays."""
+
+    job: ScanJob
+    transitioned_to_queued: bool
+
+
 def utc_now() -> datetime:
     """Return timezone-aware current UTC datetime."""
     return datetime.now(UTC)
@@ -267,10 +275,11 @@ class ScanJobService:
 
         return CreateJobResult(job=job, created=True)
 
-    async def queue_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
+    async def queue_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> QueueJobResult:
         """Atomically transition job from DRAFT to QUEUED.
 
         Guard: Rejects queueing if valid_input_count == 0 with ServiceErrorCode.NO_VALID_INPUTS.
+        Returns QueueJobResult indicating whether job transitioned or was an idempotent replay.
         """
         async with self.session.begin():
             job = await self.job_repo.get_job_for_update(organization_id, job_id)
@@ -284,7 +293,7 @@ class ScanJobService:
 
             current_status = ScanJobStatus(job.status)
             if current_status == ScanJobStatus.QUEUED:
-                return job
+                return QueueJobResult(job=job, transitioned_to_queued=False)
 
             if current_status != ScanJobStatus.DRAFT:
                 raise ServiceError(
@@ -327,7 +336,7 @@ class ScanJobService:
                 )
                 self.event_repo.append_event(event)
 
-            return job
+            return QueueJobResult(job=job, transitioned_to_queued=True)
 
     async def cancel_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
         """Cancel a scan job atomically from QUEUED or RUNNING state.
@@ -816,7 +825,8 @@ class ScanJobService:
     ) -> ScanJob:
         """Perform a validated status transition with strict idempotency and event logging."""
         if new_status == ScanJobStatus.QUEUED:
-            return await self.queue_job(organization_id, job_id)
+            result = await self.queue_job(organization_id, job_id)
+            return result.job
         elif new_status in (ScanJobStatus.CANCELLING, ScanJobStatus.CANCELLED):
             return await self.cancel_job(organization_id, job_id)
 

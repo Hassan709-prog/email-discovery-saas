@@ -5,12 +5,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import select
 
 from email_discovery_api.models import EmailFinding, ScanJob, ScanURL
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
+from email_discovery_crawl_worker.worker import CrawlWorker
 from email_scanner.errors import SiteScanOutcome
 from email_scanner.models import (
     DomainAffinity,

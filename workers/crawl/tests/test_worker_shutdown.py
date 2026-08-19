@@ -3,8 +3,9 @@
 import asyncio
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from email_discovery_crawl_worker.worker import CrawlWorker
 
 pytestmark = pytest.mark.anyio
 

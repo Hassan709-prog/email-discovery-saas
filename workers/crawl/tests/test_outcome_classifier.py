@@ -2,13 +2,12 @@
 
 import uuid
 
+from email_discovery_api.services.worker_contracts import LeaseLostError
 from email_discovery_crawl_worker.outcome_classifier import (
     WorkerExecutionOutcome,
     classify_error_code_and_retryability,
     classify_worker_outcome,
 )
-
-from email_discovery_api.services.worker_contracts import LeaseLostError
 from email_scanner import FetchOutcomeCode, PageScanOutcome, RobotsDecisionCode
 from email_scanner.errors import SiteScanOutcome
 from email_scanner.models import (

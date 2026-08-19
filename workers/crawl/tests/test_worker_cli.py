@@ -3,6 +3,7 @@
 import logging
 
 import pytest
+
 from email_discovery_crawl_worker.cli import parse_args
 
 

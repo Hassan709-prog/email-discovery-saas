@@ -749,7 +749,8 @@ class ScanJobService:
             job.failed_count = failed_actual
 
         # 3. Attempt finalization
-        return await self.try_finalize_job(organization_id, job_id)
+        await self.try_finalize_job(organization_id, job_id)
+        return await self.job_repo.get_job(organization_id, job_id)
 
     async def get_job(self, organization_id: uuid.UUID, job_id: uuid.UUID) -> ScanJob:
         """Fetch a job strictly scoped to tenant or raise JOB_NOT_FOUND."""

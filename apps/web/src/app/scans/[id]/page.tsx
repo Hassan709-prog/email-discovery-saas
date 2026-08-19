@@ -592,6 +592,15 @@ export default function JobDetailPage() {
         {/* Tab Content: FINDINGS */}
         {activeTab === 'FINDINGS' && (
           <div className="space-y-6">
+            {/* Primary Email Selection Explanation Banner */}
+            <div className="bg-blue-50 p-4 rounded-xl border border-blue-200 flex items-start space-x-3 text-xs text-blue-900">
+              <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold">Primary Email Selection: </span>
+                The most suitable publicly listed email is selected for each website.
+              </div>
+            </div>
+
             {/* Filter Toolbar Form */}
             <form
               onSubmit={handleApplyFilters}

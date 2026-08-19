@@ -39,6 +39,7 @@ class ScanURL(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "scan_urls"
     __table_args__ = (
         UniqueConstraint("scan_job_id", "original_index", name="uq_scan_urls_job_index"),
+        UniqueConstraint("id", "scan_job_id", name="uq_scan_urls_id_job"),
         Index("ix_scan_urls_job_status", "scan_job_id", "status"),
         Index("ix_scan_urls_status_next_retry", "status", "next_retry_at"),
         Index("ix_scan_urls_status_lease_expires", "status", "lease_expires_at"),

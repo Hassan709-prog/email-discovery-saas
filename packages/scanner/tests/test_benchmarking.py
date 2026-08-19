@@ -200,7 +200,7 @@ async def test_offline_benchmark_run_scenario_1() -> None:
     assert metrics.success_count == 1
     assert metrics.failure_count == 0
     assert metrics.total_pages_fetched == 4
-    assert metrics.total_emails_discovered == 7
+    assert metrics.total_emails_discovered == 1
     assert metrics.urls_per_second > 0
     assert metrics.peak_memory_bytes > 0
     assert len(metrics.result_checksum) == 64
@@ -252,7 +252,7 @@ def test_cli_benchmark_command_parsing(tmp_path: Path) -> None:
     assert "configuration" in report_data["metadata"]
     assert "1" in report_data["scenarios"]
     assert report_data["scenarios"]["1"]["success_count"] == 1
-    assert report_data["scenarios"]["1"]["total_emails_discovered"] == 7
+    assert report_data["scenarios"]["1"]["total_emails_discovered"] == 1
     assert report_data["scenarios"]["1"]["total_pages_fetched"] == 4
 
 

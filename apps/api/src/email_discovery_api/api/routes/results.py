@@ -105,9 +105,12 @@ async def list_scan_job_results(
             )
             for ev in evidence_list
         ]
+        target_url_str = f.scan_url.original_input if f.scan_url else None
         items.append(
             ScanJobResultItemApiResponse(
                 finding_id=f.id,
+                scan_url_id=f.scan_url_id,
+                target_url=target_url_str,
                 canonical_email=f.canonical_email,
                 email_domain=f.email_domain,
                 classification=f.classification,
@@ -152,9 +155,12 @@ async def get_scan_job_result_detail(
         for ev in evidence_list
     ]
 
+    target_url_str = finding.scan_url.original_input if finding.scan_url else None
     return ScanJobResultDetailApiResponse(
         finding_id=finding.id,
         job_id=finding.scan_job_id,
+        scan_url_id=finding.scan_url_id,
+        target_url=target_url_str,
         canonical_email=finding.canonical_email,
         email_domain=finding.email_domain,
         classification=finding.classification,
@@ -229,6 +235,8 @@ async def export_scan_job_results_csv(
         writer = csv.writer(header_buffer, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
         writer.writerow(
             [
+                "scan_url_id",
+                "target_url",
                 "canonical_email",
                 "email_domain",
                 "classification",
@@ -247,8 +255,11 @@ async def export_scan_job_results_csv(
             buffer = io.StringIO()
             writer = csv.writer(buffer, quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
             for f in batch:
+                target_url_val = f.scan_url.original_input if f.scan_url else ""
                 writer.writerow(
                     [
+                        sanitize_csv_cell(str(f.scan_url_id) if f.scan_url_id else ""),
+                        sanitize_csv_cell(target_url_val),
                         sanitize_csv_cell(f.canonical_email),
                         sanitize_csv_cell(f.email_domain),
                         sanitize_csv_cell(f.classification),

@@ -195,6 +195,9 @@ class ResultPersistenceService:
                 f"ScanURL attempt {claim.attempt_count} exists with different result checksum",
             )
 
+        # 0. Acquire job lock first to prevent lock order deadlocks during FK checks
+        job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
+
         # Strict fencing check requiring lease_expires_at > clock_timestamp()
         stmt_check = (
             update(ScanURL)
@@ -230,6 +233,7 @@ class ResultPersistenceService:
             job_id=claim.job_id,
             mapped_findings=mapped_findings,
             now=current_time,
+            scan_url_id=claim.scan_url_id,
         )
         new_findings_count = len(newly_inserted)
 
@@ -274,7 +278,6 @@ class ResultPersistenceService:
         await self._session.execute(stmt_url_final)
 
         # 7. Counter updates on ScanJob
-        job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
         if job is not None and getattr(job, "running_count", None) is not None:
             if job.running_count > 0:
                 job.running_count = job.running_count - 1

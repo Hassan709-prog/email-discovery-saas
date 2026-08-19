@@ -164,7 +164,7 @@ class SiteScanOrchestrator:
         visited_urls: set[str] = set()
         discovered_urls_set: set[str] = {start_url_str}
         page_records: list[PageScanRecord] = []
-        global_accepted_map: dict[str, tuple[int, EmailFinding]] = {}
+        global_accepted_map: dict[str, EmailFinding] = {}
         global_rejected_set: set[RejectedEmailCandidate] = set()
 
         pages_queued = 1
@@ -348,36 +348,69 @@ class SiteScanOrchestrator:
                 global_rejected_set.add(rejected)
 
             # Aggregate findings with global deterministic deduplication
+            # and complete evidence tracking
             page_score = queue_item.score
+            from email_scanner.models import EmailEvidenceRecord
+
             for finding in extraction_result.findings:
                 canonical = finding.canonical_email
-                if canonical not in global_accepted_map:
-                    global_accepted_map[canonical] = (page_score, finding)
-                else:
-                    existing_score, existing_finding = global_accepted_map[canonical]
-                    existing_prio = _SOURCE_PRIORITY.get(existing_finding.source_kind.value, 0)
-                    new_prio = _SOURCE_PRIORITY.get(finding.source_kind.value, 0)
+                page_ev_records = tuple(
+                    EmailEvidenceRecord(
+                        source_url=e.source_url,
+                        source_kind=e.source_kind,
+                        raw_candidate=e.raw_candidate,
+                        evidence_snippet=e.evidence_snippet,
+                        page_score=page_score,
+                    )
+                    for e in (finding.evidence_records or ())
+                ) or (
+                    EmailEvidenceRecord(
+                        source_url=finding.source_url,
+                        source_kind=finding.source_kind,
+                        raw_candidate=finding.raw_candidate,
+                        evidence_snippet=finding.evidence_snippet,
+                        page_score=page_score,
+                    ),
+                )
 
-                    # Deduplication Priority:
-                    # 1) source_kind priority (MAILTO > VISIBLE_TEXT > OBFUSCATED_TEXT)
-                    # 2) page score descending
-                    # 3) evidence snippet length descending
-                    # 4) raw_candidate lexical ascending
-                    if new_prio > existing_prio:
-                        global_accepted_map[canonical] = (page_score, finding)
-                    elif new_prio == existing_prio:
-                        if page_score > existing_score:
-                            global_accepted_map[canonical] = (page_score, finding)
-                        elif page_score == existing_score:
-                            if len(finding.evidence_snippet) > len(
-                                existing_finding.evidence_snippet
-                            ):
-                                global_accepted_map[canonical] = (page_score, finding)
-                            elif len(finding.evidence_snippet) == len(
-                                existing_finding.evidence_snippet
-                            ):
-                                if finding.raw_candidate < existing_finding.raw_candidate:
-                                    global_accepted_map[canonical] = (page_score, finding)
+                if canonical not in global_accepted_map:
+                    global_accepted_map[canonical] = EmailFinding(
+                        source_url=finding.source_url,
+                        raw_candidate=finding.raw_candidate,
+                        canonical_email=finding.canonical_email,
+                        local_part=finding.local_part,
+                        domain=finding.domain,
+                        source_kind=finding.source_kind,
+                        category=finding.category,
+                        domain_affinity=finding.domain_affinity,
+                        evidence_snippet=finding.evidence_snippet,
+                        disposition=finding.disposition,
+                        evidence_records=page_ev_records,
+                    )
+                else:
+                    existing = global_accepted_map[canonical]
+                    combined_ev = list(existing.evidence_records)
+                    for new_rec in page_ev_records:
+                        if not any(
+                            r.source_url == new_rec.source_url
+                            and r.source_kind == new_rec.source_kind
+                            and r.evidence_snippet == new_rec.evidence_snippet
+                            for r in combined_ev
+                        ):
+                            combined_ev.append(new_rec)
+                    global_accepted_map[canonical] = EmailFinding(
+                        source_url=existing.source_url,
+                        raw_candidate=existing.raw_candidate,
+                        canonical_email=existing.canonical_email,
+                        local_part=existing.local_part,
+                        domain=existing.domain,
+                        source_kind=existing.source_kind,
+                        category=existing.category,
+                        domain_affinity=existing.domain_affinity,
+                        evidence_snippet=existing.evidence_snippet,
+                        disposition=existing.disposition,
+                        evidence_records=tuple(combined_ev),
+                    )
 
             # Discover links using final_url
             discovery_result = discover_and_rank_links(
@@ -449,11 +482,13 @@ class SiteScanOrchestrator:
 
         elapsed_time = self._clock() - start_time
 
-        # Format sorted accepted findings
-        sorted_findings = tuple(
-            finding
-            for _, (_, finding) in sorted(global_accepted_map.items(), key=lambda item: item[0])
-        )[: cfg.max_email_findings]
+        # Select primary email winner deterministically across all accepted candidates
+        from email_scanner.primary_selection import select_primary_email
+
+        selection_res = select_primary_email(global_accepted_map.values(), start_url_norm)
+        sorted_findings = (
+            (selection_res.selected_finding,) if selection_res.selected_finding else ()
+        )
 
         # Format sorted rejected candidates
         sorted_rejected = tuple(

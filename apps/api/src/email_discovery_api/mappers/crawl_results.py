@@ -12,13 +12,61 @@ from urllib.parse import urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from email_discovery_api.services.result_policies import ResultPersistencePolicy
-from email_scanner.errors import SiteScanOutcome
+from email_scanner import (
+    PRIMARY_EMAIL_SELECTION_VERSION,
+    FetchOutcomeCode,
+    PageScanOutcome,
+    SiteScanOutcome,
+)
 from email_scanner.models import (
     SiteScanResult,
 )
 
 CONTROL_CHARS_PATTERN = re.compile(r"[\r\n\t\x00-\x1f\x7f-\x9f]+")
 MULTIPLE_SPACES_PATTERN = re.compile(r"\s+")
+
+_RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
+    """Evaluate whether a failed/partial site scan outcome is retryable.
+
+    Does not depend on external packages.
+    """
+    if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        return False
+    for page in site_scan_result.page_records:
+        if page.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
+            return False
+        if page.outcome in (
+            PageScanOutcome.UNSAFE_HOST,
+            PageScanOutcome.RESPONSE_TOO_LARGE,
+            PageScanOutcome.UNSUPPORTED_CONTENT_TYPE,
+        ):
+            return False
+        if page.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+            return True
+        if page.fetch_result:
+            fetch_code = page.fetch_result.outcome
+            if fetch_code in (
+                FetchOutcomeCode.TIMEOUT,
+                FetchOutcomeCode.TRANSPORT_ERROR,
+                FetchOutcomeCode.DNS_RESOLUTION_FAILED,
+            ):
+                return True
+            if fetch_code in (
+                FetchOutcomeCode.UNSAFE_HOST,
+                FetchOutcomeCode.INVALID_URL,
+                FetchOutcomeCode.TLS_VERIFICATION_FAILED,
+                FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,
+                FetchOutcomeCode.RESPONSE_TOO_LARGE,
+                FetchOutcomeCode.UNSUPPORTED_CONTENT_TYPE,
+                FetchOutcomeCode.MAX_REDIRECTS_EXCEEDED,
+            ):
+                return False
+            if fetch_code == FetchOutcomeCode.HTTP_ERROR:
+                return page.fetch_result.status_code in _RETRYABLE_HTTP_STATUSES
+    return True
 
 
 def sanitize_text(text: str | None, max_length: int = 500) -> str | None:
@@ -180,6 +228,7 @@ def compute_result_checksum(
     """Compute explicit canonical SHA-256 checksum over mapped scanner execution DTOs."""
     payload = {
         "schema_version": "v1",
+        "primary_email_selection_version": PRIMARY_EMAIL_SELECTION_VERSION,
         "starting_url": sanitize_url(starting_url),
         "attempt_number": attempt_number,
         "outcome": outcome,
@@ -338,23 +387,42 @@ def map_site_scan_result(
                 validation_status="UNVERIFIED",
             )
 
-        snip = sanitize_text(f.evidence_snippet, max_length=pol.max_snippet_length)
-        raw_cand = sanitize_text(f.raw_candidate, max_length=255)
-        cand_hash = compute_candidate_hash(canon, snip)
-        page_url = sanitize_url(f.source_url)
-
-        mapped_evidence_list.append(
-            MappedEvidence(
-                canonical_email=canon,
-                normalized_page_url=page_url,
-                source_type=str(f.source_kind),
-                raw_candidate=raw_cand,
-                snippet=snip,
-                page_url=page_url,
-                confidence=1.0,
-                candidate_hash=cand_hash,
+        ev_recs = f.evidence_records if getattr(f, "evidence_records", None) else ()
+        if not ev_recs:
+            snip = sanitize_text(f.evidence_snippet, max_length=pol.max_snippet_length)
+            raw_cand = sanitize_text(f.raw_candidate, max_length=255)
+            cand_hash = compute_candidate_hash(canon, snip)
+            page_url = sanitize_url(f.source_url)
+            mapped_evidence_list.append(
+                MappedEvidence(
+                    canonical_email=canon,
+                    normalized_page_url=page_url,
+                    source_type=str(f.source_kind),
+                    raw_candidate=raw_cand,
+                    snippet=snip,
+                    page_url=page_url,
+                    confidence=1.0,
+                    candidate_hash=cand_hash,
+                )
             )
-        )
+        else:
+            for er in ev_recs:
+                snip = sanitize_text(er.evidence_snippet, max_length=pol.max_snippet_length)
+                raw_cand = sanitize_text(er.raw_candidate, max_length=255)
+                cand_hash = compute_candidate_hash(canon, snip)
+                page_url = sanitize_url(er.source_url)
+                mapped_evidence_list.append(
+                    MappedEvidence(
+                        canonical_email=canon,
+                        normalized_page_url=page_url,
+                        source_type=str(er.source_kind),
+                        raw_candidate=raw_cand,
+                        snippet=snip,
+                        page_url=page_url,
+                        confidence=1.0,
+                        candidate_hash=cand_hash,
+                    )
+                )
 
     mapped_findings = sorted(mapped_findings_map.values(), key=lambda f: f.canonical_email)
     mapped_evidence_list.sort(key=lambda e: (e.canonical_email, e.source_type, e.candidate_hash))
@@ -426,11 +494,7 @@ def map_site_scan_result(
         retryable = False
     else:
         # For FAILED or PARTIAL outcomes, evaluate retryability from page records
-        from email_discovery_crawl_worker.outcome_classifier import (
-            classify_error_code_and_retryability,
-        )
-
-        _, retryable = classify_error_code_and_retryability(site_scan_result)
+        retryable = _evaluate_retryability(site_scan_result)
     err_msg = sanitize_text(site_scan_result.error_message, max_length=pol.max_error_message_length)
     elapsed = site_scan_result.statistics.elapsed_seconds if site_scan_result.statistics else 0.0
 

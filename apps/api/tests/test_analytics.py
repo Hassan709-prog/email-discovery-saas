@@ -233,8 +233,8 @@ async def test_analytics_tenant_isolation_proof() -> None:
         now=fixed_now,
     )
 
-    # Verify all 7 executed SELECT statements enforce organization_id filter for tenant_a_id
-    assert len(executed_statements) == 7
+    # Verify all 8 executed SELECT statements enforce organization_id filter for tenant_a_id
+    assert len(executed_statements) == 8
     for stmt in executed_statements:
         sql_str = str(stmt.compile(compile_kwargs={"literal_binds": True}))
         assert f"organization_id = '{tenant_a_id}'" in sql_str or "organization_id =" in sql_str

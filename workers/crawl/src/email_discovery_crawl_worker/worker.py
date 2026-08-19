@@ -324,6 +324,7 @@ class CrawlWorker:
                 claim.scan_url_id,
                 claim.job_id,
                 claim.attempt_count,
+                exc_info=True,
             )
 
         # Perform separate T5 job finalization check

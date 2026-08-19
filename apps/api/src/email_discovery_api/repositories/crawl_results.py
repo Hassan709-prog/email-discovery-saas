@@ -150,8 +150,9 @@ class EmailFindingRepository:
         job_id: uuid.UUID,
         mapped_findings: list[MappedFinding],
         now: datetime,
+        scan_url_id: uuid.UUID | None = None,
     ) -> tuple[list[EmailFinding], list[EmailFinding]]:
-        """Upsert EmailFindings for job_id without overwriting first_found_at.
+        """Upsert EmailFindings for job_id and scan_url_id without overwriting first_found_at.
 
         Returns:
             (newly_inserted_findings, existing_updated_findings)
@@ -163,17 +164,22 @@ class EmailFindingRepository:
         existing_updated: list[EmailFinding] = []
 
         for f in mapped_findings:
-            # Check existing tenant-scoped finding
-            stmt_select = select(EmailFinding).where(
-                EmailFinding.scan_job_id == job_id,
-                EmailFinding.canonical_email == f.canonical_email,
-            )
+            if scan_url_id is not None:
+                stmt_select = select(EmailFinding).where(
+                    EmailFinding.scan_url_id == scan_url_id,
+                )
+            else:
+                stmt_select = select(EmailFinding).where(
+                    EmailFinding.scan_job_id == job_id,
+                    EmailFinding.canonical_email == f.canonical_email,
+                )
             res = await self._session.execute(stmt_select)
             existing = res.scalar_one_or_none()
 
             if existing is None or getattr(existing, "last_found_at", None) is None:
                 new_finding = EmailFinding(
                     scan_job_id=job_id,
+                    scan_url_id=scan_url_id,
                     canonical_email=f.canonical_email,
                     email_domain=f.email_domain,
                     classification=f.classification,
@@ -241,6 +247,7 @@ class EmailFindingRepository:
                 ScanJob.organization_id == organization_id,
                 ScanJob.id == job_id,
             )
+            .options(selectinload(EmailFinding.scan_url))
         )
 
         if classification:
@@ -347,6 +354,7 @@ class EmailFindingRepository:
                 ScanJob.id == job_id,
                 EmailFinding.id == finding_id,
             )
+            .options(selectinload(EmailFinding.scan_url))
         )
         res = await self._session.execute(stmt)
         return res.scalar_one_or_none()

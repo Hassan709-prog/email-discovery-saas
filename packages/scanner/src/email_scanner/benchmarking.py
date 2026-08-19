@@ -197,7 +197,7 @@ class BenchmarkHarness:
                         for item in warmup_result.items
                         if item.result
                     )
-                    expected_emails = size * 7
+                    expected_emails = size * 1
                     if warmup_emails != expected_emails:
                         msg = (
                             f"Warmup correctness failure: expected {expected_emails} emails, "

@@ -30,6 +30,8 @@ class ScanJobResultItemApiResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     finding_id: UUID = Field(..., description="Unique finding ID")
+    scan_url_id: UUID | None = Field(None, description="Associated ScanURL ID if applicable")
+    target_url: str | None = Field(None, description="Original target website URL")
     canonical_email: str = Field(..., description="Discovered canonical email address")
     email_domain: str = Field(..., description="Domain portion of canonical email")
     classification: str = Field(..., description="Email category classification")
@@ -51,6 +53,8 @@ class ScanJobResultDetailApiResponse(BaseModel):
 
     finding_id: UUID = Field(..., description="Unique finding ID")
     job_id: UUID = Field(..., description="Associated scan job ID")
+    scan_url_id: UUID | None = Field(None, description="Associated ScanURL ID if applicable")
+    target_url: str | None = Field(None, description="Original target website URL")
     canonical_email: str = Field(..., description="Discovered canonical email address")
     email_domain: str = Field(..., description="Domain portion of canonical email")
     classification: str = Field(..., description="Email category classification")

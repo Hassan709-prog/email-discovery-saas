@@ -53,6 +53,7 @@ from email_scanner.models import (
     DomainAffinity,
     EmailCategory,
     EmailDisposition,
+    EmailEvidenceRecord,
     EmailExtractionConfig,
     EmailExtractionResult,
     EmailFinding,
@@ -81,6 +82,12 @@ from email_scanner.pinned_transport import (
     PinnedAsyncNetworkBackend,
     PinnedAsyncNetworkStream,
 )
+from email_scanner.primary_selection import (
+    PRIMARY_EMAIL_SELECTION_VERSION,
+    PrimaryEmailSelectionResult,
+    PrimaryEmailSelectionSignal,
+    select_primary_email,
+)
 from email_scanner.ranking import RANKING_VERSION, calculate_page_score, rank_pages
 from email_scanner.request_gate import (
     DomainRequestGate,
@@ -101,6 +108,7 @@ from email_scanner.scope import (
 )
 
 __all__ = [
+    "PRIMARY_EMAIL_SELECTION_VERSION",
     "RANKING_VERSION",
     "AsyncDNSResolver",
     "AsyncHTTPFetcher",
@@ -125,6 +133,7 @@ __all__ = [
     "DomainRequestGate",
     "EmailCategory",
     "EmailDisposition",
+    "EmailEvidenceRecord",
     "EmailExtractionConfig",
     "EmailExtractionResult",
     "EmailFinding",
@@ -152,6 +161,8 @@ __all__ = [
     "PinnedAsyncNetworkBackend",
     "PinnedAsyncNetworkStream",
     "PinningConfig",
+    "PrimaryEmailSelectionResult",
+    "PrimaryEmailSelectionSignal",
     "RankedPage",
     "RedirectHop",
     "RejectedEmailCandidate",
@@ -187,6 +198,7 @@ __all__ = [
     "normalize_url",
     "parse_retry_after_header",
     "rank_pages",
+    "select_primary_email",
     "should_retry_fetch",
     "validate_email_candidate",
     "validate_public_host",

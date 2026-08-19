@@ -440,6 +440,17 @@ class EmailExtractionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class EmailEvidenceRecord:
+    """Individual page evidence record for a discovered email candidate."""
+
+    source_url: str
+    source_kind: EmailSourceKind
+    raw_candidate: str
+    evidence_snippet: str
+    page_score: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class EmailFinding:
     """An accepted email address discovered on a source page."""
 
@@ -453,6 +464,7 @@ class EmailFinding:
     domain_affinity: DomainAffinity
     evidence_snippet: str
     disposition: EmailDisposition = EmailDisposition.ACCEPTED
+    evidence_records: tuple[EmailEvidenceRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

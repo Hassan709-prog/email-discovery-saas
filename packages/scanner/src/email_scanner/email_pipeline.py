@@ -18,6 +18,7 @@ from email_scanner.models import (
     DomainAffinity,
     EmailCategory,
     EmailDisposition,
+    EmailEvidenceRecord,
     EmailExtractionConfig,
     EmailExtractionResult,
     EmailFinding,
@@ -52,6 +53,11 @@ _ROLE_LOCAL_PARTS = frozenset(
         "staff",
         "enquiries",
         "inquiries",
+        "estimating",
+        "estimates",
+        "quote",
+        "quotes",
+        "hr",
     }
 )
 
@@ -236,37 +242,78 @@ def extract_emails(
 
         category = classify_email_category(clean_local)
 
-        finding = EmailFinding(
+        ev_rec = EmailEvidenceRecord(
             source_url=norm_source.normalized_url,
-            raw_candidate=raw_candidate,
-            canonical_email=canonical_email,
-            local_part=clean_local,
-            domain=idna_domain,
             source_kind=source_kind,
-            category=category,
-            domain_affinity=affinity,
+            raw_candidate=raw_candidate,
             evidence_snippet=snippet,
-            disposition=EmailDisposition.ACCEPTED,
+            page_score=0,
         )
 
         if canonical_email not in accepted_map:
-            accepted_map[canonical_email] = finding
+            accepted_map[canonical_email] = EmailFinding(
+                source_url=norm_source.normalized_url,
+                raw_candidate=raw_candidate,
+                canonical_email=canonical_email,
+                local_part=clean_local,
+                domain=idna_domain,
+                source_kind=source_kind,
+                category=category,
+                domain_affinity=affinity,
+                evidence_snippet=snippet,
+                disposition=EmailDisposition.ACCEPTED,
+                evidence_records=(ev_rec,),
+            )
         else:
             existing = accepted_map[canonical_email]
+            existing_ev = list(existing.evidence_records)
+            if not any(
+                e.source_url == ev_rec.source_url
+                and e.source_kind == ev_rec.source_kind
+                and e.evidence_snippet == ev_rec.evidence_snippet
+                for e in existing_ev
+            ):
+                existing_ev.append(ev_rec)
+
             existing_prio = _SOURCE_PRIORITY[existing.source_kind]
             new_prio = _SOURCE_PRIORITY[source_kind]
 
-            # Priority 1: source_kind priority (MAILTO > VISIBLE_TEXT > OBFUSCATED_TEXT)
+            best_source_kind = existing.source_kind
+            best_raw_candidate = existing.raw_candidate
+            best_snippet = existing.evidence_snippet
+            best_source_url = existing.source_url
+
             if new_prio > existing_prio:
-                accepted_map[canonical_email] = finding
+                best_source_kind = source_kind
+                best_raw_candidate = raw_candidate
+                best_snippet = snippet
+                best_source_url = norm_source.normalized_url
             elif new_prio == existing_prio:
-                # Priority 2: longer evidence snippet
                 if len(snippet) > len(existing.evidence_snippet):
-                    accepted_map[canonical_email] = finding
+                    best_source_kind = source_kind
+                    best_raw_candidate = raw_candidate
+                    best_snippet = snippet
+                    best_source_url = norm_source.normalized_url
                 elif len(snippet) == len(existing.evidence_snippet):
-                    # Priority 3: raw_candidate lexical order
                     if raw_candidate < existing.raw_candidate:
-                        accepted_map[canonical_email] = finding
+                        best_source_kind = source_kind
+                        best_raw_candidate = raw_candidate
+                        best_snippet = snippet
+                        best_source_url = norm_source.normalized_url
+
+            accepted_map[canonical_email] = EmailFinding(
+                source_url=best_source_url,
+                raw_candidate=best_raw_candidate,
+                canonical_email=canonical_email,
+                local_part=clean_local,
+                domain=idna_domain,
+                source_kind=best_source_kind,
+                category=category,
+                domain_affinity=affinity,
+                evidence_snippet=best_snippet,
+                disposition=EmailDisposition.ACCEPTED,
+                evidence_records=tuple(existing_ev),
+            )
 
     # Format findings deterministically sorted by canonical_email
     sorted_findings = tuple(

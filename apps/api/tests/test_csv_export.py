@@ -151,7 +151,7 @@ async def test_export_terminal_job_streams_clean_csv(
         content = res.text
         lines = content.split("\r\n")
         expected_header = (
-            "canonical_email,email_domain,classification,"
+            "scan_url_id,target_url,canonical_email,email_domain,classification,"
             "is_role_based,validation_status,evidence_count,"
             "first_found_at,last_found_at"
         )

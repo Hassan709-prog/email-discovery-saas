@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -43,3 +45,8 @@ async def get_analytics_service(
 def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
     """Dependency injecting the application-owned shared async_sessionmaker."""
     return request.app.state.db_manager.session_factory
+
+
+def get_redis_publisher(request: Request) -> Any:
+    """Dependency injecting the application-owned APIRedisClient publisher."""
+    return request.app.state.redis_manager

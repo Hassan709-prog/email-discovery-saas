@@ -53,4 +53,4 @@ dev = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["email_scanner", "email_discovery_api"]
+known-first-party = ["email_scanner", "email_discovery_api", "email_discovery_crawl_worker"]

@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -17,6 +16,7 @@ from email_discovery_api.models import JobEvent, ScanJob, ScanURL
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.services.crawl_work import CrawlWorkService
 from email_discovery_api.services.scan_jobs import ScanJobService
+from email_discovery_crawl_worker.worker import CrawlWorker
 from email_scanner.errors import PageScanOutcome, RobotsDecisionCode, SiteScanOutcome
 from email_scanner.models import (
     DomainAffinity,

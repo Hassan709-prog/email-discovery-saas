@@ -1,9 +1,12 @@
-# Development PostgreSQL service for Email Discovery SaaS.
+# Development PostgreSQL and Redis services for Email Discovery SaaS.
 # Usage:
-#   Start database:       docker compose -f infra/docker/docker-compose.yml up -d
-#   Stop database:        docker compose -f infra/docker/docker-compose.yml stop
-#   Remove (keep data):   docker compose -f infra/docker/docker-compose.yml down
-#   Remove (delete data): docker compose -f infra/docker/docker-compose.yml down -v
+#   Start infrastructure: docker compose --env-file .env.example -f infra/docker/docker-compose.yml up -d
+#   Stop infrastructure:  docker compose --env-file .env.example -f infra/docker/docker-compose.yml stop
+#   Remove (keep data):   docker compose --env-file .env.example -f infra/docker/docker-compose.yml down
+#   Remove (delete data): docker compose --env-file .env.example -f infra/docker/docker-compose.yml down -v
+#
+# Note: Unauthenticated localhost Redis exposure is strictly for local development.
+# Production environments require private networking and authenticated redis:// or rediss:// configuration.
 
 services:
   postgres:
@@ -19,6 +22,18 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-email_discovery}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7.4.2-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5

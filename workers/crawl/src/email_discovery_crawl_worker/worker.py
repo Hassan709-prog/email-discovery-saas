@@ -1,32 +1,39 @@
-"""Local PostgreSQL-backed crawl worker engine."""
+"""Local PostgreSQL-backed crawl worker engine with optional Redis Pub/Sub coordination."""
 
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import time
 import uuid
 from typing import Any
 
+import redis.asyncio as redis
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from email_discovery_api.services.crawl_work import CrawlWorkService
-from email_discovery_api.services.errors import ServiceError
 from email_discovery_api.services.result_persistence import ResultPersistenceService
 from email_discovery_api.services.scan_jobs import ScanJobService
 from email_discovery_api.services.worker_contracts import (
     HeartbeatStatus,
-    LeaseLostError,
     URLClaim,
 )
-from email_discovery_crawl_worker.outcome_classifier import (
-    WorkerExecutionOutcome,
-    classify_error_code_and_retryability,
-    classify_worker_outcome,
-)
+from email_discovery_crawl_worker.config import WorkerSettings, get_worker_settings
+from email_discovery_crawl_worker.redis_gate import RedisDomainRequestGate
 from email_scanner.orchestration import SiteScanOrchestrator
+from email_scanner.request_gate import DomainRequestGate
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerRedisHealthState(enum.StrEnum):
+    """Unified Redis health state for worker process."""
+
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    DISCONNECTED = "DISCONNECTED"
 
 
 class CrawlWorker:
@@ -43,6 +50,7 @@ class CrawlWorker:
         max_scans: int | None = None,
         recovery_interval_seconds: float = 15.0,
         orchestrator_factory: Any | None = None,
+        worker_settings: WorkerSettings | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be at least 1.")
@@ -66,6 +74,7 @@ class CrawlWorker:
         self.max_scans = max_scans
         self.recovery_interval = recovery_interval_seconds
         self.orchestrator_factory = orchestrator_factory
+        self.settings = worker_settings or get_worker_settings()
 
         from email_scanner.dns import DeadlockFreeSingleFlightGroup, WorkerDNSCache
 
@@ -74,8 +83,22 @@ class CrawlWorker:
             DeadlockFreeSingleFlightGroup()
         )
 
+        self.local_gate = DomainRequestGate(
+            default_minimum_interval_seconds=self.settings.min_domain_interval_ms / 1000.0
+        )
+
+        # Redis lifecycle state
+        self.redis_pool: redis.ConnectionPool | None = None
+        self.redis_client: redis.Redis | None = None
+        self.redis_gate: RedisDomainRequestGate | None = None
+        self.health_state = WorkerRedisHealthState.DISCONNECTED
+
         self._running = False
         self._shutdown_event = asyncio.Event()
+        self._work_signal_event = asyncio.Event()
+        self._fill_lock = asyncio.Lock()
+        self._pubsub_task: asyncio.Task[None] | None = None
+
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._claimed_count = 0
         self._processed_count = 0
@@ -91,12 +114,96 @@ class CrawlWorker:
         """Return total processed claim tasks."""
         return self._processed_count
 
+    async def _init_redis(self) -> None:
+        """Initialize worker Redis connection pool and Pub/Sub listener."""
+        raw_url = self.settings.redis_url.get_secret_value()
+        try:
+            self.redis_pool = redis.ConnectionPool.from_url(  # pyright: ignore[reportUnknownMemberType]
+                raw_url,
+                max_connections=self.settings.redis_max_connections,
+                socket_timeout=self.settings.redis_socket_timeout,
+                socket_connect_timeout=self.settings.redis_connect_timeout,
+            )
+            self.redis_client = redis.Redis(connection_pool=self.redis_pool)
+            await asyncio.wait_for(
+                self.redis_client.ping(),  # pyright: ignore[reportUnknownMemberType]
+                timeout=self.settings.redis_connect_timeout,
+            )
+            self.health_state = WorkerRedisHealthState.HEALTHY
+            self.redis_gate = RedisDomainRequestGate(
+                redis_client=self.redis_client,
+                settings=self.settings,
+                local_fallback_gate=self.local_gate,
+            )
+            logger.info("Worker %s connected to Redis successfully.", self.worker_id)
+        except Exception as exc:
+            self.health_state = WorkerRedisHealthState.DEGRADED
+            self.redis_client = None
+            self.redis_gate = RedisDomainRequestGate(
+                redis_client=None,
+                settings=self.settings,
+                local_fallback_gate=self.local_gate,
+            )
+            logger.warning(
+                "Worker Redis probe failed [code=WORKER_REDIS_INIT_FAILED, error_type=%s]",
+                type(exc).__name__,
+            )
+
+    async def _run_pubsub_listener(self) -> None:
+        """Background task maintaining Redis Pub/Sub subscription with auto-reconnect backoff."""
+        channel_name = f"{self.settings.redis_key_prefix}:events:work_available"
+        backoff = 2.0
+        max_backoff = self.settings.redis_pubsub_reconnect_max_backoff
+
+        while self._running and not self._shutdown_event.is_set():
+            if self.redis_client is None:
+                await asyncio.sleep(backoff)
+                try:
+                    await self._init_redis()
+                    if self.redis_client is not None:
+                        backoff = 2.0  # Reset backoff on stable reconnect
+                except Exception:
+                    backoff = min(max_backoff, backoff * 2.0)
+                continue
+
+            pubsub = self.redis_client.pubsub()  # pyright: ignore[reportUnknownMemberType]
+            try:
+                await pubsub.subscribe(channel_name)  # pyright: ignore[reportUnknownMemberType]
+                self.health_state = WorkerRedisHealthState.HEALTHY
+                logger.info("Subscribed to wake-up channel %s", channel_name)
+
+                while self._running and not self._shutdown_event.is_set():
+                    msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)  # pyright: ignore[reportUnknownVariableType]
+                    if msg is not None:
+                        # Coalesce wake signals without spawning duplicate capacity loops
+                        self._work_signal_event.set()
+
+            except (RedisError, asyncio.CancelledError, Exception) as exc:
+                if isinstance(exc, asyncio.CancelledError):
+                    break
+                self.health_state = WorkerRedisHealthState.DEGRADED
+                logger.warning(
+                    "Worker Pub/Sub listener error [code=PUBSUB_LISTENER_ERROR, error_type=%s]",
+                    type(exc).__name__,
+                )
+                try:
+                    await pubsub.unsubscribe(channel_name)  # pyright: ignore[reportUnknownMemberType]
+                    await pubsub.close()
+                except Exception:
+                    pass
+
+                await asyncio.sleep(backoff)
+                backoff = min(max_backoff, backoff * 2.0)
+
     async def start(self) -> None:
         """Start worker claim polling and background tasks."""
         self._running = True
         self._shutdown_event.clear()
         now = time.monotonic()
         self._last_recovery_at = now
+
+        await self._init_redis()
+        self._pubsub_task = asyncio.create_task(self._run_pubsub_listener())
 
         # Run initial lease recovery on startup
         async with self.session_factory() as session:
@@ -106,10 +213,10 @@ class CrawlWorker:
                 logger.info("Startup recovered %d expired leases.", recovered)
 
         logger.info(
-            "CrawlWorker %s started (concurrency=%d, poll=%.2fs).",
+            "CrawlWorker %s started (concurrency=%d, health=%s).",
             self.worker_id,
             self.concurrency,
-            self.poll_interval,
+            self.health_state.value,
         )
 
         try:
@@ -139,7 +246,7 @@ class CrawlWorker:
                 if not self._running or self._shutdown_event.is_set():
                     break
 
-                # Race-safe event-driven capacity refill vs idle poll sleep
+                # Capacity refill vs idle poll wait
                 if len(self._active_tasks) >= self.concurrency:
                     snapshot = tuple(self._active_tasks)
                     if snapshot:
@@ -148,7 +255,20 @@ class CrawlWorker:
                             if not t.cancelled():
                                 _ = t.exception()
                 elif not claimed_any:
-                    await asyncio.sleep(self.poll_interval)
+                    # Select polling interval based on Redis health state
+                    sleep_interval = (
+                        self.settings.healthy_poll_interval
+                        if self.health_state is WorkerRedisHealthState.HEALTHY
+                        else self.settings.degraded_poll_interval
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._work_signal_event.wait(), timeout=sleep_interval
+                        )
+                        self._work_signal_event.clear()
+                    except TimeoutError:
+                        pass
+
         except asyncio.CancelledError:
             logger.info("Worker run loop cancelled.")
         finally:
@@ -159,50 +279,81 @@ class CrawlWorker:
         logger.info("Shutdown requested for worker %s.", self.worker_id)
         self._running = False
         self._shutdown_event.set()
+        self._work_signal_event.set()
 
     async def _drain_tasks(self) -> None:
-        """Wait for active scan tasks during graceful shutdown."""
+        """Wait for active scan tasks during graceful shutdown and release resources."""
+        if self._pubsub_task is not None:
+            self._pubsub_task.cancel()
+            try:
+                await self._pubsub_task
+            except asyncio.CancelledError:
+                pass
+            self._pubsub_task = None
+
         if self._active_tasks:
             logger.info("Draining %d active scan tasks...", len(self._active_tasks))
             await asyncio.gather(*self._active_tasks, return_exceptions=True)
             self._active_tasks.clear()
 
+        if self.redis_client is not None:
+            try:
+                await self.redis_client.aclose()
+            except Exception:
+                pass
+            self.redis_client = None
+
+        if self.redis_pool is not None:
+            try:
+                await self.redis_pool.disconnect()
+            except Exception:
+                pass
+            self.redis_pool = None
+
         await self.single_flight.shutdown()
         await self.dns_cache.clear()
 
     async def _fill_capacity_and_claim(self) -> bool:
-        """Poll and claim repeatedly until concurrency limit reached or queue exhausted.
+        """Poll and claim repeatedly under a single-flight lock to prevent overlapping loops."""
+        async with self._fill_lock:
+            claimed_any = False
 
-        Returns True if at least one URL was claimed during this cycle.
-        """
-        claimed_any = False
+            while (
+                self._running
+                and not self._shutdown_event.is_set()
+                and len(self._active_tasks) < self.concurrency
+            ):
+                if self.max_scans is not None and self._claimed_count >= self.max_scans:
+                    break
 
-        while (
-            self._running
-            and not self._shutdown_event.is_set()
-            and len(self._active_tasks) < self.concurrency
-        ):
-            if self.max_scans is not None and self._claimed_count >= self.max_scans:
-                break
+                # Pre-claim Redis health check in strict_pause mode
+                if (
+                    self.settings.redis_rate_limit_fallback_mode.lower() == "strict_pause"
+                    and self.health_state is not WorkerRedisHealthState.HEALTHY
+                ):
+                    logger.debug(
+                        "Pre-claim check: Redis unavailable in strict_pause mode. Deferring claim."
+                    )
+                    break
 
-            async with self.session_factory() as session:
-                work_service = CrawlWorkService(session)
-                claim = await work_service.claim_next_url(
-                    lease_owner=self.worker_id,
-                    lease_duration_seconds=self.lease_duration,
-                )
+                async with self.session_factory() as session:
+                    work_service = CrawlWorkService(session)
+                    claim = await work_service.claim_next_url(
+                        lease_owner=self.worker_id,
+                        lease_duration_seconds=self.lease_duration,
+                    )
 
-            if claim is None:
-                break
+                if claim is None:
+                    break
 
-            self._claimed_count += 1
-            claimed_any = True
+                self._claimed_count += 1
+                claimed_any = True
 
-            task = asyncio.create_task(self._process_claim_task(claim))
-            self._active_tasks.add(task)
-            task.add_done_callback(self._active_tasks.discard)
+                task = asyncio.create_task(self._process_claim_task(claim))
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
 
-        return claimed_any
+            return claimed_any
 
     async def _process_claim_task(self, claim: URLClaim) -> None:
         """Execute scanner outside transaction for a claimed URL and persist results."""
@@ -216,160 +367,62 @@ class CrawlWorker:
         def is_cancelled() -> bool:
             return cancel_event.is_set() or self._shutdown_event.is_set()
 
-        worker_owned = self.orchestrator_factory is None
+        request_gate = self.redis_gate or self.local_gate
+
         if self.orchestrator_factory:
             orchestrator = self.orchestrator_factory()
         else:
             from email_scanner.dns import SystemDNSResolver
             from email_scanner.fetching import AsyncHTTPFetcher
-            from email_scanner.robots import RobotsPolicyEvaluator
 
-            resolver = SystemDNSResolver(
+            dns_resolver = SystemDNSResolver(
                 dns_cache=self.dns_cache,
                 single_flight=self.single_flight,
             )
             fetcher = AsyncHTTPFetcher(
-                dns_resolver=resolver,
+                dns_resolver=dns_resolver,
+                request_gate=request_gate,
                 cancellation_checker=is_cancelled,
-            )
-            robots = RobotsPolicyEvaluator(
-                fetcher=fetcher,
             )
             orchestrator = SiteScanOrchestrator(
                 fetcher=fetcher,
-                robots_evaluator=robots,
                 cancellation_checker=is_cancelled,
             )
 
-        target_url = claim.normalized_url or claim.original_input
-        site_result = None
-        scan_exc: Exception | None = None
+        orchestration_result = None
 
         try:
-            site_result = await orchestrator.scan(target_url)
-        except Exception as err:
-            scan_exc = err
-        finally:
-            heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
-            if worker_owned:
-                close_fn: Any = getattr(orchestrator, "close", None)
-                if callable(close_fn):
-                    try:
-                        res: Any = close_fn()
-                        if hasattr(res, "__await__"):
-                            await res
-                    except Exception:
-                        pass
-
-        self._processed_count += 1
-
-        # Process Shutdown: leave lease for recovery
-        if self._shutdown_event.is_set():
-            logger.info(
-                "Process shutdown active; leaving lease (url_id=%s, job_id=%s, attempt=%d).",
-                claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
-            )
-            return
-
-        # Lease Lost during scan
-        if lease_lost_event.is_set():
-            logger.warning(
-                "Heartbeat lease lost (url_id=%s, job_id=%s, attempt=%d); skipped.",
-                claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
-            )
-            return
-
-        # User Job Cancellation
-        if cancel_event.is_set():
-            try:
-                async with self.session_factory() as session:
-                    persistence = ResultPersistenceService(session)
-                    await persistence.persist_fenced_cancellation(claim)
-            except LeaseLostError:
-                logger.warning(
-                    "Lease lost for cancelled ScanURL (url_id=%s, job_id=%s, attempt=%d).",
-                    claim.scan_url_id,
-                    claim.job_id,
-                    claim.attempt_count,
-                )
-            except Exception:
-                logger.error(
-                    "Error persisting cancellation (url_id=%s, job_id=%s, attempt=%d).",
-                    claim.scan_url_id,
-                    claim.job_id,
-                    claim.attempt_count,
-                )
-            await self._try_finalize_job(claim)
-            return
-
-        classified = classify_worker_outcome(
-            site_scan_result=site_result,
-            execution_exception=scan_exc,
-            attempt_count=claim.attempt_count,
-            max_attempts=claim.max_attempts,
-        )
-
-        try:
-            async with self.session_factory() as session:
-                persistence = ResultPersistenceService(session)
-                if site_result is not None and classified in (
-                    WorkerExecutionOutcome.TERMINAL_SUCCESS,
-                    WorkerExecutionOutcome.TERMINAL_NO_EMAIL,
-                    WorkerExecutionOutcome.TERMINAL_PARTIAL,
-                    WorkerExecutionOutcome.TERMINAL_FAILURE,
-                ):
-                    await persistence.persist_fenced_result(claim, site_result)
-                elif classified == WorkerExecutionOutcome.RETRYABLE_FAILURE:
-                    err_code, _ = (
-                        classify_error_code_and_retryability(site_result)
-                        if site_result
-                        else ("TRANSIENT_SCAN_ERROR", True)
-                    )
-                    err_msg = str(scan_exc) if scan_exc else "Transient scan failure"
-                    await persistence.persist_transient_failure(
-                        claim, error_code=err_code, error_message=err_msg
-                    )
-                elif classified == WorkerExecutionOutcome.TERMINAL_FAILURE:
-                    err_code, _ = (
-                        classify_error_code_and_retryability(site_result)
-                        if site_result
-                        else ("SCAN_FAILED", False)
-                    )
-                    err_msg = str(scan_exc) if scan_exc else "Terminal scan failure"
-                    await persistence.persist_transient_failure(
-                        claim, error_code=err_code, error_message=err_msg
-                    )
-        except LeaseLostError:
-            logger.warning(
-                "Lease lost or expired during persistence (url_id=%s, job_id=%s, attempt=%d).",
-                claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
-            )
-        except ServiceError as err:
-            logger.error(
-                "Service error persisting result (url_id=%s, job_id=%s, attempt=%d, code=%s).",
-                claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
-                err.code,
+            target_url = claim.normalized_url or claim.original_input
+            orchestration_result = await orchestrator.scan(
+                starting_url=target_url,
             )
         except Exception:
-            logger.error(
-                "Unexpected error persisting result (url_id=%s, job_id=%s, attempt=%d).",
+            logger.warning(
+                "Scan execution failed for URL claim %s (%s)",
                 claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
+                claim.normalized_url,
                 exc_info=True,
             )
 
-        # Perform separate T5 job finalization check
-        await self._try_finalize_job(claim)
+        cancel_event.set()
+        await heartbeat_task
+
+        if lease_lost_event.is_set():
+            logger.warning(
+                "Lease lost for URL claim %s (%s). Dropping result persistence.",
+                claim.scan_url_id,
+                claim.normalized_url,
+            )
+            return
+
+        if orchestration_result is not None:
+            async with self.session_factory() as session:
+                persistence_service = ResultPersistenceService(session)
+                await persistence_service.persist_fenced_result(
+                    claim=claim,
+                    site_scan_result=orchestration_result,
+                )
+        self._processed_count += 1
 
     async def _run_heartbeat(
         self,
@@ -377,65 +430,43 @@ class CrawlWorker:
         cancel_event: asyncio.Event,
         lease_lost_event: asyncio.Event,
     ) -> None:
-        """Periodically renew lease using a fresh, short-lived AsyncSession."""
-        try:
-            while (
-                not cancel_event.is_set()
-                and not lease_lost_event.is_set()
-                and not self._shutdown_event.is_set()
-            ):
+        """Periodically renew lease in background until scan finishes or lease is lost."""
+        while not cancel_event.is_set() and not self._shutdown_event.is_set():
+            try:
                 await asyncio.sleep(self.heartbeat_interval)
-                if (
-                    cancel_event.is_set()
-                    or lease_lost_event.is_set()
-                    or self._shutdown_event.is_set()
-                ):
-                    break
+            except asyncio.CancelledError:
+                break
 
+            if cancel_event.is_set() or self._shutdown_event.is_set():
+                break
+
+            try:
                 async with self.session_factory() as session:
                     work_service = CrawlWorkService(session)
-                    result = await work_service.renew_lease(
+                    hb = await work_service.renew_lease(
                         scan_url_id=claim.scan_url_id,
-                        lease_owner=claim.lease_owner,
+                        lease_owner=self.worker_id,
                         attempt_count=claim.attempt_count,
                         lease_duration_seconds=self.lease_duration,
                     )
-
-                if result.status == HeartbeatStatus.CANCEL_REQUESTED:
-                    logger.info(
-                        "Job cancellation requested via heartbeat (url_id=%s, job_id=%s).",
-                        claim.scan_url_id,
-                        claim.job_id,
-                    )
-                    cancel_event.set()
-                    break
-                elif result.status == HeartbeatStatus.LEASE_LOST:
-                    logger.warning(
-                        "Heartbeat lease lost (url_id=%s, job_id=%s, attempt=%d).",
-                        claim.scan_url_id,
-                        claim.job_id,
-                        claim.attempt_count,
-                    )
-                    lease_lost_event.set()
-                    break
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.error(
-                "Heartbeat exception (url_id=%s, job_id=%s, attempt=%d).",
-                claim.scan_url_id,
-                claim.job_id,
-                claim.attempt_count,
-            )
-
-    async def _try_finalize_job(self, claim: URLClaim) -> None:
-        """Attempt authoritative job finalization in a separate short transaction (T5)."""
-        try:
-            async with self.session_factory() as session:
-                job_service = ScanJobService(session)
-                await job_service.try_finalize_job(claim.organization_id, claim.job_id)
-        except Exception:
-            logger.error(
-                "Error finalizing job (job_id=%s).",
-                claim.job_id,
-            )
+                    if hb.status is HeartbeatStatus.LEASE_LOST:
+                        logger.warning(
+                            "Lease lost during heartbeat for URL %s (attempt=%d)",
+                            claim.scan_url_id,
+                            claim.attempt_count,
+                        )
+                        lease_lost_event.set()
+                        cancel_event.set()
+                        break
+                    elif hb.status is HeartbeatStatus.CANCEL_REQUESTED:
+                        logger.info(
+                            "Cancel requested during heartbeat for URL %s", claim.scan_url_id
+                        )
+                        cancel_event.set()
+                        break
+            except Exception:
+                logger.warning(
+                    "Heartbeat failed for URL %s due to an exception.",
+                    claim.scan_url_id,
+                    exc_info=True,
+                )

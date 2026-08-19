@@ -9,7 +9,7 @@ router = APIRouter(prefix="/health", tags=["Health"])
 
 @router.get("/live", status_code=status.HTTP_200_OK)
 async def health_live(request: Request) -> dict[str, str]:
-    """Liveness probe returning HTTP 200 process status without DB access."""
+    """Liveness probe returning HTTP 200 process status without DB or Redis access."""
     settings = request.app.state.settings
     return {
         "status": "ok",
@@ -19,27 +19,50 @@ async def health_live(request: Request) -> dict[str, str]:
 
 @router.get("/ready")
 async def health_ready(request: Request, response: Response) -> dict[str, Any]:
-    """Readiness probe performing a bounded SELECT 1 query to confirm database connectivity."""
+    """Readiness probe checking database and optional Redis coordination connectivity."""
     settings = request.app.state.settings
     db_manager = request.app.state.db_manager
+    redis_manager = getattr(request.app.state, "redis_manager", None)
 
-    is_healthy = await db_manager.check_health(settings.db_health_timeout_seconds)
+    db_ok = await db_manager.check_health(settings.db_health_timeout_seconds)
 
-    if is_healthy:
-        response.status_code = status.HTTP_200_OK
+    if not db_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {
-            "status": "ok",
+            "status": "unavailable",
             "service": settings.app_name,
             "dependencies": {
-                "database": "ok",
+                "database": "unavailable",
+                "redis": "unknown",
             },
         }
 
-    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    redis_status = "ok"
+    redis_degraded = False
+
+    if redis_manager is not None:
+        redis_ok = await redis_manager.check_health()
+        if not redis_ok:
+            if settings.redis_required:
+                response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+                return {
+                    "status": "unavailable",
+                    "service": settings.app_name,
+                    "dependencies": {
+                        "database": "ok",
+                        "redis": "unavailable",
+                    },
+                }
+            redis_status = "degraded"
+            redis_degraded = True
+
+    response.status_code = status.HTTP_200_OK
     return {
-        "status": "unavailable",
+        "status": "ok",
         "service": settings.app_name,
         "dependencies": {
-            "database": "unavailable",
+            "database": "ok",
+            "redis": redis_status,
         },
+        "redis_degraded": redis_degraded,
     }

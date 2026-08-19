@@ -11,6 +11,7 @@ import sys
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from email_discovery_api.config import get_settings
+from email_discovery_crawl_worker.config import get_worker_settings
 from email_discovery_crawl_worker.worker import CrawlWorker
 
 logging.basicConfig(
@@ -81,8 +82,9 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 
 async def run_worker(cli_args: argparse.Namespace) -> None:
     """Initialize DB connection pool and run crawl worker."""
-    settings = get_settings()
-    db_url = settings.database_url.get_secret_value()
+    worker_settings = get_worker_settings()
+    api_settings = get_settings()
+    db_url = api_settings.database_url.get_secret_value()
 
     engine = create_async_engine(
         db_url,
@@ -99,12 +101,14 @@ async def run_worker(cli_args: argparse.Namespace) -> None:
 
     worker = CrawlWorker(
         session_factory=session_factory,
-        worker_id=cli_args.worker_id,
-        concurrency=cli_args.concurrency,
-        poll_interval_seconds=cli_args.poll_interval,
-        lease_duration_seconds=cli_args.lease_duration,
-        heartbeat_interval_seconds=cli_args.heartbeat_interval,
+        worker_id=cli_args.worker_id or worker_settings.worker_id,
+        concurrency=cli_args.concurrency or worker_settings.concurrency,
+        poll_interval_seconds=cli_args.poll_interval or worker_settings.poll_interval,
+        lease_duration_seconds=cli_args.lease_duration or worker_settings.lease_duration,
+        heartbeat_interval_seconds=cli_args.heartbeat_interval
+        or worker_settings.heartbeat_interval,
         max_scans=cli_args.max_scans,
+        worker_settings=worker_settings,
     )
 
     loop = asyncio.get_running_loop()

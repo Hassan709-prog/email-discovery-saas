@@ -4,9 +4,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from email_discovery_crawl_worker.worker import CrawlWorker
 
 from email_discovery_api.services.worker_contracts import URLClaim
+from email_discovery_crawl_worker.worker import CrawlWorker
 from email_scanner.models import SiteScanResult, SiteScanStatistics
 
 

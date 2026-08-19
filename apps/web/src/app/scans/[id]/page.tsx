@@ -845,26 +845,62 @@ export default function JobDetailPage() {
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600 uppercase tracking-wider">
+                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600 uppercase tracking-wider font-sans">
                       <th className="px-4 py-3">#</th>
                       <th className="px-4 py-3">Original Input</th>
                       <th className="px-4 py-3">Normalized Domain</th>
-                      <th className="px-4 py-3">Status</th>
-                      <th className="px-4 py-3">Last Error</th>
+                      <th className="px-4 py-3">Outcome</th>
+                      <th className="px-4 py-3">Selected Email</th>
+                      <th className="px-4 py-3">Duration & Retries</th>
+                      <th className="px-4 py-3">Failure Reason</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 text-xs font-mono">
                     {urls.map((u) => (
                       <tr key={u.id} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 text-slate-500">{u.original_index + 1}</td>
+                        <td className="px-4 py-3 text-slate-500 font-sans font-semibold">{u.original_index + 1}</td>
                         <td className="px-4 py-3 text-slate-900 whitespace-pre-wrap break-all">{u.original_input}</td>
                         <td className="px-4 py-3 text-slate-600">{u.normalized_domain || '—'}</td>
-                        <td className="px-4 py-3">
-                          <span className="px-2 py-0.5 rounded text-[11px] font-sans font-semibold bg-slate-100 text-slate-700 border border-slate-200">
-                            {u.status}
+                        <td className="px-4 py-3 font-sans">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                              u.status === 'COMPLETED'
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : u.status === 'NO_EMAIL'
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                : u.status === 'FAILED'
+                                ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                : u.status === 'CANCELLED'
+                                ? 'bg-slate-100 text-slate-600 border-slate-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-200'
+                            }`}
+                          >
+                            {u.plain_language_outcome || u.status}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-rose-700 font-sans">{u.last_error_code || '—'}</td>
+                        <td className="px-4 py-3 font-sans">
+                          {u.selected_primary_email ? (
+                            <span className="inline-flex items-center px-2 py-0.5 bg-blue-50 text-blue-700 font-semibold border border-blue-200 rounded text-[11px]">
+                              <Mail className="w-3 h-3 mr-1 text-blue-500" />
+                              {u.selected_primary_email}
+                            </span>
+                          ) : (
+                            <span className="text-slate-400 font-sans">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 font-sans text-slate-600">
+                          {u.processing_duration_seconds !== undefined && u.processing_duration_seconds !== null ? (
+                            <span>
+                              {u.processing_duration_seconds.toFixed(2)}s
+                              {u.retry_count ? <span className="text-slate-400 ml-1">({u.retry_count} retries)</span> : null}
+                            </span>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td className="px-4 py-3 font-sans text-rose-700">
+                          {u.failure_reason || u.last_error_code || '—'}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

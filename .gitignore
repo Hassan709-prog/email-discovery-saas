@@ -35,6 +35,7 @@ Thumbs.db
 data/
 uploads/
 exports/
-# Benchmark outputs
+# Benchmark and Audit outputs
 .benchmark-output/
+.consistency-audit-output/
 *.log

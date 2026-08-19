@@ -13,7 +13,7 @@ pre-resolved addresses directly for socket connection pinning.
 
 import asyncio
 import socket
-from typing import Protocol
+from typing import Any, Protocol
 
 from email_scanner.errors import HostSafetyError, HostSafetyErrorCode
 from email_scanner.host_safety import validate_public_host
@@ -23,7 +23,12 @@ from email_scanner.models import HostType, NormalizedURL
 class AsyncDNSResolver(Protocol):
     """Protocol for asynchronous DNS resolution and host safety checking."""
 
-    async def resolve(self, url: NormalizedURL) -> tuple[str, ...]:
+    async def resolve(
+        self,
+        url: NormalizedURL,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[str, ...]:
         """Resolve host for a NormalizedURL and return safe IP addresses."""
         ...
 
@@ -31,14 +36,25 @@ class AsyncDNSResolver(Protocol):
 class SystemDNSResolver:
     """Production DNS resolver using socket.getaddrinfo via asyncio.to_thread."""
 
-    async def resolve(self, url: NormalizedURL) -> tuple[str, ...]:
+    async def resolve(
+        self,
+        url: NormalizedURL,
+        recorder: Any | None = None,
+        clock: Any | None = None,
+    ) -> tuple[str, ...]:
         if url.host_type in {HostType.IPV4, HostType.IPV6}:
             return validate_public_host(url, ())
 
         port = url.port or (443 if url.scheme == "https" else 80)
-        return await self.resolve_host(url.hostname, port)
+        return await self.resolve_host(url.hostname, port, recorder=recorder, clock=clock)
 
-    async def resolve_host(self, hostname: str, port: int = 80) -> tuple[str, ...]:
+    async def resolve_host(
+        self,
+        hostname: str,
+        port: int = 80,
+        recorder: Any | None = None,
+        clock: Any | None = None,
+    ) -> tuple[str, ...]:
         cleaned_host = hostname.strip().strip("[]")
         if not cleaned_host:
             raise HostSafetyError(
@@ -66,6 +82,10 @@ class SystemDNSResolver:
         except ValueError:
             pass
 
+        import time
+
+        get_time = clock or time.monotonic
+        start_t = get_time()
         try:
             results = await asyncio.to_thread(
                 socket.getaddrinfo,
@@ -74,10 +94,15 @@ class SystemDNSResolver:
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as err:
+            if recorder is not None:
+                recorder.dns_resolution_duration_seconds += max(0.0, get_time() - start_t)
             raise HostSafetyError(
                 code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
                 message=f"DNS resolution failed for {cleaned_host}: {err}",
             ) from err
+
+        if recorder is not None:
+            recorder.dns_resolution_duration_seconds += max(0.0, get_time() - start_t)
 
         addresses = tuple(str(res[4][0]) for res in results if res[4])
         if not addresses:

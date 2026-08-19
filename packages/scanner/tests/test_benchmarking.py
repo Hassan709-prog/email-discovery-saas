@@ -65,8 +65,8 @@ def test_scenario_generation_exact_counts() -> None:
     for count in [1, 10, 100, 1000]:
         urls = generate_benchmark_urls(count)
         assert len(urls) == count
-        assert urls[0] == "https://site-0.org"
-        assert urls[-1] == f"https://site-{count - 1}.org"
+        assert urls[0] == "http://site-0.org"
+        assert urls[-1] == f"http://site-{count - 1}.org"
 
     with pytest.raises(ValueError):
         generate_benchmark_urls(0)

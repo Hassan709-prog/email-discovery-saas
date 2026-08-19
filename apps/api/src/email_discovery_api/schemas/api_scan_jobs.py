@@ -167,6 +167,22 @@ class ScanJobProgressApiResponse(BaseModel):
     completed_at: datetime | None = None
 
 
+class ScanURLDiagnosticsApiResponse(BaseModel):
+    """Bounded, typed diagnostic breakdown for an individual target URL."""
+
+    model_config = ConfigDict(frozen=True)
+
+    total_duration_seconds: float | None = None
+    pages_attempted: int | None = None
+    pages_fetched: int | None = None
+    retry_count: int | None = None
+    last_failure_code: str | None = None
+    selected_primary_email: str | None = None
+    primary_email_selection_version: str | None = None
+    plain_language_outcome: str | None = None
+    failure_reason: str | None = None
+
+
 class ScanURLApiResponse(BaseModel):
     """Public scan URL detail response model."""
 
@@ -182,9 +198,63 @@ class ScanURLApiResponse(BaseModel):
     duplicate_of_scan_url_id: UUID | None = None
     last_error_code: str | None = None
     created_at: datetime
+    # Optional Phase 4B diagnostic fields
+    processing_duration_seconds: float | None = None
+    retry_count: int | None = None
+    pages_checked: int | None = None
+    selected_primary_email: str | None = None
+    primary_email_selection_version: str | None = None
+    plain_language_outcome: str | None = None
+    failure_reason: str | None = None
+    diagnostics: ScanURLDiagnosticsApiResponse | None = None
 
     @classmethod
     def from_orm_model(cls, url: Any) -> ScanURLApiResponse:
+        finding = getattr(url, "email_finding", None)
+        selected_email = finding.canonical_email if finding else None
+        selection_version = "primary-email-selection-v1" if selected_email else None
+
+        st = ScanURLStatus(url.status)
+        if st == ScanURLStatus.COMPLETED:
+            plain_outcome = "Completed"
+            reason = None
+        elif st == ScanURLStatus.NO_EMAIL:
+            plain_outcome = "No Email Found"
+            reason = "No suitable public email found"
+        elif st == ScanURLStatus.CANCELLED:
+            plain_outcome = "Cancelled"
+            reason = "Scan job was cancelled"
+        elif st == ScanURLStatus.DUPLICATE:
+            plain_outcome = "Duplicate"
+            reason = "Duplicate input coalesced"
+        elif st == ScanURLStatus.INVALID:
+            plain_outcome = "Invalid URL"
+            reason = url.last_error_message or "URL normalization failed"
+        else:
+            plain_outcome = "Failed"
+            fail_code = getattr(url, "last_failure_code", None) or url.last_error_code
+            reason = fail_code or url.last_error_message or "Scan execution failed"
+
+        tot_dur = getattr(url, "total_duration_seconds", None)
+        p_attempted = getattr(url, "pages_attempted", None)
+        r_count = getattr(url, "retry_count", None)
+        p_fetched = getattr(url, "pages_fetched", None)
+        last_fail = getattr(url, "last_failure_code", None)
+
+        diag_obj = None
+        if any(v is not None for v in (tot_dur, p_attempted, r_count, last_fail, selected_email)):
+            diag_obj = ScanURLDiagnosticsApiResponse(
+                total_duration_seconds=tot_dur,
+                pages_attempted=p_attempted,
+                pages_fetched=p_fetched,
+                retry_count=r_count,
+                last_failure_code=last_fail,
+                selected_primary_email=selected_email,
+                primary_email_selection_version=selection_version,
+                plain_language_outcome=plain_outcome,
+                failure_reason=reason,
+            )
+
         return cls(
             id=url.id,
             scan_job_id=url.scan_job_id,
@@ -192,10 +262,18 @@ class ScanURLApiResponse(BaseModel):
             original_input=url.original_input,
             normalized_url=url.normalized_url,
             normalized_domain=url.normalized_domain,
-            status=ScanURLStatus(url.status),
+            status=st,
             duplicate_of_scan_url_id=url.duplicate_of_scan_url_id,
             last_error_code=url.last_error_code,
             created_at=url.created_at or datetime.now(UTC),
+            processing_duration_seconds=tot_dur,
+            retry_count=r_count,
+            pages_checked=p_attempted,
+            selected_primary_email=selected_email,
+            primary_email_selection_version=selection_version,
+            plain_language_outcome=plain_outcome,
+            failure_reason=reason,
+            diagnostics=diag_obj,
         )
 
 

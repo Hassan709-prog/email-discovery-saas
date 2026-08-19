@@ -52,6 +52,26 @@ class CrawlAttempt(Base, UUIDPrimaryKeyMixin):
             "result_checksum ~ '^[0-9a-f]{64}$'",
             name="ck_crawl_attempts_result_checksum_hex",
         ),
+        CheckConstraint(
+            "dns_duration_seconds IS NULL OR dns_duration_seconds >= 0.0",
+            name="ck_crawl_attempts_dns_duration_nonnegative",
+        ),
+        CheckConstraint(
+            "gate_wait_seconds IS NULL OR gate_wait_seconds >= 0.0",
+            name="ck_crawl_attempts_gate_wait_nonnegative",
+        ),
+        CheckConstraint(
+            "robots_duration_seconds IS NULL OR robots_duration_seconds >= 0.0",
+            name="ck_crawl_attempts_robots_duration_nonnegative",
+        ),
+        CheckConstraint(
+            "http_duration_seconds IS NULL OR http_duration_seconds >= 0.0",
+            name="ck_crawl_attempts_http_duration_nonnegative",
+        ),
+        CheckConstraint(
+            "parse_duration_seconds IS NULL OR parse_duration_seconds >= 0.0",
+            name="ck_crawl_attempts_parse_duration_nonnegative",
+        ),
         Index("ix_crawl_attempts_scan_url_created", "scan_url_id", "created_at"),
         Index("ix_crawl_attempts_outcome_created", "outcome", "created_at"),
     )
@@ -69,6 +89,7 @@ class CrawlAttempt(Base, UUIDPrimaryKeyMixin):
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     redirect_history: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     connection_attempts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
@@ -81,6 +102,11 @@ class CrawlAttempt(Base, UUIDPrimaryKeyMixin):
         nullable=True,
     )
     elapsed_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    dns_duration_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    gate_wait_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    robots_duration_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    http_duration_seconds: Mapped[float | None] = mapped_column(nullable=True)
+    parse_duration_seconds: Mapped[float | None] = mapped_column(nullable=True)
     result_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),

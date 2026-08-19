@@ -182,6 +182,44 @@ class SiteScanOutcome(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class SiteScanFailureCode(StrEnum):
+    """Stable failure classification codes for website scanning outcomes."""
+
+    ROBOTS_BLOCKED = "ROBOTS_BLOCKED"
+    ROBOTS_TEMPORARY_FAILURE = "ROBOTS_TEMPORARY_FAILURE"
+    DNS_RESOLUTION_FAILED = "DNS_RESOLUTION_FAILED"
+    UNSAFE_HOST = "UNSAFE_HOST"
+    CONNECT_TIMEOUT = "CONNECT_TIMEOUT"
+    READ_TIMEOUT = "READ_TIMEOUT"
+    GENERIC_TIMEOUT = "GENERIC_TIMEOUT"
+    TOTAL_TIME_BUDGET_EXHAUSTED = "TOTAL_TIME_BUDGET_EXHAUSTED"
+    TLS_VERIFICATION_FAILED = "TLS_VERIFICATION_FAILED"
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    RETRY_BUDGET_EXHAUSTED = "RETRY_BUDGET_EXHAUSTED"
+    HTTP_ERROR = "HTTP_ERROR"
+    UNSUPPORTED_CONTENT_TYPE = "UNSUPPORTED_CONTENT_TYPE"
+    RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
+    OUT_OF_SCOPE_REDIRECT = "OUT_OF_SCOPE_REDIRECT"
+    CANCELLED = "CANCELLED"
+    UNEXPECTED_INTERNAL_ERROR = "UNEXPECTED_INTERNAL_ERROR"
+
+
+def map_fetch_outcome_to_failure_code(outcome: FetchOutcomeCode) -> SiteScanFailureCode | None:
+    """Map FetchOutcomeCode to stable SiteScanFailureCode strictly via typed enum matching."""
+    mapping = {
+        FetchOutcomeCode.DNS_RESOLUTION_FAILED: SiteScanFailureCode.DNS_RESOLUTION_FAILED,
+        FetchOutcomeCode.UNSAFE_HOST: SiteScanFailureCode.UNSAFE_HOST,
+        FetchOutcomeCode.TLS_VERIFICATION_FAILED: SiteScanFailureCode.TLS_VERIFICATION_FAILED,
+        FetchOutcomeCode.TIMEOUT: SiteScanFailureCode.GENERIC_TIMEOUT,
+        FetchOutcomeCode.TRANSPORT_ERROR: SiteScanFailureCode.TRANSPORT_ERROR,
+        FetchOutcomeCode.HTTP_ERROR: SiteScanFailureCode.HTTP_ERROR,
+        FetchOutcomeCode.UNSUPPORTED_CONTENT_TYPE: SiteScanFailureCode.UNSUPPORTED_CONTENT_TYPE,
+        FetchOutcomeCode.RESPONSE_TOO_LARGE: SiteScanFailureCode.RESPONSE_TOO_LARGE,
+        FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT: SiteScanFailureCode.OUT_OF_SCOPE_REDIRECT,
+    }
+    return mapping.get(outcome)
+
+
 class PageScanOutcome(StrEnum):
     """Stable status codes representing the scan outcome for an individual page."""
 

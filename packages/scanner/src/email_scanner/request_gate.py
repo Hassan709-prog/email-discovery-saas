@@ -4,7 +4,7 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Any, Protocol
 
 from email_scanner.models import NormalizedURL
 
@@ -19,7 +19,12 @@ def get_domain_key(url: NormalizedURL) -> str:
 class RequestGateProtocol(Protocol):
     """Protocol for shared request rate-limiting gates."""
 
-    async def acquire(self, target_url: NormalizedURL) -> None:
+    async def acquire(
+        self,
+        target_url: NormalizedURL,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         """Acquire permission to send an HTTP request to the target URL."""
         ...
 
@@ -89,10 +94,15 @@ class DomainRequestGate:
         """Return scheduled request timestamps for audit/testing."""
         return list(self._scheduled_times.get(domain_key, []))
 
-    async def acquire(self, target_url: NormalizedURL) -> None:
+    async def acquire(
+        self,
+        target_url: NormalizedURL,
+        recorder: Any | None = None,
+    ) -> None:
         """Atomically reserve a request slot and sleep until the scheduled time."""
         domain_key = get_domain_key(target_url)
         lock = self._get_domain_lock(domain_key)
+        start_t = self._clock()
 
         async with lock:
             now = self._clock()
@@ -108,3 +118,6 @@ class DomainRequestGate:
         sleep_sec = scheduled_at - now
         if sleep_sec > 0.0 and self._sleeper is not None:
             await self._sleeper(sleep_sec)
+
+        if recorder is not None:
+            recorder.gate_wait_duration_seconds += max(0.0, self._clock() - start_t)

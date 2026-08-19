@@ -122,7 +122,7 @@ def generate_benchmark_urls(size: int) -> tuple[str, ...]:
     """Generate exact N deterministic input URLs for benchmark scenario."""
     if size < 1:
         raise ValueError("Benchmark scenario size must be at least 1")
-    return tuple(f"https://site-{i}.org" for i in range(size))
+    return tuple(f"http://site-{i}.org" for i in range(size))
 
 
 class BenchmarkHarness:

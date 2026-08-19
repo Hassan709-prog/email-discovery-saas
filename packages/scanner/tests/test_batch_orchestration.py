@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -88,6 +89,7 @@ def test_robots_cache_single_flight() -> None:
                 url: str | NormalizedURL,
                 allowed_content_types: tuple[str, ...] | None = None,
                 redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+                recorder: Any | None = None,
             ) -> FetchResult:
                 nonlocal fetch_count
                 fetch_count += 1
@@ -133,6 +135,7 @@ def test_input_order_output_despite_out_of_order_completion() -> None:
                 self,
                 starting_url: str | NormalizedURL,
                 config: SiteScanConfig | None = None,
+                recorder: Any | None = None,
             ) -> SiteScanResult:
                 url_str = (
                     starting_url.normalized_url
@@ -203,6 +206,7 @@ def test_exact_duplicate_coalescing_and_path_separation() -> None:
                 self,
                 starting_url: str | NormalizedURL,
                 config: SiteScanConfig | None = None,
+                recorder: Any | None = None,
             ) -> SiteScanResult:
                 url_str = (
                     starting_url.normalized_url
@@ -275,6 +279,7 @@ def test_item_exception_isolation() -> None:
                 self,
                 starting_url: str | NormalizedURL,
                 config: SiteScanConfig | None = None,
+                recorder: Any | None = None,
             ) -> SiteScanResult:
                 url_str = (
                     starting_url.normalized_url
@@ -340,6 +345,7 @@ def test_statistics_counter_invariants() -> None:
                 self,
                 starting_url: str | NormalizedURL,
                 config: SiteScanConfig | None = None,
+                recorder: Any | None = None,
             ) -> SiteScanResult:
                 url_str = (
                     starting_url.normalized_url

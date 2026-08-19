@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -44,6 +45,7 @@ class MockHTTPFetcher:
         url: str | NormalizedURL,
         allowed_content_types: tuple[str, ...] | None = None,
         redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+        recorder: Any | None = None,
     ) -> FetchResult:
         url_str = url.normalized_url if isinstance(url, NormalizedURL) else url
         self.fetched_urls.append(url_str)
@@ -85,7 +87,12 @@ class MockRobotsEvaluator:
     def __init__(self, decisions: dict[str, RobotsDecision] | None = None) -> None:
         self.decisions: dict[str, RobotsDecision] = decisions or {}
 
-    async def evaluate(self, url: str | NormalizedURL) -> RobotsDecision:
+    async def evaluate(
+        self,
+        url: str | NormalizedURL,
+        user_agent_token: str | None = None,
+        recorder: Any | None = None,
+    ) -> RobotsDecision:
         url_str = url.normalized_url if isinstance(url, NormalizedURL) else url
         if url_str in self.decisions:
             return self.decisions[url_str]

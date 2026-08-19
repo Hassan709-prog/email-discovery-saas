@@ -8,7 +8,7 @@ import heapq
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from email_scanner.discovery import discover_and_rank_links
 from email_scanner.errors import (
@@ -49,15 +49,20 @@ class HTTPFetcherProtocol(Protocol):
     async def fetch(
         self,
         url: str | NormalizedURL,
-        allowed_content_types: tuple[str, ...] | None = None,
-        redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> FetchResult: ...
 
 
 class RobotsEvaluatorProtocol(Protocol):
     """Protocol for robots policy evaluation abstractions."""
 
-    async def evaluate(self, url: str | NormalizedURL) -> RobotsDecision: ...
+    async def evaluate(
+        self,
+        url: str | NormalizedURL,
+        *args: Any,
+        **kwargs: Any,
+    ) -> RobotsDecision: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +114,13 @@ class SiteScanOrchestrator:
         self,
         starting_url: str | NormalizedURL,
         config: SiteScanConfig | None = None,
+        recorder: Any | None = None,
     ) -> SiteScanResult:
         """Run an end-to-end single-site email scan."""
+        from email_scanner.models import SiteScanDiagnosticRecorder
+
         cfg = config or SiteScanConfig()
+        rec = recorder if recorder is not None else SiteScanDiagnosticRecorder()
 
         if isinstance(starting_url, str):
             try:
@@ -228,7 +237,7 @@ class SiteScanOrchestrator:
                 continue
 
             # 1. Evaluate Robots.txt policy
-            robots_decision = await self._robots_evaluator.evaluate(norm_current)
+            robots_decision = await self._robots_evaluator.evaluate(norm_current, recorder=rec)
 
             if robots_decision.decision == RobotsDecisionCode.DISALLOWED:
                 pages_blocked_by_robots += 1
@@ -297,6 +306,7 @@ class SiteScanOrchestrator:
             fetch_result = await self._fetcher.fetch(
                 norm_current,
                 redirect_validator=redirect_validator,
+                recorder=rec,
             )
 
             if self._cancellation_checker is not None and self._cancellation_checker():
@@ -333,6 +343,7 @@ class SiteScanOrchestrator:
 
             # 4. Successful page processing
             pages_fetched += 1
+            parse_start_t = self._clock()
 
             # Extract emails using final_url
             from email_scanner.email_pipeline import extract_emails
@@ -418,6 +429,7 @@ class SiteScanOrchestrator:
                 fetch_result.body_text or "",
                 cfg.discovery_config,
             )
+            rec.page_processing_duration_seconds += max(0.0, self._clock() - parse_start_t)
 
             # Queue discovered links if within depth and total URL limits
             if depth + 1 <= cfg.max_depth:
@@ -532,6 +544,30 @@ class SiteScanOrchestrator:
                 else SiteScanOutcome.COMPLETED_NO_EMAILS
             )
 
+        rec.total_duration_seconds = elapsed_time
+        rec.cancellation_occurred = stop_reason == "CANCELLED"
+        rec.time_budget_exhausted = stop_reason == "MAX_ELAPSED_TIME_EXCEEDED"
+
+        from email_scanner.errors import SiteScanFailureCode, map_fetch_outcome_to_failure_code
+
+        if site_outcome not in {SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS}:
+            if rec.failure_code is None:
+                if site_outcome == SiteScanOutcome.CANCELLED:
+                    rec.failure_code = SiteScanFailureCode.CANCELLED
+                elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+                    rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
+                elif page_records:
+                    first_p = page_records[0]
+                    if first_p.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
+                    elif first_p.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_TEMPORARY_FAILURE
+                    elif first_p.fetch_result is not None:
+                        fetch_out = first_p.fetch_result.outcome
+                        rec.failure_code = map_fetch_outcome_to_failure_code(fetch_out)
+
+        diagnostics_snapshot = rec.build_diagnostics()
+
         return SiteScanResult(
             starting_url=start_url_str,
             outcome=site_outcome,
@@ -539,4 +575,5 @@ class SiteScanOrchestrator:
             page_records=tuple(page_records),
             email_findings=sorted_findings,
             rejected_email_candidates=sorted_rejected,
+            diagnostics=diagnostics_snapshot,
         )

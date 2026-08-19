@@ -46,9 +46,12 @@ def test_fingerprint_dict_independence_and_input_sensitivity() -> None:
         configuration_snapshot={"a": 1, "b": 2},
     )
 
-    fp1 = compute_request_fingerprint(cmd1)
-    fp2 = compute_request_fingerprint(cmd2)
-    fp_diff = compute_request_fingerprint(cmd_diff_order)
+    targets1 = ["https://example.com/", "https://acme.org/"]
+    targets_diff = ["https://acme.org/", "https://example.com/"]
+
+    fp1 = compute_request_fingerprint(cmd1, targets1)
+    fp2 = compute_request_fingerprint(cmd2, targets1)
+    fp_diff = compute_request_fingerprint(cmd_diff_order, targets_diff)
 
     assert fp1 == fp2
     assert fp1 != fp_diff
@@ -63,16 +66,16 @@ def test_preview_scan_inputs_classification() -> None:
         "https://example.com",
         "https://acme.org",
     ]
-    previews = preview_scan_inputs(inputs)
+    batch_result = preview_scan_inputs(inputs)
 
-    assert len(previews) == 4
-    assert previews[0].classification == "VALID"
-    assert previews[0].normalized_url == "https://example.com/"
-    assert previews[1].classification == "INVALID"
-    assert previews[1].error_code is not None
-    assert previews[2].classification == "DUPLICATE"
-    assert previews[2].duplicate_of_index == 0
-    assert previews[3].classification == "VALID"
+    assert batch_result.total_input_count == 4
+    items = batch_result.items
+    assert items[0].decision_code == "READY_TO_CHECK"
+    assert items[0].canonical_target == "https://example.com/"
+    assert items[1].decision_code == "UNSUPPORTED_SCHEME"
+    assert items[2].decision_code == "DUPLICATE_URL"
+    assert items[2].duplicate_of_index == 0
+    assert items[3].decision_code == "READY_TO_CHECK"
 
 
 def test_policy_pre_ingestion_limits() -> None:
@@ -185,7 +188,7 @@ async def test_idempotency_matching_and_conflict() -> None:
         inputs=["https://example.com"],
         idempotency_key="key-123",
     )
-    fp = compute_request_fingerprint(cmd)
+    fp = compute_request_fingerprint(cmd, ["https://example.com/"])
 
     existing_job = ScanJob(
         id=uuid.uuid4(),
@@ -231,7 +234,7 @@ async def test_uniqueness_race_recovery_on_integrity_error() -> None:
         inputs=["https://example.com"],
         idempotency_key="key-race",
     )
-    fp = compute_request_fingerprint(cmd)
+    fp = compute_request_fingerprint(cmd, ["https://example.com/"])
 
     existing_job = ScanJob(
         id=uuid.uuid4(),

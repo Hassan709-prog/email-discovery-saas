@@ -238,6 +238,7 @@ export interface PaginatedResponse<T> {
 
 export interface PreviewScanInputsApiRequest {
   inputs: string[];
+  overrides?: Record<number, boolean>;
   configuration_snapshot?: Record<string, unknown>;
 }
 
@@ -246,27 +247,40 @@ export interface ScanInputPreviewItemApiResponse {
   original_input: string;
   normalized_url: string | null;
   normalized_domain: string | null;
+  canonical_target: string | null;
   classification: 'VALID' | 'DUPLICATE' | 'INVALID' | string;
+  decision_code: string;
+  explanation: string;
   duplicate_of_index: number | null;
-  error_code: string | null;
-  error_message: string | null;
+  is_selected: boolean;
+  user_override_permitted: boolean;
+  ui_label: string;
+  error_code?: string | null;
+  error_message?: string | null;
 }
 
 export interface PreviewScanInputsApiResponse {
   previews: ScanInputPreviewItemApiResponse[];
   total_input_count: number;
-  valid_input_count: number;
+  ready_to_check_count: number;
+  needs_review_count: number;
+  unrelated_platform_count: number;
   duplicate_input_count: number;
   invalid_input_count: number;
+  final_target_count: number;
+  valid_input_count: number;
+  accepted_canonical_targets: string[];
 }
 
 export interface CreateScanJobApiRequest {
   name?: string | null;
   source_type?: ScanJobSourceType;
   inputs: string[];
+  overrides?: Record<number, boolean>;
   configuration_snapshot?: Record<string, unknown>;
   scanner_version?: string;
   normalization_version?: string;
+  cleaning_policy_version?: string;
   ranking_version?: string;
 }
 

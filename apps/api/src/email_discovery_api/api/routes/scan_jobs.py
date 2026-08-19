@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Response, status
@@ -47,33 +48,43 @@ async def preview_scan_jobs(
     """Preview URL inputs for normalization, domain extraction, and syntax validation."""
     policy.validate_pre_ingestion(request.inputs, request.configuration_snapshot)
 
-    previews = preview_scan_inputs(request.inputs)
-
-    total_input_count = len(previews)
-    valid_input_count = sum(1 for p in previews if p.classification == "VALID")
-    duplicate_input_count = sum(1 for p in previews if p.classification == "DUPLICATE")
-    invalid_input_count = sum(1 for p in previews if p.classification == "INVALID")
+    batch_result = preview_scan_inputs(request.inputs, overrides=request.overrides)
 
     items = [
         ScanInputPreviewItemApiResponse(
             original_index=p.original_index,
             original_input=p.original_input,
             normalized_url=p.normalized_url,
-            normalized_domain=p.normalized_domain,
-            classification=p.classification,
+            normalized_domain=urlsplit(p.normalized_url).hostname if p.normalized_url else None,
+            canonical_target=p.canonical_target,
+            classification=(
+                "VALID"
+                if (p.is_selected and p.canonical_target)
+                else ("DUPLICATE" if str(p.decision_code).startswith("DUPLICATE") else "INVALID")
+            ),
+            decision_code=p.decision_code.value,
+            explanation=p.explanation,
             duplicate_of_index=p.duplicate_of_index,
-            error_code=p.error_code,
-            error_message=p.error_message,
+            is_selected=p.is_selected,
+            user_override_permitted=p.user_override_permitted,
+            ui_label=p.ui_label,
+            error_code=p.decision_code.value if not p.is_selected else None,
+            error_message=p.explanation if not p.is_selected else None,
         )
-        for p in previews
+        for p in batch_result.items
     ]
 
     return PreviewScanInputsApiResponse(
         previews=items,
-        total_input_count=total_input_count,
-        valid_input_count=valid_input_count,
-        duplicate_input_count=duplicate_input_count,
-        invalid_input_count=invalid_input_count,
+        total_input_count=batch_result.total_input_count,
+        ready_to_check_count=batch_result.ready_to_check_count,
+        needs_review_count=batch_result.needs_review_count,
+        unrelated_platform_count=batch_result.unrelated_platform_count,
+        duplicate_input_count=batch_result.duplicate_input_count,
+        invalid_input_count=batch_result.invalid_input_count,
+        final_target_count=batch_result.final_target_count,
+        valid_input_count=batch_result.final_target_count,
+        accepted_canonical_targets=batch_result.accepted_canonical_targets,
     )
 
 
@@ -95,11 +106,13 @@ async def create_scan_job(
         organization_id=principal.organization_id,
         created_by_user_id=principal.user_id,
         inputs=request.inputs,
+        overrides=request.overrides,
         name=request.name,
         source_type=request.source_type,
         configuration_snapshot=request.configuration_snapshot,
         scanner_version=request.scanner_version,
         normalization_version=request.normalization_version,
+        cleaning_policy_version=request.cleaning_policy_version,
         ranking_version=request.ranking_version,
         idempotency_key=idempotency_key,
     )

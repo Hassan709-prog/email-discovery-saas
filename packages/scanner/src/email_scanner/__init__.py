@@ -1,6 +1,15 @@
 """Independent scanner core for the Email Discovery SaaS."""
 
 from email_scanner.batch_orchestration import BatchScanOrchestrator
+from email_scanner.cleaning import (
+    CLEANING_POLICY_VERSION,
+    URLCleaningBatchResult,
+    URLCleaningDecisionCode,
+    URLCleaningItem,
+    clean_and_review_urls,
+    get_explanation_for_decision,
+    get_ui_label_for_decision,
+)
 from email_scanner.discovery import HTMLLinkExtractor, discover_and_rank_links
 from email_scanner.dns import AsyncDNSResolver, SystemDNSResolver
 from email_scanner.email_extraction import HTMLEmailExtractor
@@ -112,8 +121,12 @@ from email_scanner.scope import (
 )
 
 __all__ = [
+    "CLEANING_POLICY_VERSION",
     "PRIMARY_EMAIL_SELECTION_VERSION",
     "RANKING_VERSION",
+    "URLCleaningBatchResult",
+    "URLCleaningDecisionCode",
+    "URLCleaningItem",
     "AsyncDNSResolver",
     "AsyncHTTPFetcher",
     "BatchItemOutcome",
@@ -196,9 +209,12 @@ __all__ = [
     "calculate_domain_affinity",
     "calculate_page_score",
     "classify_email_category",
+    "clean_and_review_urls",
     "discover_and_rank_links",
     "extract_emails",
     "get_domain_key",
+    "get_explanation_for_decision",
+    "get_ui_label_for_decision",
     "is_asset_url",
     "is_in_scope",
     "is_same_origin",

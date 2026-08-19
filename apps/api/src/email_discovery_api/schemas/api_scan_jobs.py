@@ -28,6 +28,9 @@ class CreateScanJobApiRequest(BaseModel):
         max_length=10_000,
         description="URL input strings to crawl and scan",
     )
+    overrides: dict[int, bool] | None = Field(
+        default=None, description="Optional index-based selection overrides"
+    )
     configuration_snapshot: dict[str, Any] = Field(
         default_factory=dict, description="Scan job configuration settings"
     )
@@ -36,6 +39,9 @@ class CreateScanJobApiRequest(BaseModel):
     )
     normalization_version: str = Field(
         default="1.0.0", max_length=50, description="URL normalization version string"
+    )
+    cleaning_policy_version: str = Field(
+        default="1.0.0", max_length=50, description="Cleaning policy version string"
     )
     ranking_version: str = Field(
         default="1.0.0", max_length=50, description="Email ranking algorithm version string"
@@ -52,6 +58,9 @@ class PreviewScanInputsApiRequest(BaseModel):
         min_length=1,
         max_length=10_000,
         description="URL input strings to preview and normalize",
+    )
+    overrides: dict[int, bool] | None = Field(
+        default=None, description="Optional index-based selection overrides"
     )
     configuration_snapshot: dict[str, Any] = Field(
         default_factory=dict, description="Optional scan configuration for policy validation"
@@ -127,8 +136,14 @@ class ScanInputPreviewItemApiResponse(BaseModel):
     original_input: str
     normalized_url: str | None = None
     normalized_domain: str | None = None
+    canonical_target: str | None = None
     classification: str
+    decision_code: str
+    explanation: str
     duplicate_of_index: int | None = None
+    is_selected: bool
+    user_override_permitted: bool
+    ui_label: str
     error_code: str | None = None
     error_message: str | None = None
 
@@ -140,9 +155,14 @@ class PreviewScanInputsApiResponse(BaseModel):
 
     previews: list[ScanInputPreviewItemApiResponse]
     total_input_count: int
-    valid_input_count: int
+    ready_to_check_count: int
+    needs_review_count: int
+    unrelated_platform_count: int
     duplicate_input_count: int
     invalid_input_count: int
+    final_target_count: int
+    valid_input_count: int
+    accepted_canonical_targets: list[str]
 
 
 class ScanJobProgressApiResponse(BaseModel):

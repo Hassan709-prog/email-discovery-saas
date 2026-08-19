@@ -21,7 +21,7 @@ SERVICE_ERROR_STATUS_MAP: dict[ServiceErrorCode, int] = {
     ServiceErrorCode.JOB_NOT_FOUND: status.HTTP_404_NOT_FOUND,
     ServiceErrorCode.IDEMPOTENCY_CONFLICT: status.HTTP_409_CONFLICT,
     ServiceErrorCode.INVALID_STATE_TRANSITION: status.HTTP_409_CONFLICT,
-    ServiceErrorCode.NO_VALID_INPUTS: status.HTTP_409_CONFLICT,
+    ServiceErrorCode.NO_VALID_INPUTS: status.HTTP_400_BAD_REQUEST,
     ServiceErrorCode.LEASE_LOST: status.HTTP_409_CONFLICT,
     ServiceErrorCode.EXPORT_TOO_LARGE: status.HTTP_409_CONFLICT,
     ServiceErrorCode.ACTIVE_JOB_LIMIT_EXCEEDED: status.HTTP_429_TOO_MANY_REQUESTS,

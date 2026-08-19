@@ -22,9 +22,11 @@ class CreateScanJobCommand(BaseModel):
     source_type: ScanJobSourceType = ScanJobSourceType.MANUAL
     inputs: list[str] = Field(..., min_length=1)
     idempotency_key: str | None = Field(default=None, max_length=255)
+    overrides: dict[int, bool] | None = Field(default=None)
     configuration_snapshot: dict[str, Any] = Field(default_factory=dict)
     scanner_version: str = Field(default="1.0.0", max_length=50)
     normalization_version: str = Field(default="1.0.0", max_length=50)
+    cleaning_policy_version: str = Field(default="1.0.0", max_length=50)
     ranking_version: str = Field(default="1.0.0", max_length=50)
 
 

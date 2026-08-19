@@ -59,20 +59,31 @@ describe('CreateScanPage', () => {
     mockPush.mockClear();
   });
 
-  it('previews URL inputs and renders classification counts and invalid error reason table', async () => {
+  it('previews URL inputs and renders classification breakdown metrics and table', async () => {
     vi.spyOn(apiClient, 'previewScanInputs').mockResolvedValue({
       total_input_count: 3,
-      valid_input_count: 1,
+      ready_to_check_count: 1,
+      needs_review_count: 0,
+      unrelated_platform_count: 0,
       duplicate_input_count: 1,
       invalid_input_count: 1,
+      final_target_count: 1,
+      valid_input_count: 1,
+      accepted_canonical_targets: ['https://example.com/'],
       previews: [
         {
           original_index: 0,
           original_input: 'https://example.com',
           normalized_url: 'https://example.com/',
           normalized_domain: 'example.com',
+          canonical_target: 'https://example.com/',
           classification: 'VALID',
+          decision_code: 'READY_TO_CHECK',
+          explanation: 'Valid website ready to scan.',
           duplicate_of_index: null,
+          is_selected: true,
+          user_override_permitted: true,
+          ui_label: 'Ready to check',
           error_code: null,
           error_message: null,
         },
@@ -81,8 +92,14 @@ describe('CreateScanPage', () => {
           original_input: 'https://example.com',
           normalized_url: 'https://example.com/',
           normalized_domain: 'example.com',
+          canonical_target: 'https://example.com/',
           classification: 'DUPLICATE',
+          decision_code: 'DUPLICATE_URL',
+          explanation: 'Duplicate website address of item #1.',
           duplicate_of_index: 0,
+          is_selected: false,
+          user_override_permitted: true,
+          ui_label: 'Duplicate website',
           error_code: null,
           error_message: null,
         },
@@ -91,10 +108,16 @@ describe('CreateScanPage', () => {
           original_input: 'not-a-url',
           normalized_url: null,
           normalized_domain: null,
+          canonical_target: null,
           classification: 'INVALID',
+          decision_code: 'INVALID_URL',
+          explanation: 'Invalid website address format.',
           duplicate_of_index: null,
-          error_code: 'INVALID_SYNTAX',
-          error_message: 'Invalid URL scheme or format',
+          is_selected: false,
+          user_override_permitted: false,
+          ui_label: 'Invalid website address',
+          error_code: 'INVALID_URL',
+          error_message: 'Invalid website address format.',
         },
       ],
     });
@@ -110,8 +133,8 @@ describe('CreateScanPage', () => {
     fireEvent.click(previewBtn);
 
     await waitFor(() => {
-      expect(screen.getByText('Total Websites')).toBeInTheDocument();
-      expect(screen.getByText('Invalid URL scheme or format')).toBeInTheDocument();
+      expect(screen.getByText('Total Raw')).toBeInTheDocument();
+      expect(screen.getByText('Invalid website address format.')).toBeInTheDocument();
     });
   });
 
@@ -120,17 +143,28 @@ describe('CreateScanPage', () => {
     vi.spyOn(apiClient, 'queueScanJob').mockRejectedValue(new Error('Queue connection dropped'));
     vi.spyOn(apiClient, 'previewScanInputs').mockResolvedValue({
       total_input_count: 1,
-      valid_input_count: 1,
+      ready_to_check_count: 1,
+      needs_review_count: 0,
+      unrelated_platform_count: 0,
       duplicate_input_count: 0,
       invalid_input_count: 0,
+      final_target_count: 1,
+      valid_input_count: 1,
+      accepted_canonical_targets: ['https://test.com/'],
       previews: [
         {
           original_index: 0,
           original_input: 'https://test.com',
           normalized_url: 'https://test.com/',
           normalized_domain: 'test.com',
+          canonical_target: 'https://test.com/',
           classification: 'VALID',
+          decision_code: 'READY_TO_CHECK',
+          explanation: 'Valid website ready to scan.',
           duplicate_of_index: null,
+          is_selected: true,
+          user_override_permitted: true,
+          ui_label: 'Ready to check',
           error_code: null,
           error_message: null,
         },
@@ -185,17 +219,28 @@ describe('CreateScanPage', () => {
 
     vi.spyOn(apiClient, 'previewScanInputs').mockResolvedValue({
       total_input_count: 1,
-      valid_input_count: 1,
+      ready_to_check_count: 1,
+      needs_review_count: 0,
+      unrelated_platform_count: 0,
       duplicate_input_count: 0,
       invalid_input_count: 0,
+      final_target_count: 1,
+      valid_input_count: 1,
+      accepted_canonical_targets: ['https://test.com/'],
       previews: [
         {
           original_index: 0,
           original_input: 'https://test.com',
           normalized_url: 'https://test.com/',
           normalized_domain: 'test.com',
+          canonical_target: 'https://test.com/',
           classification: 'VALID',
+          decision_code: 'READY_TO_CHECK',
+          explanation: 'Valid website ready to scan.',
           duplicate_of_index: null,
+          is_selected: true,
+          user_override_permitted: true,
+          ui_label: 'Ready to check',
           error_code: null,
           error_message: null,
         },

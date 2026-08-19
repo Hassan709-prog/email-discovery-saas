@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -25,12 +26,14 @@ from email_discovery_api.repositories.scan_jobs import ScanJobRepository
 from email_discovery_api.repositories.scan_urls import ScanURLRepository
 from email_discovery_api.schemas.scan_jobs import (
     CreateScanJobCommand,
-    ScanInputPreview,
     ScanJobProgress,
 )
 from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.policies import ScanCreationPolicy
-from email_scanner import URLNormalizationError, normalize_url
+from email_scanner import (
+    URLCleaningBatchResult,
+    clean_and_review_urls,
+)
 
 ALLOWED_STATE_TRANSITIONS: dict[ScanJobStatus, set[ScanJobStatus]] = {
     ScanJobStatus.DRAFT: {ScanJobStatus.QUEUED},
@@ -71,66 +74,33 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def compute_request_fingerprint(command: CreateScanJobCommand) -> str:
-    """Compute deterministic 64-character SHA-256 request fingerprint."""
+def compute_request_fingerprint(
+    command: CreateScanJobCommand,
+    accepted_canonical_targets: list[str],
+) -> str:
+    """Compute deterministic 64-character SHA-256 request fingerprint based on accepted targets."""
     payload: dict[str, Any] = {
         "organization_id": str(command.organization_id),
         "created_by_user_id": str(command.created_by_user_id),
         "source_type": command.source_type.value,
-        "inputs": command.inputs,
+        "canonical_targets": accepted_canonical_targets,
         "name": command.name,
         "configuration_snapshot": command.configuration_snapshot,
         "scanner_version": command.scanner_version,
         "normalization_version": command.normalization_version,
+        "cleaning_policy_version": command.cleaning_policy_version,
         "ranking_version": command.ranking_version,
     }
     canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
-def preview_scan_inputs(inputs: list[str]) -> list[ScanInputPreview]:
-    """Parse inputs deterministically into a list of preview items with classification."""
-    previews: list[ScanInputPreview] = []
-    seen_urls: dict[str, int] = {}
-
-    for idx, raw_input in enumerate(inputs):
-        try:
-            norm = normalize_url(raw_input)
-            canonical_url = norm.normalized_url
-            if canonical_url in seen_urls:
-                previews.append(
-                    ScanInputPreview(
-                        original_index=idx,
-                        original_input=raw_input,
-                        normalized_url=norm.normalized_url,
-                        normalized_domain=norm.hostname,
-                        classification="DUPLICATE",
-                        duplicate_of_index=seen_urls[canonical_url],
-                    )
-                )
-            else:
-                seen_urls[canonical_url] = idx
-                previews.append(
-                    ScanInputPreview(
-                        original_index=idx,
-                        original_input=raw_input,
-                        normalized_url=norm.normalized_url,
-                        normalized_domain=norm.hostname,
-                        classification="VALID",
-                    )
-                )
-        except URLNormalizationError as err:
-            previews.append(
-                ScanInputPreview(
-                    original_index=idx,
-                    original_input=raw_input,
-                    classification="INVALID",
-                    error_code=err.code.value if hasattr(err, "code") else "INVALID_URL",
-                    error_message=str(err),
-                )
-            )
-
-    return previews
+def preview_scan_inputs(
+    inputs: list[str],
+    overrides: dict[int, bool] | None = None,
+) -> URLCleaningBatchResult:
+    """Clean, normalize, classify, deduplicate, and apply optional overrides."""
+    return clean_and_review_urls(inputs, overrides=overrides)
 
 
 class ScanJobService:
@@ -151,11 +121,21 @@ class ScanJobService:
     async def create_job(self, command: CreateScanJobCommand) -> CreateJobResult:
         """Create scan job and ingest input URLs into draft state."""
         self.policy.validate_pre_ingestion(command.inputs, command.configuration_snapshot)
-        fingerprint = compute_request_fingerprint(command)
+
+        cleaning_result = clean_and_review_urls(command.inputs, overrides=command.overrides)
+        accepted_targets = cleaning_result.accepted_canonical_targets
+
+        if len(accepted_targets) == 0:
+            raise ServiceError(
+                ServiceErrorCode.NO_VALID_INPUTS,
+                "No eligible websites are ready to scan. Review the excluded and invalid inputs.",
+            )
+
+        fingerprint = compute_request_fingerprint(command, accepted_targets)
 
         try:
             async with self.session.begin():
-                return await self._create_job_in_transaction(command, fingerprint)
+                return await self._create_job_in_transaction(command, fingerprint, cleaning_result)
         except IntegrityError as err:
             if command.idempotency_key:
                 async with self.session.begin():
@@ -172,7 +152,10 @@ class ScanJobService:
             raise
 
     async def _create_job_in_transaction(
-        self, command: CreateScanJobCommand, fingerprint: str
+        self,
+        command: CreateScanJobCommand,
+        fingerprint: str,
+        cleaning_result: URLCleaningBatchResult,
     ) -> CreateJobResult:
         """Internal job creation steps executed within an active transaction."""
         org = await self.org_repo.get_active_organization_for_update(command.organization_id)
@@ -213,60 +196,31 @@ class ScanJobService:
 
         job_id = uuid.uuid4()
         scan_urls: list[ScanURL] = []
-        seen_urls: dict[str, tuple[uuid.UUID, int]] = {}
 
-        total_input_count = len(command.inputs)
-        valid_input_count = 0
-        duplicate_input_count = 0
+        total_input_count = cleaning_result.total_input_count
+        valid_input_count = cleaning_result.final_target_count
+        duplicate_input_count = cleaning_result.duplicate_input_count
 
-        for idx, raw_input in enumerate(command.inputs):
-            url_id = uuid.uuid4()
-            try:
-                norm = normalize_url(raw_input)
-                canonical_url = norm.normalized_url
-
-                if canonical_url in seen_urls:
-                    first_url_id, _first_idx = seen_urls[canonical_url]
-                    duplicate_input_count += 1
-                    scan_urls.append(
-                        ScanURL(
-                            id=url_id,
-                            scan_job_id=job_id,
-                            original_index=idx,
-                            original_input=raw_input,
-                            normalized_url=norm.normalized_url,
-                            normalized_domain=norm.hostname,
-                            status=ScanURLStatus.DUPLICATE.value,
-                            duplicate_of_scan_url_id=first_url_id,
-                        )
-                    )
-                else:
-                    seen_urls[canonical_url] = (url_id, idx)
-                    valid_input_count += 1
-                    scan_urls.append(
-                        ScanURL(
-                            id=url_id,
-                            scan_job_id=job_id,
-                            original_index=idx,
-                            original_input=raw_input,
-                            normalized_url=norm.normalized_url,
-                            normalized_domain=norm.hostname,
-                            status=ScanURLStatus.PENDING.value,
-                        )
-                    )
-            except URLNormalizationError as err:
-                code_str = err.code.value if hasattr(err, "code") else "INVALID_URL"
+        # Create ScanURL rows ONLY for accepted canonical targets (Correction #6)
+        for item in cleaning_result.items:
+            if item.is_selected and item.canonical_target:
+                url_id = uuid.uuid4()
+                target_parsed = urlsplit(item.canonical_target)
+                target_domain = target_parsed.hostname
                 scan_urls.append(
                     ScanURL(
                         id=url_id,
                         scan_job_id=job_id,
-                        original_index=idx,
-                        original_input=raw_input,
-                        status=ScanURLStatus.INVALID.value,
-                        last_error_code=code_str,
-                        last_error_message=str(err),
+                        original_index=item.original_index,
+                        original_input=item.original_input,
+                        normalized_url=item.canonical_target,
+                        normalized_domain=target_domain,
+                        status=ScanURLStatus.PENDING.value,
                     )
                 )
+
+        config_snapshot = dict(command.configuration_snapshot or {})
+        config_snapshot["cleaning_policy_version"] = command.cleaning_policy_version
 
         job = ScanJob(
             id=job_id,

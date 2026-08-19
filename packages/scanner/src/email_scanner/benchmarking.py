@@ -21,6 +21,7 @@ from email_scanner.benchmark_fixtures import (
     OfflineBenchmarkDNSResolver,
     OfflineBenchmarkNetworkBackend,
 )
+from email_scanner.dns import WorkerDNSCache
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.models import (
     BatchItemOutcome,
@@ -136,6 +137,7 @@ class BenchmarkHarness:
         live: bool = False,
         simulated_delay_sec: float = 0.0,
         seed: int = 42,
+        cache_mode: str = "cold",
     ) -> BenchmarkRunMetrics:
         """Run benchmark scenario asynchronously, measuring timing, throughput, and memory."""
         if live:
@@ -161,7 +163,8 @@ class BenchmarkHarness:
             ),
         )
 
-        dns_resolver = OfflineBenchmarkDNSResolver()
+        dns_cache = WorkerDNSCache() if cache_mode != "uncached" else None
+        dns_resolver = OfflineBenchmarkDNSResolver(dns_cache=dns_cache)
         backend = OfflineBenchmarkNetworkBackend(simulated_delay_sec=simulated_delay_sec)
         gate = DomainRequestGate(default_minimum_interval_seconds=0.0)
 
@@ -186,6 +189,8 @@ class BenchmarkHarness:
 
                 # 1. Warmup run to separate correctness from performance measurement
                 if warmup:
+                    if dns_cache is not None:
+                        await dns_cache.clear()
                     warmup_result = await orchestrator.scan_batch(input_urls, config=batch_config)
                     # Correctness assertions before measuring repeats
                     if len(warmup_result.items) != size:
@@ -227,6 +232,9 @@ class BenchmarkHarness:
                 last_result: BatchScanResult | None = None
 
                 for _ in range(repeats):
+                    if cache_mode == "cold" and dns_cache is not None:
+                        await dns_cache.clear()
+
                     was_tracing = tracemalloc.is_tracing()
                     if not was_tracing:
                         tracemalloc.start()
@@ -415,6 +423,7 @@ async def run_benchmark_cli(args: argparse.Namespace) -> tuple[int, str]:
 
     seed = getattr(args, "seed", 42)
     simulated_delay = getattr(args, "simulated_delay", 0.0)
+    cache_mode = getattr(args, "cache_mode", "cold")
 
     results_by_size: dict[str, Any] = {}
 
@@ -426,6 +435,7 @@ async def run_benchmark_cli(args: argparse.Namespace) -> tuple[int, str]:
             live=args.live,
             simulated_delay_sec=simulated_delay,
             seed=seed,
+            cache_mode=cache_mode,
         )
         results_by_size[str(sz)] = asdict(metrics)
 
@@ -447,8 +457,9 @@ async def run_benchmark_cli(args: argparse.Namespace) -> tuple[int, str]:
         "scenarios": results_by_size,
     }
 
-    if args.baseline:
-        base_path = Path(args.baseline)
+    baseline_path = getattr(args, "baseline", None)
+    if baseline_path:
+        base_path = Path(baseline_path)
         if base_path.is_file():
             try:
                 base_data = json.loads(base_path.read_text(encoding="utf-8"))

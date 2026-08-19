@@ -349,6 +349,12 @@ def main(cli_args: list[str] | None = None) -> int:
         default=None,
         help="Path to an existing benchmark JSON file for performance comparison",
     )
+    bench_parser.add_argument(
+        "--cache-mode",
+        choices=["cold", "warm", "uncached"],
+        default="cold",
+        help="DNS cache mode: cold (cleared per repeat), warm (retained), or uncached",
+    )
     # consistency-audit command
     audit_parser = subparsers.add_parser(
         "consistency-audit",

@@ -67,6 +67,13 @@ class CrawlWorker:
         self.recovery_interval = recovery_interval_seconds
         self.orchestrator_factory = orchestrator_factory
 
+        from email_scanner.dns import DeadlockFreeSingleFlightGroup, WorkerDNSCache
+
+        self.dns_cache = WorkerDNSCache()
+        self.single_flight: DeadlockFreeSingleFlightGroup[tuple[str, int, str], tuple[str, ...]] = (
+            DeadlockFreeSingleFlightGroup()
+        )
+
         self._running = False
         self._shutdown_event = asyncio.Event()
         self._active_tasks: set[asyncio.Task[Any]] = set()
@@ -114,20 +121,33 @@ class CrawlWorker:
                     )
                     self._running = False
                     break
-                if not claimed_any:
-                    now = time.monotonic()
-                    if now - self._last_recovery_at >= self.recovery_interval:
-                        self._last_recovery_at = now
-                        try:
-                            async with self.session_factory() as session:
-                                work_service = CrawlWorkService(session)
-                                await work_service.recover_expired_leases()
-                                job_service = ScanJobService(session)
-                                await job_service.finalize_eligible_stuck_jobs()
-                        except Exception:
-                            logger.warning(
-                                "Periodic lease recovery encountered an exception.", exc_info=True
-                            )
+
+                now = time.monotonic()
+                if now - self._last_recovery_at >= self.recovery_interval:
+                    self._last_recovery_at = now
+                    try:
+                        async with self.session_factory() as session:
+                            work_service = CrawlWorkService(session)
+                            await work_service.recover_expired_leases()
+                            job_service = ScanJobService(session)
+                            await job_service.finalize_eligible_stuck_jobs()
+                    except Exception:
+                        logger.warning(
+                            "Periodic lease recovery encountered an exception.", exc_info=True
+                        )
+
+                if not self._running or self._shutdown_event.is_set():
+                    break
+
+                # Race-safe event-driven capacity refill vs idle poll sleep
+                if len(self._active_tasks) >= self.concurrency:
+                    snapshot = tuple(self._active_tasks)
+                    if snapshot:
+                        done, _ = await asyncio.wait(snapshot, return_when=asyncio.FIRST_COMPLETED)
+                        for t in done:
+                            if not t.cancelled():
+                                _ = t.exception()
+                elif not claimed_any:
                     await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             logger.info("Worker run loop cancelled.")
@@ -142,11 +162,13 @@ class CrawlWorker:
 
     async def _drain_tasks(self) -> None:
         """Wait for active scan tasks during graceful shutdown."""
-        if not self._active_tasks:
-            return
-        logger.info("Draining %d active scan tasks...", len(self._active_tasks))
-        await asyncio.gather(*self._active_tasks, return_exceptions=True)
-        self._active_tasks.clear()
+        if self._active_tasks:
+            logger.info("Draining %d active scan tasks...", len(self._active_tasks))
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            self._active_tasks.clear()
+
+        await self.single_flight.shutdown()
+        await self.dns_cache.clear()
 
     async def _fill_capacity_and_claim(self) -> bool:
         """Poll and claim repeatedly until concurrency limit reached or queue exhausted.
@@ -191,14 +213,33 @@ class CrawlWorker:
             self._run_heartbeat(claim, cancel_event, lease_lost_event)
         )
 
+        def is_cancelled() -> bool:
+            return cancel_event.is_set() or self._shutdown_event.is_set()
+
         worker_owned = self.orchestrator_factory is None
-        orchestrator = (
-            self.orchestrator_factory()
-            if self.orchestrator_factory
-            else SiteScanOrchestrator(
-                cancellation_checker=lambda: cancel_event.is_set() or self._shutdown_event.is_set()
+        if self.orchestrator_factory:
+            orchestrator = self.orchestrator_factory()
+        else:
+            from email_scanner.dns import SystemDNSResolver
+            from email_scanner.fetching import AsyncHTTPFetcher
+            from email_scanner.robots import RobotsPolicyEvaluator
+
+            resolver = SystemDNSResolver(
+                dns_cache=self.dns_cache,
+                single_flight=self.single_flight,
             )
-        )
+            fetcher = AsyncHTTPFetcher(
+                dns_resolver=resolver,
+                cancellation_checker=is_cancelled,
+            )
+            robots = RobotsPolicyEvaluator(
+                fetcher=fetcher,
+            )
+            orchestrator = SiteScanOrchestrator(
+                fetcher=fetcher,
+                robots_evaluator=robots,
+                cancellation_checker=is_cancelled,
+            )
 
         target_url = claim.normalized_url or claim.original_input
         site_result = None

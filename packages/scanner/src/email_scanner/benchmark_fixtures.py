@@ -6,8 +6,12 @@ from typing import Any
 
 import httpcore
 
-from email_scanner.dns import AsyncDNSResolver
-from email_scanner.models import NormalizedURL
+from email_scanner.dns import (
+    AsyncDNSResolver,
+    DeadlockFreeSingleFlightGroup,
+    WorkerDNSCache,
+)
+from email_scanner.models import HostType, NormalizedURL
 
 
 class SyntheticSiteGenerator:
@@ -213,29 +217,70 @@ class OfflineBenchmarkNetworkBackend(httpcore.AsyncNetworkBackend):
 class OfflineBenchmarkDNSResolver(AsyncDNSResolver):
     """Async DNS resolver mapping site-{i}.example.org to synthetic public IP addresses."""
 
+    def __init__(
+        self,
+        dns_cache: WorkerDNSCache | None = None,
+        single_flight: DeadlockFreeSingleFlightGroup[tuple[str, int, str], tuple[str, ...]]
+        | None = None,
+    ) -> None:
+        self.dns_cache = dns_cache
+        self.single_flight = single_flight or DeadlockFreeSingleFlightGroup()
+        self.underlying_resolutions = 0
+
     async def resolve(
         self,
         url: NormalizedURL,
         recorder: Any | None = None,
         clock: Any | None = None,
     ) -> tuple[str, ...]:
-        return await self.resolve_host(url.hostname, url.port or 80, recorder=recorder, clock=clock)
+        return await self.resolve_host(
+            url.hostname, url.port or 80, target_url=url, recorder=recorder, clock=clock
+        )
 
     async def resolve_host(
         self,
         hostname: str,
         port: int = 80,
+        target_url: NormalizedURL | None = None,
         recorder: Any | None = None,
         clock: Any | None = None,
     ) -> tuple[str, ...]:
         clean_host = hostname.strip().strip("[]")
-        if "site-" in clean_host:
-            try:
-                idx_str = clean_host.split("site-")[1].split(".")[0]
-                site_idx = int(idx_str)
-                # Map to public TEST-NET-2 IP range 198.51.100.X
-                ip_octet = site_idx % 250
-                return (f"93.184.216.{ip_octet}",)
-            except ValueError:
-                pass
-        return ("93.184.216.0",)
+        norm_url = target_url or NormalizedURL(
+            original_url=f"http://{clean_host}",
+            normalized_url=f"http://{clean_host}",
+            scheme="https" if port == 443 else "http",
+            hostname=clean_host,
+            port=port if port not in (80, 443) else None,
+            path="/",
+            query="",
+            host_type=HostType.DOMAIN,
+            registrable_domain=None,
+        )
+
+        if self.dns_cache is not None:
+            cached = await self.dns_cache.get(norm_url, clean_host, port)
+            if cached is not None:
+                return cached
+
+        flight_key = (clean_host.lower(), port, "default")
+
+        async def _perform_resolution() -> tuple[str, ...]:
+            self.underlying_resolutions += 1
+            res_ip = "93.184.216.0"
+            if "site-" in clean_host:
+                try:
+                    idx_str = clean_host.split("site-")[1].split(".")[0]
+                    site_idx = int(idx_str)
+                    ip_octet = site_idx % 250
+                    res_ip = f"93.184.216.{ip_octet}"
+                except ValueError:
+                    pass
+
+            ips = (res_ip,)
+            if self.dns_cache is not None:
+                await self.dns_cache.put(clean_host, port, ips)
+
+            return ips
+
+        return await self.single_flight.do(flight_key, _perform_resolution)

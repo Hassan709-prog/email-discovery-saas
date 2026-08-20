@@ -75,6 +75,7 @@ async def expired_lease_url(
         normalized_url="https://expired-lease.com/",
         normalized_domain="expired-lease.com",
         lease_owner="worker-expired",
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=None,  # type: ignore
@@ -99,7 +100,7 @@ async def test_expired_lease_cannot_renew(expired_lease_url: dict[str, Any]) -> 
         res = await service.renew_lease(
             scan_url_id=claim.scan_url_id,
             lease_owner=claim.lease_owner,
-            attempt_count=claim.attempt_count,
+            fence_token=claim.fence_token,
         )
 
     assert res.status == HeartbeatStatus.LEASE_LOST

@@ -69,7 +69,8 @@ async def test_readiness_probe_healthy(test_app: FastAPI, mock_db_manager: Datab
     assert data == {
         "status": "ok",
         "service": "test-api",
-        "dependencies": {"database": "ok"},
+        "dependencies": {"database": "ok", "redis": "ok"},
+        "redis_degraded": False,
     }
 
 
@@ -88,7 +89,7 @@ async def test_readiness_probe_unhealthy(
     assert data == {
         "status": "unavailable",
         "service": "test-api",
-        "dependencies": {"database": "unavailable"},
+        "dependencies": {"database": "unavailable", "redis": "unknown"},
     }
 
 

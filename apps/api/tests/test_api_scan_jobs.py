@@ -21,7 +21,7 @@ from email_discovery_api.models.enums import ScanJobStatus
 from email_discovery_api.models.scan_job import ScanJob
 from email_discovery_api.schemas.scan_jobs import ScanJobProgress
 from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
-from email_discovery_api.services.scan_jobs import CreateJobResult, ScanJobService
+from email_discovery_api.services.scan_jobs import CreateJobResult, QueueJobResult, ScanJobService
 
 
 @pytest.fixture
@@ -395,7 +395,9 @@ def test_queue_and_cancel_status_transitions(
 
     # 1. Queue draft job -> 200
     mock_service.transition_job_status = AsyncMock(return_value=queued_job)
-    mock_service.queue_job = AsyncMock(return_value=queued_job)
+    mock_service.queue_job = AsyncMock(
+        return_value=QueueJobResult(job=queued_job, transitioned_to_queued=True)
+    )
     res_queue = client.post(f"/api/v1/scan-jobs/{job_id}/queue")
     assert res_queue.status_code == 200
     assert res_queue.json()["status"] == "QUEUED"
@@ -443,7 +445,7 @@ def test_queue_and_cancel_status_transitions(
 def test_queue_job_zero_valid_inputs_rejected(
     test_app: FastAPI, client: Any, test_principal: RequestPrincipal
 ) -> None:
-    """Verify queueing job with zero valid inputs returns HTTP 409 NO_VALID_INPUTS."""
+    """Verify queueing job with zero valid inputs returns HTTP 400 NO_VALID_INPUTS."""
     mock_service = MagicMock(spec=ScanJobService)
     test_app.dependency_overrides[get_current_principal] = lambda: test_principal
     test_app.dependency_overrides[get_scan_job_service] = lambda: mock_service
@@ -457,7 +459,7 @@ def test_queue_job_zero_valid_inputs_rejected(
     mock_service.queue_job = AsyncMock(side_effect=err)
 
     response = client.post(f"/api/v1/scan-jobs/{job_id}/queue")
-    assert response.status_code == 409
+    assert response.status_code == 400
     assert response.json()["error"]["code"] == "NO_VALID_INPUTS"
 
 

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import email_discovery_api.models  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from email_discovery_api.config import Settings
 from email_discovery_api.models import Base, Membership, Organization, User
 from email_discovery_api.models.enums import (
@@ -87,21 +88,21 @@ async def isolated_db_engine() -> AsyncGenerator[AsyncEngine]:
             f"Isolated PostgreSQL test database 'email_discovery_test' unavailable ({conn_err})."
         )
 
-    async with engine.begin() as conn:
-        await conn.execute(text("DROP SCHEMA public CASCADE;"))
-        await conn.execute(text("CREATE SCHEMA public;"))
-        await conn.run_sync(Base.metadata.create_all)
-
-    yield engine
+    table_names = ", ".join(f'"{table.name}"' for table in Base.metadata.sorted_tables)
+    truncate_sql = text(f"TRUNCATE TABLE {table_names} RESTART IDENTITY CASCADE")
 
     try:
         async with engine.begin() as conn:
-            await conn.execute(text("DROP SCHEMA public CASCADE;"))
-            await conn.execute(text("CREATE SCHEMA public;"))
-    except Exception:
-        pass
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.execute(truncate_sql)
+
+        yield engine
     finally:
-        await engine.dispose()
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(truncate_sql)
+        finally:
+            await engine.dispose()
 
 
 @pytest.fixture

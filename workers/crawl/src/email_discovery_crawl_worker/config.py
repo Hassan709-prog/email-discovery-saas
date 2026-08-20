@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from functools import lru_cache
 
 from pydantic import Field, SecretStr, field_validator
@@ -12,8 +13,19 @@ class WorkerSettings(BaseSettings):
     """Worker settings read strictly from environment variables."""
 
     environment: str = Field(default="development", description="Execution environment")
-    worker_id: str | None = Field(default=None, description="Worker identifier")
+    worker_id: str | None = Field(default=None, description="Logical worker label/id")
+    worker_label: str | None = Field(default=None, description="Logical worker label")
+    instance_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description="Unique 128-bit random instance identity for lease ownership",
+    )
     concurrency: int = Field(default=2, description="Max concurrent scan tasks")
+    max_waiting_claims_per_worker: int = Field(
+        default=4, description="Max domain-deferred claims held in waiting queue per worker"
+    )
+    max_waiting_claims_per_domain: int = Field(
+        default=2, description="Max waiting claims allowed for a single domain per worker"
+    )
     poll_interval: float = Field(default=2.0, description="Default idle poll interval")
     healthy_poll_interval: float = Field(
         default=10.0, description="Healthy background poll interval"

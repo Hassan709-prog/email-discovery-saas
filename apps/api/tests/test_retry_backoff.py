@@ -1,5 +1,6 @@
 """Unit and integration tests for RetryBackoffPolicy and retry scheduling."""
 
+import dataclasses
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -95,6 +96,13 @@ async def test_transient_failure_scheduling_and_claiming(
         work_service = CrawlWorkService(session)
         claim = await work_service.claim_next_url(lease_owner="w1", lease_duration_seconds=120.0)
     assert claim is not None
+    async with session_factory() as session:
+        attempt_number = await CrawlWorkService(session).mark_attempt_started(
+            scan_url_id=claim.scan_url_id,
+            lease_owner=claim.lease_owner,
+            fence_token=claim.fence_token,
+        )
+    claim = dataclasses.replace(claim, attempt_count=attempt_number)
 
     # 2. Persist transient failure with attempt 1 < max_attempts 3
     async with session_factory() as session:
@@ -127,6 +135,14 @@ async def test_transient_failure_scheduling_and_claiming(
         work_service = CrawlWorkService(session)
         claim2 = await work_service.claim_next_url(lease_owner="w3")
     assert claim2 is not None
+    assert claim2.attempt_count == 1
+    async with session_factory() as session:
+        attempt_number = await CrawlWorkService(session).mark_attempt_started(
+            scan_url_id=claim2.scan_url_id,
+            lease_owner=claim2.lease_owner,
+            fence_token=claim2.fence_token,
+        )
+    claim2 = dataclasses.replace(claim2, attempt_count=attempt_number)
     assert claim2.attempt_count == 2
 
     # 6. Transient failure for attempt 2 with claim2.max_attempts reached
@@ -138,6 +154,7 @@ async def test_transient_failure_scheduling_and_claiming(
         normalized_url=claim2.normalized_url,
         normalized_domain=claim2.normalized_domain,
         lease_owner=claim2.lease_owner,
+        fence_token=claim2.fence_token,
         attempt_count=2,
         max_attempts=2,
         lease_expires_at=claim2.lease_expires_at,

@@ -150,6 +150,9 @@ class ScanJob(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
+    last_claimed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
 
     # Relationships
     organization: Mapped[Organization] = relationship(back_populates="scan_jobs")

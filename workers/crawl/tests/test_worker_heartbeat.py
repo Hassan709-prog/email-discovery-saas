@@ -52,6 +52,7 @@ async def seeded_scanning_url(
                 normalized_domain="example.com",
                 status=ScanURLStatus.SCANNING.value,
                 lease_owner="worker-hb-1",
+                fence_token=1,
                 attempt_count=1,
             )
             session.add_all([job, url])
@@ -64,6 +65,7 @@ async def seeded_scanning_url(
         normalized_url="https://example.com/",
         normalized_domain="example.com",
         lease_owner="worker-hb-1",
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=None,  # type: ignore
@@ -95,9 +97,6 @@ async def test_heartbeat_observes_job_cancellation_fast(
 
     cancel_event = asyncio.Event()
     lease_lost_event = asyncio.Event()
-    hb_task = asyncio.create_task(
-        worker._run_heartbeat(claim, cancel_event, lease_lost_event)  # pyright: ignore[reportPrivateUsage]
-    )
 
     # Mark job CANCELLING in DB
     async with session_factory() as session:
@@ -105,9 +104,12 @@ async def test_heartbeat_observes_job_cancellation_fast(
             job = (await session.execute(select(ScanJob).where(ScanJob.id == job_id))).scalar_one()
             job.status = ScanJobStatus.CANCELLING.value
 
-    # Wait for heartbeat to run and observe cancellation
-    await asyncio.sleep(0.15)
+    hb_task = asyncio.create_task(
+        worker._run_heartbeat(claim, cancel_event, lease_lost_event)  # pyright: ignore[reportPrivateUsage]
+    )
 
+    # Wait for the heartbeat signal itself instead of assuming database scheduling latency.
+    await asyncio.wait_for(cancel_event.wait(), timeout=1.0)
     assert cancel_event.is_set()
     hb_task.cancel()
     await asyncio.gather(hb_task, return_exceptions=True)

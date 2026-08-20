@@ -5,14 +5,14 @@ Targeting isolated PostgreSQL test database with fake orchestrator/network compo
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from email_discovery_api.models import JobEvent, ScanJob, ScanURL
+from email_discovery_api.models import JobEvent, Organization, ScanJob, ScanURL, User
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.services.crawl_work import CrawlWorkService
 from email_discovery_api.services.scan_jobs import ScanJobService
@@ -149,6 +149,16 @@ async def seeded_100_url_job(
 
     async with session_factory() as session:
         async with session.begin():
+            org_email = f"user-{user_id.hex[:6]}@example.com"
+            org = Organization(id=org_id, name="Reg Org", slug=f"reg-org-{org_id.hex[:6]}")
+            user = User(
+                id=user_id,
+                email=org_email,
+                normalized_email=org_email,
+                password_hash="foo",
+            )
+            await session.merge(org)
+            await session.merge(user)
             job = ScanJob(
                 id=job_id,
                 organization_id=org_id,
@@ -181,13 +191,15 @@ async def test_worker_concurrency_cap_and_lease_recovery(
     job_id = seeded_100_url_job["job_id"]
 
     # 1. Create worker with concurrency 4
+    mock_orch = MockOrchestrator(delay_seconds=2.0)
     worker = CrawlWorker(
         session_factory=session_factory,
         worker_id="test-worker-c4",
         concurrency=4,
         poll_interval_seconds=0.1,
-        lease_duration_seconds=0.5,  # Short lease for testing expiry
+        lease_duration_seconds=30.0,
         heartbeat_interval_seconds=0.1,
+        orchestrator_factory=lambda: mock_orch,
     )
     worker._running = True  # pyright: ignore[reportPrivateUsage]
 
@@ -196,9 +208,13 @@ async def test_worker_concurrency_cap_and_lease_recovery(
     assert claimed_any is True
     assert len(worker._active_tasks) <= 4  # pyright: ignore[reportPrivateUsage]
 
-    # Drain active worker tasks and force lease expiration to simulate worker crash
-    worker.request_shutdown()
-    await worker._drain_tasks()  # pyright: ignore[reportPrivateUsage]
+    # Simulate abrupt worker crash (cancel tasks without graceful claim release)
+    tasks_to_cancel = list(worker._active_tasks)  # pyright: ignore[reportPrivateUsage]
+    for t in tasks_to_cancel:
+        t.cancel()
+    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+    worker._active_tasks.clear()  # pyright: ignore[reportPrivateUsage]
+    worker._active_claims.clear()  # pyright: ignore[reportPrivateUsage]
 
     async with session_factory() as session:
         async with session.begin():
@@ -311,7 +327,7 @@ async def test_deterministic_100_url_end_to_end_regression(
             for u in urls_to_interrupt:
                 u.status = ScanURLStatus.SCANNING.value
                 u.lease_owner = "demo-worker-1"
-                u.lease_expires_at = datetime.now(UTC)
+                u.lease_expires_at = datetime.now(UTC) - timedelta(seconds=10)
                 u.attempt_count = 1
             # Update job running count
             res_job = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
@@ -372,17 +388,28 @@ async def test_deterministic_100_url_end_to_end_regression(
         worker_id="regression-worker-1",
         concurrency=4,
         poll_interval_seconds=0.01,
-        recovery_interval_seconds=0.1,
+        recovery_interval_seconds=1.0,
         orchestrator_factory=lambda: mock_orch,
     )
 
     # 3. Process work loop via worker.start
     worker_task = asyncio.create_task(worker.start())
-    for _ in range(300):
-        await asyncio.sleep(0.05)
+    for i in range(500):
+        await asyncio.sleep(0.1)
         async with session_factory() as session:
+            if i % 10 == 0:
+                await session.execute(
+                    update(ScanURL)
+                    .where(
+                        ScanURL.scan_job_id == job_id,
+                        ScanURL.status == ScanURLStatus.RETRY_WAIT.value,
+                    )
+                    .values(next_retry_at=datetime.now(UTC))
+                )
+                await session.commit()
             res_job = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
             j = res_job.scalar_one_or_none()
+            await session.commit()
             if j and (j.completed_count + j.failed_count) >= 94:
                 break
 

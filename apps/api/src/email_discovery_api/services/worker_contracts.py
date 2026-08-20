@@ -21,9 +21,12 @@ class URLClaim:
     normalized_url: str | None
     normalized_domain: str | None
     lease_owner: str
+    fence_token: int
     attempt_count: int
     max_attempts: int
     lease_expires_at: datetime
+    claimed_from_status: str | None = None
+    claimed_from_next_retry_at: datetime | None = None
 
 
 class HeartbeatStatus(StrEnum):

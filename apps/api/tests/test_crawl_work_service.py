@@ -86,7 +86,7 @@ async def test_claim_next_url_updates_status_and_counters(
     assert claim is not None
     assert claim.job_id == job_id
     assert claim.lease_owner == "worker-1"
-    assert claim.attempt_count == 1
+    assert claim.attempt_count == 0
     assert claim.lease_expires_at is not None
 
     async with session_factory() as session:
@@ -119,7 +119,7 @@ async def test_renew_lease_fencing_and_expiry_check(
         res = await service.renew_lease(
             scan_url_id=claim.scan_url_id,
             lease_owner="worker-1",
-            attempt_count=claim.attempt_count,
+            fence_token=claim.fence_token,
             lease_duration_seconds=60.0,
         )
     assert res.status == HeartbeatStatus.RENEWED
@@ -131,7 +131,7 @@ async def test_renew_lease_fencing_and_expiry_check(
         res_lost = await service.renew_lease(
             scan_url_id=claim.scan_url_id,
             lease_owner="worker-wrong",
-            attempt_count=claim.attempt_count,
+            fence_token=claim.fence_token,
         )
     assert res_lost.status == HeartbeatStatus.LEASE_LOST
 
@@ -139,7 +139,7 @@ async def test_renew_lease_fencing_and_expiry_check(
 async def test_recover_expired_leases_reclaims_expired_urls(
     seeded_job_and_urls: dict[str, Any],
 ) -> None:
-    """Verify recover_expired_leases transitions expired SCANNING URLs to RETRY_WAIT."""
+    """Verify an expired claim with no started attempt returns to its source queue."""
     session_factory = seeded_job_and_urls["session_factory"]
 
     async with session_factory() as session:
@@ -159,5 +159,5 @@ async def test_recover_expired_leases_reclaims_expired_urls(
     async with session_factory() as session:
         url_res = await session.execute(select(ScanURL).where(ScanURL.id == claim.scan_url_id))
         url = url_res.scalar_one()
-        assert url.status == ScanURLStatus.RETRY_WAIT.value
+        assert url.status == ScanURLStatus.QUEUED.value
         assert url.lease_owner is None

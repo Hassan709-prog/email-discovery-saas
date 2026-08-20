@@ -26,6 +26,8 @@ ignore = ["B008"]
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
 include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests", "workers/crawl/src", "workers/crawl/tests"]
 extraPaths = ["packages/scanner/src", "apps/api/src", "workers/crawl/src"]
 

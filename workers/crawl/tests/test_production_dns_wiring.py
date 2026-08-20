@@ -50,6 +50,7 @@ async def test_default_crawl_worker_wires_shared_dns_cache_and_single_flight() -
         normalized_url="http://example.com/page1",
         normalized_domain="example.com",
         lease_owner=worker.worker_id,
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=MagicMock(),
@@ -63,6 +64,7 @@ async def test_default_crawl_worker_wires_shared_dns_cache_and_single_flight() -
         normalized_url="http://example.com/page2",
         normalized_domain="example.com",
         lease_owner=worker.worker_id,
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=MagicMock(),
@@ -96,15 +98,18 @@ async def test_default_crawl_worker_wires_shared_dns_cache_and_single_flight() -
             "email_discovery_crawl_worker.worker.ResultPersistenceService"
         ) as mock_persistence_cls,
         patch("email_discovery_crawl_worker.worker.CrawlWorkService") as mock_work_cls,
+        patch("email_discovery_crawl_worker.worker.ScanJobService") as mock_job_cls,
     ):
         mock_work = MagicMock()
         mock_work.claim_next_url = AsyncMock(side_effect=[claim1, claim2, None])
         mock_work.recover_expired_leases = AsyncMock(return_value=0)
+        mock_work.mark_attempt_started = AsyncMock(return_value=1)
         mock_work_cls.return_value = mock_work
 
         mock_persist = MagicMock()
-        mock_persist.persist_site_scan_result = AsyncMock()
+        mock_persist.persist_fenced_result = AsyncMock()
         mock_persistence_cls.return_value = mock_persist
+        mock_job_cls.return_value.try_finalize_job = AsyncMock()
 
         # Run claim task 1
         await worker._process_claim_task(claim1)
@@ -298,6 +303,7 @@ async def test_custom_orchestrator_factory_compatibility() -> None:
         normalized_url="http://custom-factory.org",
         normalized_domain="custom-factory.org",
         lease_owner=worker.worker_id,
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=MagicMock(),
@@ -306,10 +312,13 @@ async def test_custom_orchestrator_factory_compatibility() -> None:
     with (
         patch("email_discovery_crawl_worker.worker.ResultPersistenceService") as mock_persist_cls,
         patch("email_discovery_crawl_worker.worker.CrawlWorkService") as mock_work_cls,
+        patch("email_discovery_crawl_worker.worker.ScanJobService") as mock_job_cls,
     ):
         mock_work_cls.return_value.claim_next_url = AsyncMock(return_value=claim)
         mock_work_cls.return_value.recover_expired_leases = AsyncMock(return_value=0)
-        mock_persist_cls.return_value.persist_site_scan_result = AsyncMock()
+        mock_work_cls.return_value.mark_attempt_started = AsyncMock(return_value=1)
+        mock_persist_cls.return_value.persist_fenced_result = AsyncMock()
+        mock_job_cls.return_value.try_finalize_job = AsyncMock()
 
         await worker._process_claim_task(claim)
 

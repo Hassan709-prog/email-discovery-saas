@@ -16,7 +16,7 @@ from email_discovery_api.mappers.crawl_results import (
     sanitize_text,
     sanitize_url,
 )
-from email_discovery_api.models.enums import ScanURLStatus
+from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
 from email_discovery_api.models.scan_url import ScanURL
 from email_discovery_api.repositories.crawl_results import (
@@ -129,6 +129,7 @@ class ResultPersistenceService:
                 normalized_url=raw_url.normalized_url,
                 normalized_domain=raw_url.normalized_domain,
                 lease_owner=raw_url.lease_owner,
+                fence_token=raw_url.fence_token,
                 attempt_count=raw_url.attempt_count,
                 max_attempts=raw_url.max_attempts,
                 lease_expires_at=raw_url.lease_expires_at
@@ -170,6 +171,11 @@ class ResultPersistenceService:
         current_time = now or datetime.now(UTC)
         self._policy.validate_site_scan_result(site_scan_result)
 
+        attempt_number = claim.attempt_count
+        assert attempt_number >= 1, (
+            f"Authoritative attempt_number must be >= 1, got {attempt_number}"
+        )
+
         (
             mapped_attempt,
             mapped_pages,
@@ -178,7 +184,7 @@ class ResultPersistenceService:
             mapped_rejected,
         ) = map_site_scan_result(
             site_scan_result=site_scan_result,
-            attempt_number=claim.attempt_count,
+            attempt_number=attempt_number,
             now=current_time,
             policy=self._policy,
         )
@@ -198,21 +204,46 @@ class ResultPersistenceService:
         # 0. Acquire job lock first to prevent lock order deadlocks during FK checks
         job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
 
-        # Strict fencing check requiring lease_expires_at > clock_timestamp()
+        if job and job.status in (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value):
+            # Parent job is cancelled: update ScanURL to CANCELLED without inserting findings
+            stmt_cancel = (
+                update(ScanURL)
+                .where(
+                    ScanURL.id == claim.scan_url_id,
+                    ScanURL.status == ScanURLStatus.SCANNING.value,
+                    ScanURL.lease_owner == claim.lease_owner,
+                    ScanURL.fence_token == claim.fence_token,
+                )
+                .values(
+                    status=ScanURLStatus.CANCELLED.value,
+                    completed_at=current_time,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claimed_from_status=None,
+                    claimed_from_next_retry_at=None,
+                    attempt_started_at=None,
+                    attempt_started_fence_token=None,
+                    last_error_code="JOB_CANCELLED",
+                )
+            )
+            await self._session.execute(stmt_cancel)
+            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.fence_token)
+
+        # Strict 5-predicate fencing check requiring lease_expires_at > clock_timestamp()
         stmt_check = (
             update(ScanURL)
             .where(
                 ScanURL.id == claim.scan_url_id,
                 ScanURL.status == ScanURLStatus.SCANNING.value,
                 ScanURL.lease_owner == claim.lease_owner,
-                ScanURL.attempt_count == claim.attempt_count,
+                ScanURL.fence_token == claim.fence_token,
                 ScanURL.lease_expires_at > func.clock_timestamp(),
             )
             .values(updated_at=func.clock_timestamp())
         )
         fence_res = await self._session.execute(stmt_check)
         if int(getattr(fence_res, "rowcount", 0)) == 0:
-            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
+            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.fence_token)
 
         target_status, err_code = map_outcome_to_url_status(
             site_scan_result.outcome, len(mapped_findings)

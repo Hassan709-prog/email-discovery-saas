@@ -22,6 +22,7 @@ async def test_worker_fills_concurrency_capacity_immediately() -> None:
             normalized_url=f"https://example.com/{i}",
             normalized_domain="example.com",
             lease_owner="worker-test",
+            fence_token=1,
             attempt_count=1,
             max_attempts=3,
             lease_expires_at=MagicMock(),
@@ -73,12 +74,17 @@ async def test_worker_fills_concurrency_capacity_immediately() -> None:
 
     with (
         patch("email_discovery_crawl_worker.worker.CrawlWorkService") as mock_work_cls,
-        patch("email_discovery_crawl_worker.worker.ResultPersistenceService"),
-        patch("email_discovery_crawl_worker.worker.ScanJobService"),
+        patch(
+            "email_discovery_crawl_worker.worker.ResultPersistenceService"
+        ) as mock_persistence_cls,
+        patch("email_discovery_crawl_worker.worker.ScanJobService") as mock_job_cls,
     ):
         mock_service_inst = MagicMock()
         mock_service_inst.claim_next_url = AsyncMock(side_effect=mock_claim_next_url)
+        mock_service_inst.mark_attempt_started = AsyncMock(return_value=1)
         mock_work_cls.return_value = mock_service_inst
+        mock_persistence_cls.return_value.persist_fenced_result = AsyncMock()
+        mock_job_cls.return_value.try_finalize_job = AsyncMock()
 
         worker._running = True  # pyright: ignore[reportPrivateUsage]
         claimed_any = await worker._fill_capacity_and_claim()  # pyright: ignore[reportPrivateUsage]

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     TIMESTAMP,
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -102,6 +103,17 @@ class ScanURL(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     next_retry_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    fence_token: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    attempt_started_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    attempt_started_fence_token: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    claimed_from_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    claimed_from_next_retry_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
     started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)

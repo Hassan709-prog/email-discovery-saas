@@ -1,12 +1,9 @@
-# Development PostgreSQL and Redis services for Email Discovery SaaS.
+# Development PostgreSQL, Redis, and Crawl Worker services for Email Discovery SaaS.
 # Usage:
 #   Start infrastructure: docker compose --env-file .env.example -f infra/docker/docker-compose.yml up -d
+#   Start 2 worker replicas: docker compose --env-file .env.example -f infra/docker/docker-compose.yml up -d --scale worker=2
 #   Stop infrastructure:  docker compose --env-file .env.example -f infra/docker/docker-compose.yml stop
 #   Remove (keep data):   docker compose --env-file .env.example -f infra/docker/docker-compose.yml down
-#   Remove (delete data): docker compose --env-file .env.example -f infra/docker/docker-compose.yml down -v
-#
-# Note: Unauthenticated localhost Redis exposure is strictly for local development.
-# Production environments require private networking and authenticated redis:// or rediss:// configuration.
 
 services:
   postgres:
@@ -37,6 +34,21 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.worker
+    profiles: ["workers"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-email_discovery}
+      REDIS_URL: redis://redis:6379/0
+      CONCURRENCY: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:

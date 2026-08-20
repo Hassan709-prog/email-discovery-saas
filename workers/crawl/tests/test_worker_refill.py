@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from email_discovery_api.services.worker_contracts import URLClaim
-from email_discovery_crawl_worker.worker import CrawlWorker
+from email_discovery_crawl_worker.worker import CrawlWorker, WorkerState
 from email_scanner.models import SiteScanResult, SiteScanStatistics
 
 
@@ -30,6 +30,7 @@ async def test_worker_refills_capacity_immediately_on_task_completion() -> None:
             normalized_url=url_str,
             normalized_domain=f"site-{idx}.org",
             lease_owner=lease_owner,
+            fence_token=1,
             attempt_count=1,
             max_attempts=3,
             lease_expires_at=MagicMock(),
@@ -80,13 +81,21 @@ async def test_worker_refills_capacity_immediately_on_task_completion() -> None:
 
     with (
         patch("email_discovery_crawl_worker.worker.CrawlWorkService") as mock_work_cls,
-        patch("email_discovery_crawl_worker.worker.ResultPersistenceService"),
-        patch("email_discovery_crawl_worker.worker.ScanJobService"),
+        patch(
+            "email_discovery_crawl_worker.worker.ResultPersistenceService"
+        ) as mock_persistence_cls,
+        patch("email_discovery_crawl_worker.worker.ScanJobService") as mock_job_cls,
     ):
         mock_service_inst = MagicMock()
         mock_service_inst.claim_next_url = AsyncMock(side_effect=mock_claim_next_url)
         mock_service_inst.recover_expired_leases = AsyncMock(return_value=0)
+        mock_service_inst.mark_attempt_started = AsyncMock(return_value=1)
         mock_work_cls.return_value = mock_service_inst
+        mock_persistence_cls.return_value.persist_fenced_result = AsyncMock()
+        mock_job_cls.return_value.try_finalize_job = AsyncMock()
+        worker._init_redis = AsyncMock(  # pyright: ignore[reportPrivateUsage]
+            side_effect=lambda: setattr(worker, "state", WorkerState.ACTIVE)
+        )
 
         # Run worker.start() as a task and stop after max_scans
         worker_task = asyncio.create_task(worker.start())

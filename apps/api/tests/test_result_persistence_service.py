@@ -150,6 +150,7 @@ async def test_persist_fenced_result_completed_no_emails(
                 normalized_domain="no-emails.com",
                 status=ScanURLStatus.SCANNING.value,
                 lease_owner="w1",
+                fence_token=1,
                 attempt_count=1,
                 lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
@@ -163,6 +164,7 @@ async def test_persist_fenced_result_completed_no_emails(
         normalized_url="https://no-emails.com/",
         normalized_domain="no-emails.com",
         lease_owner="w1",
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
@@ -244,6 +246,7 @@ async def test_persist_site_scan_result_success_first_delivery() -> None:
         )
     )
     service_any._attempt_repo.get_by_scan_url_and_attempt = AsyncMock(return_value=None)
+    service_any._scan_job_repo.get_job_for_update = AsyncMock(return_value=None)
 
     created_attempt = CrawlAttempt(
         id=uuid.uuid4(),
@@ -378,6 +381,7 @@ async def test_persist_fenced_result_with_valid_claim() -> None:
         normalized_url="https://example.com",
         normalized_domain="example.com",
         lease_owner="w1",
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
@@ -387,6 +391,7 @@ async def test_persist_fenced_result_with_valid_claim() -> None:
     service_any: Any = service
 
     service_any._attempt_repo.get_by_scan_url_and_attempt = AsyncMock(return_value=None)
+    service_any._scan_job_repo.get_job_for_update = AsyncMock(return_value=None)
     created_attempt = CrawlAttempt(
         id=uuid.uuid4(),
         scan_url_id=scan_url_id,

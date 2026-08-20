@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import redis.asyncio as redis
-from redis.exceptions import NoScriptError, RedisError
+from redis.exceptions import NoScriptError
 
 from email_scanner.models import NormalizedURL
 from email_scanner.request_gate import DomainRequestGate, RequestGateProtocol, get_domain_key
@@ -202,18 +202,17 @@ class RedisDomainRequestGate(RequestGateProtocol):
 
         learned_delay_ms = int(self._learned_crawl_delays.get(domain_digest, 0.0) * 1000)
 
-        sha = await self._ensure_script_loaded()
-        keys = [redis_key]
-        argv = [
-            str(self.settings.min_domain_interval_ms),
-            str(learned_delay_ms),
-            str(self.settings.max_domain_interval_ms),
-            str(self.settings.max_reservation_horizon_ms),
-            str(self.settings.min_ttl_ms),
-            str(self.settings.max_ttl_ms),
-        ]
-
         try:
+            sha = await self._ensure_script_loaded()
+            keys = [redis_key]
+            argv = [
+                str(self.settings.min_domain_interval_ms),
+                str(learned_delay_ms),
+                str(self.settings.max_domain_interval_ms),
+                str(self.settings.max_reservation_horizon_ms),
+                str(self.settings.min_ttl_ms),
+                str(self.settings.max_ttl_ms),
+            ]
             try:
                 raw_res = await asyncio.wait_for(
                     cast(Any, self.client.evalsha(sha, len(keys), *keys, *argv)),
@@ -249,7 +248,7 @@ class RedisDomainRequestGate(RequestGateProtocol):
 
             raise ValueError(f"Unexpected Redis rate limit Lua return status: {res_status}")
 
-        except (TimeoutError, RedisError) as exc:
+        except Exception as exc:
             logger.warning(
                 "Redis domain rate limit operation failed [code=REDIS_GATE_FAILED, error_type=%s]",
                 type(exc).__name__,

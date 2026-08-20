@@ -25,6 +25,7 @@ async def test_worker_owned_orchestrator_closed_in_finally() -> None:
         normalized_url="https://example.com",
         normalized_domain="example.com",
         lease_owner="w1",
+        fence_token=1,
         attempt_count=1,
         max_attempts=3,
         lease_expires_at=datetime.now(UTC),
@@ -44,8 +45,10 @@ async def test_worker_owned_orchestrator_closed_in_finally() -> None:
             "email_discovery_crawl_worker.worker.SiteScanOrchestrator",
             return_value=mock_orchestrator,
         ),
+        patch("email_discovery_crawl_worker.worker.CrawlWorkService") as mock_work_cls,
         patch("email_discovery_crawl_worker.worker.ResultPersistenceService"),
         patch("email_discovery_crawl_worker.worker.ScanJobService"),
     ):
+        mock_work_cls.return_value.mark_attempt_started = AsyncMock(return_value=1)
         await worker._process_claim_task(claim)  # pyright: ignore[reportPrivateUsage]
         mock_orchestrator.close.assert_called_once()

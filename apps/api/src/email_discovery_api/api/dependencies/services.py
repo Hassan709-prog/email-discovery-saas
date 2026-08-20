@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from email_discovery_api.database import get_db_session
 from email_discovery_api.services.analytics import AnalyticsService
 from email_discovery_api.services.auth import AuthService
+from email_discovery_api.services.operations import OperationalService
 from email_discovery_api.services.results import ScanJobResultsService
 from email_discovery_api.services.scan_jobs import ScanJobService
 
@@ -50,3 +51,16 @@ def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
 def get_redis_publisher(request: Request) -> Any:
     """Dependency injecting the application-owned APIRedisClient publisher."""
     return request.app.state.redis_manager
+
+
+async def get_operational_service(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> OperationalService:
+    """Inject the bounded operational service using application-owned dependencies."""
+    return OperationalService(
+        session,
+        db_manager=request.app.state.db_manager,
+        redis_manager=request.app.state.redis_manager,
+        settings=request.app.state.settings,
+    )

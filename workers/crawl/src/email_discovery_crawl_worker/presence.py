@@ -32,7 +32,7 @@ class WorkerPresenceManager:
         self.instance_digest = derive_instance_digest(settings.instance_id)
         self.key_prefix = settings.redis_key_prefix
         self.presence_key = f"{self.key_prefix}:workers:{self.instance_digest}"
-        self.worker_label = settings.worker_label or settings.worker_id or "unnamed_worker"
+        self.registry_key = f"{self.key_prefix}:workers:presence_registry"
 
     async def update_presence(
         self,
@@ -47,18 +47,21 @@ class WorkerPresenceManager:
 
             payload = {
                 "instance_id_digest": self.instance_digest,
-                "worker_label": self.worker_label,
                 "state": state,
                 "concurrency": self.settings.concurrency,
                 "active_claims": active_claims_count,
                 "last_seen_redis_time_ms": now_ms,
             }
 
-            await self.redis.set(
-                self.presence_key,
-                json.dumps(payload),
-                ex=ttl_seconds,
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.set(self.presence_key, json.dumps(payload), ex=ttl_seconds)
+            pipeline.zadd(self.registry_key, {self.instance_digest: now_ms})
+            pipeline.zremrangebyscore(
+                self.registry_key,
+                0,
+                now_ms - int(24 * 60 * 60 * 1000),
             )
+            await pipeline.execute()
             return True
         except RedisError as exc:
             logger.warning(
@@ -71,6 +74,9 @@ class WorkerPresenceManager:
     async def remove_presence(self) -> None:
         """Remove worker presence key on graceful shutdown."""
         try:
-            await self.redis.delete(self.presence_key)
+            pipeline = self.redis.pipeline(transaction=False)
+            pipeline.delete(self.presence_key)
+            pipeline.zrem(self.registry_key, self.instance_digest)
+            await pipeline.execute()
         except RedisError:
             pass

@@ -26,7 +26,7 @@ from email_discovery_api.services.worker_contracts import (
     URLClaim,
 )
 from email_discovery_crawl_worker.config import WorkerSettings, get_worker_settings
-from email_discovery_crawl_worker.presence import WorkerPresenceManager
+from email_discovery_crawl_worker.presence import WorkerPresenceManager, derive_instance_digest
 from email_discovery_crawl_worker.redis_gate import RedisDomainRequestGate
 from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.request_gate import DomainRequestGate
@@ -179,9 +179,8 @@ class CrawlWorker:
                 settings=self.settings,
             )
             logger.info(
-                "Worker %s (instance=%s) connected to Redis.",
-                self.worker_label,
-                self.instance_id[:8],
+                "event_code=WORKER_REDIS_READY instance_digest=%s",
+                derive_instance_digest(self.instance_id),
             )
         except Exception as exc:
             if self.settings.redis_required:
@@ -196,7 +195,8 @@ class CrawlWorker:
                 local_fallback_gate=self.local_gate,
             )
             logger.warning(
-                "Worker Redis probe failed [code=WORKER_REDIS_INIT_FAILED, error_type=%s]",
+                "event_code=WORKER_REDIS_DEGRADED instance_digest=%s error_type=%s",
+                derive_instance_digest(self.instance_id),
                 type(exc).__name__,
             )
 
@@ -297,6 +297,12 @@ class CrawlWorker:
 
     async def run(self) -> None:
         """Main worker execution loop."""
+        logger.info(
+            "event_code=WORKER_STARTING instance_digest=%s concurrency=%d fallback_mode=%s",
+            derive_instance_digest(self.instance_id),
+            self.concurrency,
+            self.settings.redis_rate_limit_fallback_mode,
+        )
         self._running = True
         self._shutdown_event.clear()
         now = time.monotonic()
@@ -304,7 +310,10 @@ class CrawlWorker:
 
         await self._init_redis()
         if self.state == WorkerState.FAILED_STARTUP:
-            logger.error("Startup failed for worker %s.", self.worker_label)
+            logger.error(
+                "event_code=WORKER_STARTUP_FAILED instance_digest=%s",
+                derive_instance_digest(self.instance_id),
+            )
             return
 
         self._pubsub_task = asyncio.create_task(self._run_pubsub_listener())
@@ -316,14 +325,17 @@ class CrawlWorker:
                 work_service = CrawlWorkService(session)
                 recovered = await work_service.recover_expired_leases()
                 if recovered > 0:
-                    logger.info("Startup recovered %d expired leases.", recovered)
+                    logger.info(
+                        "event_code=WORKER_RECOVERY_SUMMARY instance_digest=%s recovered=%d",
+                        derive_instance_digest(self.instance_id),
+                        recovered,
+                    )
         except Exception:
             logger.warning("Startup lease recovery exception.", exc_info=True)
 
         logger.info(
-            "CrawlWorker %s (instance=%s) started (concurrency=%d, state=%s).",
-            self.worker_label,
-            self.instance_id[:8],
+            "event_code=WORKER_READY instance_digest=%s concurrency=%d state=%s",
+            derive_instance_digest(self.instance_id),
             self.concurrency,
             self.state.value,
         )
@@ -395,9 +407,9 @@ class CrawlWorker:
     def request_shutdown(self) -> None:
         """Signal graceful worker shutdown without failing running jobs."""
         logger.info(
-            "Shutdown requested for worker %s (instance=%s).",
-            self.worker_label,
-            self.instance_id[:8],
+            "event_code=WORKER_SHUTDOWN_REQUESTED instance_digest=%s active_claims=%d",
+            derive_instance_digest(self.instance_id),
+            self.total_held_claims,
         )
         self.state = WorkerState.DRAINING
         self._running = False
@@ -491,6 +503,11 @@ class CrawlWorker:
         await self.single_flight.shutdown()
         await self.dns_cache.clear()
         self.state = WorkerState.STOPPED
+        logger.info(
+            "event_code=WORKER_STOPPED instance_digest=%s processed=%d",
+            derive_instance_digest(self.instance_id),
+            self._processed_count,
+        )
 
     async def _fill_capacity_and_claim(self) -> bool:
         """Poll and claim repeatedly up to total_held_claims limit."""

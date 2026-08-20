@@ -39,4 +39,5 @@ exports/
 # Benchmark and Audit outputs
 .benchmark-output/
 .consistency-audit-output/
+.operational-load-output/
 *.log

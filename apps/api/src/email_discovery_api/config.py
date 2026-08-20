@@ -2,6 +2,7 @@
 
 import math
 from functools import lru_cache
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,6 +19,24 @@ class Settings(BaseSettings):
         default=False,
         validation_alias="ALLOW_DEV_IDENTITY_HEADERS",
         description="Allow development X-Dev-User-ID and X-Dev-Organization-ID identity headers",
+    )
+    operations_enabled: bool = Field(
+        default=False,
+        description="Enable the private system operations API.",
+    )
+    operations_admin_user_ids: str = Field(
+        default="",
+        description="Comma-separated user UUID allowlist for the system operations API.",
+    )
+    operations_query_timeout_seconds: float = Field(
+        default=2.0,
+        description="Bound for each operational database or Redis request.",
+    )
+    operations_max_presence_records: int = Field(
+        default=256,
+        ge=1,
+        le=512,
+        description="Maximum advisory worker presence records returned per request.",
     )
 
     # Database Settings
@@ -157,6 +176,16 @@ class Settings(BaseSettings):
     def get_database_url_str(self) -> str:
         """Return raw database URL string containing unmasked credentials."""
         return self.database_url.get_secret_value()
+
+    def get_operations_admin_user_ids(self) -> frozenset[UUID]:
+        """Parse the explicit operations allowlist without accepting malformed entries."""
+        if not self.operations_admin_user_ids.strip():
+            return frozenset()
+        return frozenset(
+            UUID(value.strip())
+            for value in self.operations_admin_user_ids.split(",")
+            if value.strip()
+        )
 
     def __repr__(self) -> str:
         """Sanitizing string representation to prevent password and key leaks in logs."""

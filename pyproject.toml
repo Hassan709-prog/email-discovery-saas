@@ -28,7 +28,7 @@ pythonVersion = "3.14"
 typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
-include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests", "workers/crawl/src", "workers/crawl/tests"]
+include = ["packages/scanner/src", "packages/scanner/tests", "apps/api/src", "apps/api/tests", "workers/crawl/src", "workers/crawl/tests", "tools", "tests/test_phase5c_operational_load.py"]
 extraPaths = ["packages/scanner/src", "apps/api/src", "workers/crawl/src"]
 
 
@@ -55,4 +55,4 @@ dev = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["email_scanner", "email_discovery_api", "email_discovery_crawl_worker"]
+known-first-party = ["email_scanner", "email_discovery_api", "email_discovery_crawl_worker", "tools"]

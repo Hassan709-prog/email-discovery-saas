@@ -1,3 +1,5 @@
 # Local Docker infrastructure
 
-Docker Compose configuration for PostgreSQL, Redis, object storage, and workers will be added in later phases.
+The Compose file provides PostgreSQL, advisory Redis coordination, and an optional Python worker
+profile. See `docs/operations/local-beta-runbook.md` for bounded startup, readiness, load testing,
+and graceful shutdown commands.

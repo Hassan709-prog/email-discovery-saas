@@ -244,7 +244,7 @@ class CrawlWorker:
                         pass
                     try:
                         await asyncio.shield(
-                            asyncio.wait_for(pubsub.close(), timeout=2.0)  # pyright: ignore[reportUnknownMemberType]
+                            asyncio.wait_for(pubsub.aclose(), timeout=2.0)  # pyright: ignore[reportUnknownMemberType]
                         )
                     except Exception:
                         pass
@@ -493,11 +493,9 @@ class CrawlWorker:
 
         if self.redis_pool is not None:
             try:
-                disc = self.redis_pool.disconnect()
-                if asyncio.iscoroutine(disc) or inspect.isawaitable(disc):
-                    await asyncio.wait_for(disc, timeout=2.0)
+                await asyncio.wait_for(self.redis_pool.aclose(), timeout=2.0)
             except Exception as exc:
-                logger.debug("Redis pool disconnect error: %s", type(exc).__name__)
+                logger.debug("Redis pool aclose error: %s", type(exc).__name__)
             self.redis_pool = None
 
         await self.single_flight.shutdown()

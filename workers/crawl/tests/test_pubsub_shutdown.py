@@ -28,7 +28,7 @@ async def test_pubsub_listener_cancellation_unsubscribes_and_closes() -> None:
     mock_pubsub = AsyncMock()
     mock_pubsub.subscribe = AsyncMock()
     mock_pubsub.unsubscribe = AsyncMock()
-    mock_pubsub.close = AsyncMock()
+    mock_pubsub.aclose = AsyncMock()
     mock_pubsub.get_message = AsyncMock(side_effect=asyncio.CancelledError)
 
     mock_redis = MagicMock()
@@ -60,7 +60,7 @@ async def test_pubsub_listener_cancellation_unsubscribes_and_closes() -> None:
         pass
 
     mock_pubsub.unsubscribe.assert_called()
-    mock_pubsub.close.assert_called()
+    mock_pubsub.aclose.assert_awaited_once()
 
 
 async def test_shutdown_completes_promptly_with_active_subscription(

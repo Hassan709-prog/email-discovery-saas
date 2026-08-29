@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from email_discovery_api.models import AuditLog, ScanJob, ScanURL
@@ -75,10 +75,12 @@ class OperationalService:
         prefix = self.settings.redis_key_prefix
         registry_key = f"{prefix}:workers:presence_registry"
         maximum = self.settings.operations_max_presence_records
+        if maximum <= 0:
+            return [], []
         stale_before_ms = int((now - timedelta(seconds=45)).timestamp() * 1000)
         try:
             raw_registry = await self._bounded(
-                client.zrevrange(registry_key, 0, maximum, withscores=True)
+                client.zrevrange(registry_key, 0, maximum - 1, withscores=True)
             )
             entries: list[tuple[str, float]] = []
             for member, score in raw_registry:
@@ -233,52 +235,123 @@ class OperationalService:
 
     async def diagnostics(self, limit: int) -> OperationalDiagnosticsResponse:
         now = datetime.now(UTC)
-        candidate_stmt = (
-            select(ScanJob)
+
+        job_stats = (
+            select(
+                ScanJob.id.label("job_id"),
+                ScanJob.valid_input_count,
+                ScanJob.queued_count,
+                ScanJob.running_count,
+                ScanJob.completed_count,
+                ScanJob.failed_count,
+                ScanJob.created_at,
+                func.coalesce(func.count().filter(ScanURL.status.in_(ACTIVE_URL_STATES)), 0).label(
+                    "active_urls"
+                ),
+                func.coalesce(
+                    func.count().filter(ScanURL.status.in_(TERMINAL_URL_STATES)), 0
+                ).label("terminal_urls"),
+                func.coalesce(
+                    func.count().filter(ScanURL.status.in_(("QUEUED", "RETRY_WAIT"))), 0
+                ).label("actual_queued"),
+                func.coalesce(
+                    func.count().filter(ScanURL.status.in_(("LEASED", "SCANNING"))), 0
+                ).label("actual_running"),
+                func.coalesce(
+                    func.count().filter(ScanURL.status.in_(("COMPLETED", "NO_EMAIL"))), 0
+                ).label("actual_completed"),
+                func.coalesce(
+                    func.count().filter(ScanURL.status.in_(("FAILED", "INVALID"))), 0
+                ).label("actual_failed"),
+            )
+            .select_from(ScanJob)
+            .outerjoin(ScanURL, ScanJob.id == ScanURL.scan_job_id)
             .where(ScanJob.status.in_(ACTIVE_JOB_STATES))
-            .order_by(ScanJob.created_at.asc(), ScanJob.id.asc())
-            .limit(limit + 1)
+            .group_by(
+                ScanJob.id,
+                ScanJob.valid_input_count,
+                ScanJob.queued_count,
+                ScanJob.running_count,
+                ScanJob.completed_count,
+                ScanJob.failed_count,
+                ScanJob.created_at,
+            )
+        ).subquery()
+
+        is_eligible = (job_stats.c.active_urls == 0) & (
+            job_stats.c.terminal_urls >= job_stats.c.valid_input_count
         )
-        jobs = list((await self._bounded(self.session.execute(candidate_stmt))).scalars().all())
-        selected_jobs = jobs[:limit]
-        job_ids = [job.id for job in selected_jobs]
-        counts_by_job: dict[UUID, dict[str, int]] = {job_id: {} for job_id in job_ids}
-        if job_ids:
-            count_stmt = (
-                select(ScanURL.scan_job_id, ScanURL.status, func.count())
-                .where(ScanURL.scan_job_id.in_(job_ids))
-                .group_by(ScanURL.scan_job_id, ScanURL.status)
-            )
-            for job_id, state, count in (
-                await self._bounded(self.session.execute(count_stmt))
-            ).all():
-                counts_by_job[job_id][state] = int(count)
+        is_inactive = (job_stats.c.active_urls == 0) & (
+            job_stats.c.terminal_urls < job_stats.c.valid_input_count
+        )
+        is_mismatch = (
+            (job_stats.c.actual_queued != job_stats.c.queued_count)
+            | (job_stats.c.actual_running != job_stats.c.running_count)
+            | (job_stats.c.actual_completed != job_stats.c.completed_count)
+            | (job_stats.c.actual_failed != job_stats.c.failed_count)
+        )
 
-        eligible: list[DiagnosticItem] = []
-        inactive: list[DiagnosticItem] = []
-        mismatches: list[DiagnosticItem] = []
-        for job in selected_jobs:
-            counts = counts_by_job[job.id]
-            active = sum(counts.get(state, 0) for state in ACTIVE_URL_STATES)
-            terminal = sum(counts.get(state, 0) for state in TERMINAL_URL_STATES)
-            digest = safe_digest(job.id)
-            if active == 0 and terminal >= job.valid_input_count:
-                eligible.append(DiagnosticItem(reference_digest=digest, reason="all_work_terminal"))
-            if active == 0 and terminal < job.valid_input_count:
-                inactive.append(DiagnosticItem(reference_digest=digest, reason="no_active_work"))
-            actual = (
-                counts.get("QUEUED", 0) + counts.get("RETRY_WAIT", 0),
-                counts.get("LEASED", 0) + counts.get("SCANNING", 0),
-                counts.get("COMPLETED", 0) + counts.get("NO_EMAIL", 0),
-                counts.get("FAILED", 0) + counts.get("INVALID", 0),
-            )
-            stored = (job.queued_count, job.running_count, job.completed_count, job.failed_count)
-            if actual != stored:
-                mismatches.append(
-                    DiagnosticItem(reference_digest=digest, reason="counter_mismatch")
-                )
+        q_eligible = select(
+            literal("eligible").label("category"),
+            job_stats.c.job_id,
+            literal("all_work_terminal").label("reason"),
+            func.row_number()
+            .over(order_by=(job_stats.c.created_at.asc(), job_stats.c.job_id.asc()))
+            .label("rn"),
+            func.count().over().label("cat_total"),
+        ).where(is_eligible)
 
-        async def due_items(kind: str) -> tuple[list[DiagnosticItem], bool]:
+        q_inactive = select(
+            literal("inactive").label("category"),
+            job_stats.c.job_id,
+            literal("no_active_work").label("reason"),
+            func.row_number()
+            .over(order_by=(job_stats.c.created_at.asc(), job_stats.c.job_id.asc()))
+            .label("rn"),
+            func.count().over().label("cat_total"),
+        ).where(is_inactive)
+
+        q_mismatch = select(
+            literal("mismatch").label("category"),
+            job_stats.c.job_id,
+            literal("counter_mismatch").label("reason"),
+            func.row_number()
+            .over(order_by=(job_stats.c.created_at.asc(), job_stats.c.job_id.asc()))
+            .label("rn"),
+            func.count().over().label("cat_total"),
+        ).where(is_mismatch)
+
+        combined_subq = union_all(q_eligible, q_inactive, q_mismatch).subquery()
+        classified_stmt = select(
+            combined_subq.c.category,
+            combined_subq.c.job_id,
+            combined_subq.c.reason,
+            combined_subq.c.cat_total,
+        ).where(combined_subq.c.rn <= limit)
+
+        classified_rows = (await self._bounded(self.session.execute(classified_stmt))).all()
+
+        eligible_items: list[DiagnosticItem] = []
+        eligible_total = 0
+        inactive_items: list[DiagnosticItem] = []
+        inactive_total = 0
+        mismatch_items: list[DiagnosticItem] = []
+        mismatch_total = 0
+
+        for cat, job_id, reason, cat_total in classified_rows:
+            digest = safe_digest(job_id)
+            item = DiagnosticItem(reference_digest=digest, reason=str(reason))
+            if cat == "eligible":
+                eligible_items.append(item)
+                eligible_total = int(cat_total)
+            elif cat == "inactive":
+                inactive_items.append(item)
+                inactive_total = int(cat_total)
+            elif cat == "mismatch":
+                mismatch_items.append(item)
+                mismatch_total = int(cat_total)
+
+        async def due_items(kind: str) -> tuple[list[DiagnosticItem], int]:
             if kind == "expired_lease":
                 predicate = (ScanURL.status.in_(("LEASED", "SCANNING"))) & (
                     ScanURL.lease_expires_at < now
@@ -287,30 +360,41 @@ class OperationalService:
             else:
                 predicate = (ScanURL.status == "RETRY_WAIT") & (ScanURL.next_retry_at <= now)
                 ordering = ScanURL.next_retry_at
-            stmt = (
-                select(ScanURL.id)
-                .where(predicate)
-                .order_by(ordering.asc(), ScanURL.id.asc())
-                .limit(limit + 1)
-            )
-            rows = list((await self._bounded(self.session.execute(stmt))).scalars().all())
-            return [
-                DiagnosticItem(reference_digest=safe_digest(row_id), reason=kind)
-                for row_id in rows[:limit]
-            ], len(rows) > limit
 
-        expired_items, expired_more = await due_items("expired_lease")
-        retry_items, retry_more = await due_items("retry_due")
+            subq = (
+                select(
+                    ScanURL.id,
+                    func.count().over().label("cat_total"),
+                    func.row_number().over(order_by=(ordering.asc(), ScanURL.id.asc())).label("rn"),
+                ).where(predicate)
+            ).subquery()
+
+            stmt = select(subq.c.id, subq.c.cat_total).where(subq.c.rn <= limit)
+            rows = list((await self._bounded(self.session.execute(stmt))).all())
+            if not rows:
+                return [], 0
+            items = [
+                DiagnosticItem(reference_digest=safe_digest(row_id), reason=kind)
+                for row_id, _ in rows
+            ]
+            cat_total = int(rows[0][1])
+            return items, cat_total
+
+        expired_items, expired_total = await due_items("expired_lease")
+        retry_items, retry_total = await due_items("retry_due")
         _, expired_presence = await self._read_presence(now)
+
         return OperationalDiagnosticsResponse(
             generated_at=now,
-            jobs_eligible_for_finalization=self._category(eligible, limit),
-            nonterminal_jobs_without_active_work=self._category(inactive, limit),
-            expired_leases=self._category(
-                expired_items, limit, len(expired_items) + int(expired_more)
+            jobs_eligible_for_finalization=self._category(
+                eligible_items, limit, total=eligible_total
             ),
-            due_retries=self._category(retry_items, limit, len(retry_items) + int(retry_more)),
-            counter_mismatches=self._category(mismatches, limit),
+            nonterminal_jobs_without_active_work=self._category(
+                inactive_items, limit, total=inactive_total
+            ),
+            expired_leases=self._category(expired_items, limit, total=expired_total),
+            due_retries=self._category(retry_items, limit, total=retry_total),
+            counter_mismatches=self._category(mismatch_items, limit, total=mismatch_total),
             expired_worker_presence=self._category(expired_presence, limit),
         )
 

@@ -36,3 +36,27 @@ class LoadRunReport(BaseModel):
     uncleared_claims: int = Field(ge=0)
     job_counters_match: bool
     shutdown_clean: bool
+
+
+class LoadRunFailureReport(BaseModel):
+    size: int
+    workers: int
+    error_type: str
+    error_message: str
+    phase: str
+    elapsed_seconds: float = Field(ge=0)
+    cleanup_errors: list[str] = Field(default_factory=list)
+    partial_report: LoadRunReport | None = None
+
+
+class OperationalLoadError(Exception):
+    """Sanitized, typed exception raised when an operational load run fails or
+    encounters cleanup errors.
+    """
+
+    def __init__(self, failure_report: LoadRunFailureReport) -> None:
+        self.report = failure_report
+        super().__init__(
+            f"Operational load run failed during {failure_report.phase}: "
+            f"[{failure_report.error_type}] {failure_report.error_message}"
+        )

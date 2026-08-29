@@ -20,6 +20,7 @@ import redis.asyncio as redis
 from pydantic import SecretStr
 from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -38,7 +39,7 @@ from email_discovery_api.services.worker_contracts import LeaseLostError, URLCla
 from email_discovery_crawl_worker.config import WorkerSettings
 from email_discovery_crawl_worker.worker import CrawlWorker
 from tools.operational_load.fixtures import ActivityTracker, DeterministicOfflineOrchestrator
-from tools.operational_load.models import LoadRunReport
+from tools.operational_load.models import LoadRunFailureReport, LoadRunReport, OperationalLoadError
 
 TERMINAL_URLS = ("COMPLETED", "NO_EMAIL", "FAILED", "CANCELLED")
 ALLOWED_SIZES = (100, 500, 1000)
@@ -262,6 +263,48 @@ async def _fence_audit(
     return stale_rejected and unchanged, expired_rejected and unchanged
 
 
+async def _stop_worker_tasks(
+    workers: Sequence[Any],
+    tasks: list[asyncio.Task[Any]],
+    timeout_seconds: float = 5.0,
+) -> list[str]:
+    errors: list[str] = []
+    if not workers and not tasks:
+        return errors
+
+    for worker in workers:
+        try:
+            worker.request_shutdown()
+        except Exception:
+            errors.append("Worker shutdown request error during cleanup stage")
+
+    if tasks:
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=min(2.0, timeout_seconds))
+            for task in done:
+                if not task.cancelled() and task.exception() is not None:
+                    errors.append("Worker task error during cleanup stage")
+
+            if pending:
+                for task in pending:
+                    task.cancel()
+                try:
+                    c_done, c_pending = await asyncio.wait(
+                        pending, timeout=min(2.0, timeout_seconds)
+                    )
+                    for task in c_done:
+                        if not task.cancelled() and task.exception() is not None:
+                            errors.append("Worker task error after cancellation")
+                    if c_pending:
+                        errors.append("Worker task cancellation timed out during cleanup stage")
+                except Exception:
+                    errors.append("Worker task cancellation gather error")
+        except Exception:
+            errors.append("Worker shutdown error during cleanup stage")
+
+    return errors
+
+
 async def run_load(
     *,
     size: int,
@@ -272,187 +315,387 @@ async def run_load(
 ) -> LoadRunReport:
     if size not in ALLOWED_SIZES or worker_count not in ALLOWED_WORKERS:
         raise ValueError("size must be 100/500/1000 and workers must be 1/2/4")
-    engine = create_async_engine(
-        database_url,
-        pool_size=max(4, worker_count * 2),
-        max_overflow=0,
-        pool_timeout=5,
-    )
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    client = redis.from_url(  # pyright: ignore[reportUnknownMemberType]
-        redis_url, decode_responses=True, max_connections=16
-    )
-    await asyncio.wait_for(
-        client.ping(),  # pyright: ignore[reportUnknownMemberType]
-        timeout=2,
-    )
-    connection_tracker = ConnectionTracker()
-    event.listen(engine.sync_engine, "checkout", connection_tracker.checkout)
-    event.listen(engine.sync_engine, "checkin", connection_tracker.checkin)
-    await _cleanup(session_factory, client, size)
-    job_id = await _seed(session_factory, size)
-    tracker = ActivityTracker()
-    settings = [
-        WorkerSettings(
-            instance_id=uuid.uuid5(NAMESPACE, f"worker:{size}:{worker_count}:{index}").hex,
-            concurrency=2,
-            poll_interval=0.02,
-            healthy_poll_interval=0.1,
-            degraded_poll_interval=0.05,
-            lease_duration=30,
-            heartbeat_interval=5,
-            redis_url=SecretStr(redis_url),
-            redis_required=True,
-            redis_key_prefix=f"phase5c:load:{size}",
-        )
-        for index in range(worker_count)
-    ]
-    workers = [
-        CrawlWorker(
-            session_factory,
-            concurrency=2,
-            poll_interval_seconds=0.02,
-            lease_duration_seconds=30,
-            heartbeat_interval_seconds=5,
-            recovery_interval_seconds=1,
-            orchestrator_factory=lambda: DeterministicOfflineOrchestrator(tracker),
-            worker_settings=worker_settings,
-        )
-        for worker_settings in settings
-    ]
-    redis_before = await _redis_commands(client)
-    tracemalloc.start()
-    tasks = [asyncio.create_task(worker.run()) for worker in workers]
-    try:
-        elapsed, peak_tasks, peak_claims = await _wait_terminal(
-            session_factory, job_id, workers, timeout_seconds
-        )
-    finally:
-        for worker in workers:
-            worker.request_shutdown()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=35)
-    _, peak_memory = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    redis_after = await _redis_commands(client)
 
-    async with session_factory() as session:
-        job = await session.get(ScanJob, job_id)
-        urls = list(
-            (await session.execute(select(ScanURL).where(ScanURL.scan_job_id == job_id))).scalars()
+    start_time = time.perf_counter()
+    engine: AsyncEngine | None = None
+    client: redis.Redis | None = None
+    session_factory: async_sessionmaker[AsyncSession] | None = None
+    connection_tracker: ConnectionTracker | None = None
+    workers: list[CrawlWorker] = []
+    tasks: list[asyncio.Task[Any]] = []
+    tracemalloc_started = False
+    phase = "setup"
+    run_exception: Exception | None = None
+    error_phase: str | None = None
+    partial_report: LoadRunReport | None = None
+    cleanup_errors: list[str] = []
+    peak_tasks = 0
+    peak_claims = 0
+    peak_memory = 0
+    redis_before = 0
+    redis_after = 0
+    job_id: uuid.UUID | None = None
+    terminal_reached = False
+
+    try:
+        engine = create_async_engine(
+            database_url,
+            pool_size=max(4, worker_count * 2),
+            max_overflow=0,
+            pool_timeout=5,
         )
-        attempts = list(
-            (
-                await session.execute(
-                    select(CrawlAttempt)
-                    .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
-                    .where(ScanURL.scan_job_id == job_id)
-                )
-            ).scalars()
+        session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+        client = redis.from_url(  # pyright: ignore[reportUnknownMemberType]
+            redis_url, decode_responses=True, max_connections=16
         )
-        findings = (
-            await session.execute(
-                select(
-                    EmailFinding.canonical_email,
-                    EmailFinding.email_domain,
-                    EmailFinding.classification,
-                    EmailFinding.validation_status,
-                    EmailFinding.is_role_based,
-                )
-                .where(EmailFinding.scan_job_id == job_id)
-                .order_by(EmailFinding.canonical_email.asc())
+        await asyncio.wait_for(
+            client.ping(),  # pyright: ignore[reportUnknownMemberType]
+            timeout=2,
+        )
+        connection_tracker = ConnectionTracker()
+        event.listen(engine.sync_engine, "checkout", connection_tracker.checkout)
+        event.listen(engine.sync_engine, "checkin", connection_tracker.checkin)
+
+        await _cleanup(session_factory, client, size)
+        job_id = await _seed(session_factory, size)
+
+        phase = "execution"
+        tracker = ActivityTracker()
+        settings = [
+            WorkerSettings(
+                instance_id=uuid.uuid5(NAMESPACE, f"worker:{size}:{worker_count}:{index}").hex,
+                concurrency=2,
+                poll_interval=0.02,
+                healthy_poll_interval=0.1,
+                degraded_poll_interval=0.05,
+                lease_duration=30,
+                heartbeat_interval=5,
+                redis_url=SecretStr(redis_url),
+                redis_required=True,
+                redis_key_prefix=f"phase5c:load:{size}",
             )
-        ).all()
-        duplicate_attempts = int(
-            await session.scalar(
-                select(func.count()).select_from(
-                    select(CrawlAttempt.scan_url_id, CrawlAttempt.attempt_number)
-                    .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
-                    .where(ScanURL.scan_job_id == job_id)
-                    .group_by(CrawlAttempt.scan_url_id, CrawlAttempt.attempt_number)
-                    .having(func.count() > 1)
-                    .subquery()
-                )
+            for index in range(worker_count)
+        ]
+        workers = [
+            CrawlWorker(
+                session_factory,
+                concurrency=2,
+                poll_interval_seconds=0.02,
+                lease_duration_seconds=30,
+                heartbeat_interval_seconds=5,
+                recovery_interval_seconds=1,
+                orchestrator_factory=lambda: DeterministicOfflineOrchestrator(tracker),
+                worker_settings=worker_settings,
             )
-            or 0
-        )
-        duplicate_findings = int(
-            await session.scalar(
-                select(func.count()).select_from(
-                    select(EmailFinding.scan_url_id, EmailFinding.canonical_email)
-                    .where(EmailFinding.scan_job_id == job_id)
-                    .group_by(EmailFinding.scan_url_id, EmailFinding.canonical_email)
-                    .having(func.count() > 1)
-                    .subquery()
-                )
+            for worker_settings in settings
+        ]
+        redis_before = await _redis_commands(client)
+        tracemalloc.start()
+        tracemalloc_started = True
+
+        tasks = [asyncio.create_task(worker.run()) for worker in workers]
+
+        phase = "wait_terminal"
+        try:
+            elapsed, peak_tasks, peak_claims = await _wait_terminal(
+                session_factory, job_id, workers, timeout_seconds
             )
-            or 0
+            terminal_reached = True
+        except Exception as exc:
+            run_exception = exc
+            error_phase = phase
+            elapsed = time.perf_counter() - start_time
+            terminal_reached = False
+
+        # Request worker shutdown and await task completion before metrics gathering
+        if workers:
+            try:
+                for worker in workers:
+                    worker.request_shutdown()
+                if tasks:
+                    done, pending = await asyncio.wait(tasks, timeout=10.0)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    for task in done:
+                        if not task.cancelled() and task.exception() is not None:
+                            cleanup_errors.append("Worker task error during execution")
+            except Exception:
+                cleanup_errors.append("Worker shutdown error during execution")
+
+        if tracemalloc_started:
+            _, peak_memory = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            tracemalloc_started = False
+
+        redis_after = (
+            await _redis_commands(client)
+            if client is not None  # pyright: ignore[reportUnnecessaryComparison]
+            else redis_before
         )
-    if job is None:
-        raise AssertionError("load job disappeared")
-    latencies = [
-        attempt.elapsed_seconds for attempt in attempts if attempt.elapsed_seconds is not None
-    ]
-    sequential = all(attempt.attempt_number == 1 for attempt in attempts)
-    nonterminal = sum(row.status not in TERMINAL_URLS for row in urls)
-    uncleared = sum(row.lease_owner is not None or row.lease_expires_at is not None for row in urls)
-    finding_rows = [list(row) for row in findings]
-    logical_payload = {
-        "size": size,
-        "statuses": sorted(row.status for row in urls),
-        "findings": finding_rows,
-    }
-    csv_buffer = io.StringIO(newline="")
-    writer = csv.writer(csv_buffer, lineterminator="\r\n")
-    writer.writerow(
-        ["canonical_email", "email_domain", "classification", "validation_status", "is_role_based"]
-    )
-    writer.writerows(finding_rows)
-    fixture_result = await DeterministicOfflineOrchestrator(ActivityTracker(), 0).scan(
-        "https://site0000.fixture.test/"
-    )
-    stale_zero, expired_zero = await _fence_audit(session_factory, size, fixture_result)
-    counters_match = (
-        job.queued_count == 0
-        and job.running_count == 0
-        and job.completed_count == size
-        and job.failed_count == 0
-        and job.email_finding_count == size
-    )
-    shutdown_clean = all(task.done() for task in tasks) and connection_tracker.active == 0
-    report = LoadRunReport(
-        size=size,
-        workers=worker_count,
-        worker_concurrency=2,
-        elapsed_seconds=elapsed,
-        urls_per_second=size / elapsed,
-        pages_per_second=sum(row.pages_fetched or 0 for row in urls) / elapsed,
-        p50_latency_seconds=_percentile(latencies, 0.50),
-        p95_latency_seconds=_percentile(latencies, 0.95),
-        p99_latency_seconds=_percentile(latencies, 0.99),
-        peak_active_tasks=peak_tasks,
-        peak_active_claims=peak_claims,
-        peak_database_connections=connection_tracker.peak,
-        redis_operations=max(0, redis_after - redis_before),
-        redis_fallbacks=0,
-        retry_total=sum(row.retry_count or 0 for row in urls),
-        failure_total=sum(row.status == "FAILED" for row in urls),
-        success_total=sum(row.status in ("COMPLETED", "NO_EMAIL") for row in urls),
-        partial_total=sum(attempt.outcome == "PARTIAL" for attempt in attempts),
-        peak_python_memory_bytes=peak_memory,
-        result_checksum=_sha(logical_payload),
-        csv_checksum=hashlib.sha256(csv_buffer.getvalue().encode("utf-8")).hexdigest(),
-        attempt_rows=len(attempts),
-        finding_rows=len(findings),
-        duplicate_attempt_groups=duplicate_attempts,
-        duplicate_finding_groups=duplicate_findings,
-        sequential_attempts=sequential,
-        stale_fence_zero_writes=stale_zero,
-        expired_fence_zero_writes=expired_zero,
-        nonterminal_rows=nonterminal,
-        uncleared_claims=uncleared,
-        job_counters_match=counters_match,
-        shutdown_clean=shutdown_clean,
-    )
+
+        phase = "metrics"
+        if session_factory is not None and job_id is not None:  # pyright: ignore[reportUnnecessaryComparison]
+            try:
+                async with session_factory() as session:
+                    job = await session.get(ScanJob, job_id)
+                    urls = list(
+                        (
+                            await session.execute(
+                                select(ScanURL).where(ScanURL.scan_job_id == job_id)
+                            )
+                        ).scalars()
+                    )
+                    attempts = list(
+                        (
+                            await session.execute(
+                                select(CrawlAttempt)
+                                .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
+                                .where(ScanURL.scan_job_id == job_id)
+                            )
+                        ).scalars()
+                    )
+                    findings = (
+                        await session.execute(
+                            select(
+                                EmailFinding.canonical_email,
+                                EmailFinding.email_domain,
+                                EmailFinding.classification,
+                                EmailFinding.validation_status,
+                                EmailFinding.is_role_based,
+                            )
+                            .where(EmailFinding.scan_job_id == job_id)
+                            .order_by(EmailFinding.canonical_email.asc())
+                        )
+                    ).all()
+                    duplicate_attempts = int(
+                        await session.scalar(
+                            select(func.count()).select_from(
+                                select(CrawlAttempt.scan_url_id, CrawlAttempt.attempt_number)
+                                .join(ScanURL, CrawlAttempt.scan_url_id == ScanURL.id)
+                                .where(ScanURL.scan_job_id == job_id)
+                                .group_by(CrawlAttempt.scan_url_id, CrawlAttempt.attempt_number)
+                                .having(func.count() > 1)
+                                .subquery()
+                            )
+                        )
+                        or 0
+                    )
+                    duplicate_findings = int(
+                        await session.scalar(
+                            select(func.count()).select_from(
+                                select(EmailFinding.scan_url_id, EmailFinding.canonical_email)
+                                .where(EmailFinding.scan_job_id == job_id)
+                                .group_by(EmailFinding.scan_url_id, EmailFinding.canonical_email)
+                                .having(func.count() > 1)
+                                .subquery()
+                            )
+                        )
+                        or 0
+                    )
+
+                if job is not None:
+                    latencies = [
+                        attempt.elapsed_seconds
+                        for attempt in attempts
+                        if attempt.elapsed_seconds is not None
+                    ]
+                    sequential = (
+                        all(att.attempt_number == 1 for att in attempts) if attempts else False
+                    )
+                    nonterminal = sum(row.status not in TERMINAL_URLS for row in urls)
+                    uncleared = sum(
+                        row.lease_owner is not None or row.lease_expires_at is not None
+                        for row in urls
+                    )
+                    finding_rows = [list(row) for row in findings]
+                    logical_payload = {
+                        "size": size,
+                        "statuses": sorted(row.status for row in urls),
+                        "findings": finding_rows,
+                    }
+                    csv_buffer = io.StringIO()
+                    writer = csv.writer(csv_buffer)
+                    writer.writerow(["url", "status", "attempts", "pages"])
+                    for row in sorted(
+                        urls, key=lambda item: item.normalized_url or item.original_input
+                    ):
+                        url_display = row.normalized_url or row.original_input
+                        writer.writerow(
+                            [url_display, row.status, row.attempt_count, row.pages_fetched]
+                        )
+
+                    if terminal_reached:
+                        fixture_result = await DeterministicOfflineOrchestrator(
+                            ActivityTracker(), 0
+                        ).scan("https://site0000.fixture.test/")
+                        stale_zero, expired_zero = await _fence_audit(
+                            session_factory, size, fixture_result
+                        )
+                    else:
+                        stale_zero, expired_zero = False, False
+
+                    counters_match = (
+                        job.queued_count == 0
+                        and job.running_count == 0
+                        and job.completed_count == size
+                        and job.failed_count == 0
+                        and job.email_finding_count == size
+                    )
+
+                    partial_report = LoadRunReport(
+                        size=size,
+                        workers=worker_count,
+                        worker_concurrency=2,
+                        elapsed_seconds=elapsed,
+                        urls_per_second=size / elapsed if elapsed > 0 else 0.0,
+                        pages_per_second=sum(row.pages_fetched or 0 for row in urls) / elapsed
+                        if elapsed > 0
+                        else 0.0,
+                        p50_latency_seconds=_percentile(latencies, 0.50),
+                        p95_latency_seconds=_percentile(latencies, 0.95),
+                        p99_latency_seconds=_percentile(latencies, 0.99),
+                        peak_active_tasks=peak_tasks,
+                        peak_active_claims=peak_claims,
+                        peak_database_connections=connection_tracker.peak
+                        if connection_tracker
+                        else 0,
+                        redis_operations=max(0, redis_after - redis_before),
+                        redis_fallbacks=0,
+                        retry_total=sum(row.retry_count or 0 for row in urls),
+                        failure_total=sum(row.status == "FAILED" for row in urls),
+                        success_total=sum(row.status in ("COMPLETED", "NO_EMAIL") for row in urls),
+                        partial_total=sum(attempt.outcome == "PARTIAL" for attempt in attempts),
+                        peak_python_memory_bytes=peak_memory,
+                        result_checksum=_sha(logical_payload),
+                        csv_checksum=hashlib.sha256(
+                            csv_buffer.getvalue().encode("utf-8")
+                        ).hexdigest(),
+                        attempt_rows=len(attempts),
+                        finding_rows=len(findings),
+                        duplicate_attempt_groups=duplicate_attempts,
+                        duplicate_finding_groups=duplicate_findings,
+                        sequential_attempts=sequential,
+                        stale_fence_zero_writes=stale_zero,
+                        expired_fence_zero_writes=expired_zero,
+                        nonterminal_rows=nonterminal,
+                        uncleared_claims=uncleared,
+                        job_counters_match=counters_match,
+                        shutdown_clean=False,
+                    )
+            except Exception as exc:
+                if run_exception is None:
+                    run_exception = exc
+                    error_phase = "metrics"
+
+    finally:
+        phase = "cleanup"
+        worker_stop_errors = await _stop_worker_tasks(workers, tasks, timeout_seconds=5.0)
+        cleanup_errors.extend(worker_stop_errors)
+
+        tasks_clean = (not tasks) or all(t.done() for t in tasks)
+
+        if tasks_clean:
+            if session_factory is not None and client is not None:
+                try:
+                    await asyncio.wait_for(_cleanup(session_factory, client, size), timeout=10.0)
+                except TimeoutError:
+                    cleanup_errors.append("Database and Redis cleanup timed out")
+                except Exception:
+                    cleanup_errors.append("Database and Redis cleanup error")
+        else:
+            cleanup_errors.append(
+                "Database cleanup skipped because worker tasks failed to terminate"
+            )
+
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.aclose(), timeout=5.0)
+            except TimeoutError:
+                cleanup_errors.append("Redis client close timed out")
+            except Exception:
+                cleanup_errors.append("Redis client close error")
+
+        if engine is not None:
+            if connection_tracker is not None:
+                try:
+                    event.remove(engine.sync_engine, "checkout", connection_tracker.checkout)
+                    event.remove(engine.sync_engine, "checkin", connection_tracker.checkin)
+                except Exception:
+                    cleanup_errors.append("Connection listener cleanup error")
+            try:
+                await asyncio.wait_for(engine.dispose(), timeout=5.0)
+            except TimeoutError:
+                cleanup_errors.append("Engine dispose timed out")
+            except Exception:
+                cleanup_errors.append("Engine dispose error")
+
+        try:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
+        except Exception:
+            cleanup_errors.append("Tracemalloc stop error")
+
+        tracker_clean = (connection_tracker is None) or (connection_tracker.active == 0)
+        no_cleanup_errors = len(cleanup_errors) == 0
+        final_shutdown_clean = tasks_clean and tracker_clean and no_cleanup_errors
+
+        if partial_report is not None:
+            partial_report = partial_report.model_copy(
+                update={"shutdown_clean": final_shutdown_clean}
+            )
+
+    elapsed_final = time.perf_counter() - start_time
+    if run_exception is not None:
+        error_type = "WorkerTerminationTimeout" if not tasks_clean else type(run_exception).__name__
+        safe_msg = (
+            "Offline load execution exceeded configured timeout bound"
+            if isinstance(run_exception, TimeoutError)
+            else f"Offline load execution encountered {error_type}"
+        )
+        raise OperationalLoadError(
+            LoadRunFailureReport(
+                size=size,
+                workers=worker_count,
+                error_type=error_type,
+                error_message=safe_msg,
+                phase=error_phase or "execution",
+                elapsed_seconds=elapsed_final,
+                cleanup_errors=cleanup_errors,
+                partial_report=partial_report,
+            )
+        )
+
+    if cleanup_errors:
+        raise OperationalLoadError(
+            LoadRunFailureReport(
+                size=size,
+                workers=worker_count,
+                error_type="CleanupError",
+                error_message=f"Encountered {len(cleanup_errors)} cleanup error(s)",
+                phase="cleanup",
+                elapsed_seconds=elapsed_final,
+                cleanup_errors=cleanup_errors,
+                partial_report=partial_report,
+            )
+        )
+
+    if partial_report is None:
+        raise OperationalLoadError(
+            LoadRunFailureReport(
+                size=size,
+                workers=worker_count,
+                error_type="NoReportGenerated",
+                error_message="Load run completed without generating report",
+                phase="metrics",
+                elapsed_seconds=elapsed_final,
+                cleanup_errors=cleanup_errors,
+                partial_report=None,
+            )
+        )
+
+    report = partial_report
     violations = (
         report.success_total != size
         or report.failure_total != 0
@@ -471,9 +714,19 @@ async def run_load(
         or report.peak_active_claims > worker_count * 6
         or report.peak_database_connections > max(4, worker_count * 2)
     )
-    await _cleanup(session_factory, client, size)
-    await client.aclose()
-    await engine.dispose()
+
     if violations:
-        raise AssertionError(report.model_dump_json())
+        raise OperationalLoadError(
+            LoadRunFailureReport(
+                size=size,
+                workers=worker_count,
+                error_type="InvariantViolation",
+                error_message="Load run report failed invariant verification checks",
+                phase="verification",
+                elapsed_seconds=elapsed_final,
+                cleanup_errors=cleanup_errors,
+                partial_report=report,
+            )
+        )
+
     return report

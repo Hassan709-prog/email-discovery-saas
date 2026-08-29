@@ -25,9 +25,9 @@ SERVICE_ERROR_STATUS_MAP: dict[ServiceErrorCode, int] = {
     ServiceErrorCode.LEASE_LOST: status.HTTP_409_CONFLICT,
     ServiceErrorCode.EXPORT_TOO_LARGE: status.HTTP_409_CONFLICT,
     ServiceErrorCode.ACTIVE_JOB_LIMIT_EXCEEDED: status.HTTP_429_TOO_MANY_REQUESTS,
-    ServiceErrorCode.INPUT_LIMIT_EXCEEDED: status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-    ServiceErrorCode.INPUT_TOO_LONG: status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-    ServiceErrorCode.CONFIGURATION_TOO_LARGE: status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+    ServiceErrorCode.INPUT_LIMIT_EXCEEDED: status.HTTP_413_CONTENT_TOO_LARGE,
+    ServiceErrorCode.INPUT_TOO_LONG: status.HTTP_413_CONTENT_TOO_LARGE,
+    ServiceErrorCode.CONFIGURATION_TOO_LARGE: status.HTTP_413_CONTENT_TOO_LARGE,
 }
 
 HTTP_STATUS_CODE_MAP: dict[int, str] = {
@@ -102,7 +102,7 @@ async def validation_exception_handler(
         request_id,
     )
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         content=content,
         headers=headers,
     )
@@ -139,7 +139,7 @@ AUTH_SERVICE_ERROR_STATUS_MAP: dict[str, int] = {
     "CSRF_VALIDATION_FAILED": status.HTTP_401_UNAUTHORIZED,
     "ORGANIZATION_SELECTION_REQUIRED": status.HTTP_400_BAD_REQUEST,
     "EMAIL_OR_SLUG_CONFLICT": status.HTTP_409_CONFLICT,
-    "PASSWORD_POLICY_VIOLATION": status.HTTP_422_UNPROCESSABLE_ENTITY,
+    "PASSWORD_POLICY_VIOLATION": status.HTTP_422_UNPROCESSABLE_CONTENT,
     "RATE_LIMITED": status.HTTP_429_TOO_MANY_REQUESTS,
 }
 

@@ -228,3 +228,103 @@ def test_no_html_body_in_mapped_dtos() -> None:
     assert not hasattr(pages[0], "body_text")
     assert not hasattr(pages[0], "html")
     assert pages[0].content_sha256 is None
+
+
+def test_result_mapper_deduplicates_page_records_and_retains_evidence() -> None:
+    """Verify duplicate page URLs are deduplicated while preserving evidence."""
+    now = datetime.now(UTC)
+    duplicate_url_1 = "https://pypi.org/account/login/"
+    duplicate_url_2 = "https://pypi.org/account/login/?next=/account/"
+
+    result = SiteScanResult(
+        starting_url="https://pypi.org/",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=2,
+            pages_attempted=2,
+            pages_fetched=2,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=2,
+            accepted_email_findings=1,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(
+            PageScanRecord(
+                requested_url=duplicate_url_1,
+                final_url=duplicate_url_1,
+                depth=1,
+                outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+                status_code=200,
+                robots_decision=RobotsDecision(
+                    target_url=duplicate_url_1,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="OK",
+                ),
+                fetch_result=FetchResult(
+                    final_url=duplicate_url_1,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text="<html>login</html>",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                emails_found_count=1,
+                links_discovered_count=0,
+            ),
+            PageScanRecord(
+                requested_url=duplicate_url_2,
+                final_url=duplicate_url_2,
+                depth=2,
+                outcome=PageScanOutcome.SKIPPED_BUDGET_REACHED,
+                status_code=None,
+                robots_decision=RobotsDecision(
+                    target_url=duplicate_url_2,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="OK",
+                ),
+                fetch_result=None,
+                emails_found_count=0,
+                links_discovered_count=0,
+            ),
+        ),
+        email_findings=(
+            ScannerEmailFinding(
+                source_url=duplicate_url_1,
+                raw_candidate="admin@pypi.org",
+                canonical_email="admin@pypi.org",
+                local_part="admin",
+                domain="pypi.org",
+                source_kind=EmailSourceKind.VISIBLE_TEXT,
+                category=EmailCategory.ROLE_BASED,
+                domain_affinity=DomainAffinity.EXACT_HOST,
+                evidence_snippet="Contact admin@pypi.org for help",
+            ),
+        ),
+        rejected_email_candidates=(),
+    )
+
+    attempt1, pages1, findings1, evidence1, _ = map_site_scan_result(
+        result, attempt_number=1, now=now
+    )
+    attempt2, pages2, findings2, _, _ = map_site_scan_result(result, attempt_number=1, now=now)
+
+    # 1. Exactly one stored page row per unique normalized URL
+    assert len(pages1) == 1
+    assert pages1[0].normalized_url == "https://pypi.org/account/login/"
+
+    # 2. Email finding and evidence reference the correct retained page and are NOT discarded
+    assert len(findings1) == 1
+    assert findings1[0].canonical_email == "admin@pypi.org"
+    assert len(evidence1) == 1
+    assert evidence1[0].normalized_page_url == "https://pypi.org/account/login/"
+    assert evidence1[0].canonical_email == "admin@pypi.org"
+
+    # 3. Deterministic checksum and replay behavior remain identical
+    assert attempt1.result_checksum == attempt2.result_checksum
+    assert len(pages1) == len(pages2)
+    assert len(findings1) == len(findings2)

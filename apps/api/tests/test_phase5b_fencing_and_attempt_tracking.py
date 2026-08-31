@@ -1,5 +1,6 @@
 """Phase 5B Fencing, Per-Fence Attempt Tracking & Claim-Origin Persistence Tests."""
 
+import dataclasses
 import uuid
 
 import pytest
@@ -280,3 +281,304 @@ async def test_stale_worker_fence_rejected(isolated_db_engine: AsyncEngine) -> N
             fence_token=claim_1.fence_token,
         )
     assert rel_res is False
+
+
+@pytest.mark.anyio
+async def test_persist_transient_failure_valid_claim(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify valid owner + valid fence + unexpired lease persists transient failure."""
+    from email_discovery_api.models import CrawlAttempt
+    from email_discovery_api.services.result_persistence import ResultPersistenceService
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory.begin() as session:
+        org = Organization(id=org_id, name="Test Org", slug=f"test-org-{org_id.hex[:6]}")
+        job = ScanJob(
+            id=job_id,
+            organization_id=org_id,
+            status=ScanJobStatus.QUEUED.value,
+            total_input_count=1,
+            valid_input_count=1,
+            queued_count=1,
+        )
+        url = ScanURL(
+            id=url_id,
+            scan_job_id=job_id,
+            original_index=0,
+            original_input="https://example.com",
+            status=ScanURLStatus.QUEUED.value,
+            fence_token=0,
+            attempt_count=0,
+            max_attempts=3,
+        )
+        session.add_all([org, job, url])
+
+    async with session_factory() as session:
+        service = CrawlWorkService(session)
+        claim = await service.claim_next_url(lease_owner="w1")
+        assert claim is not None
+        attempt_number = await service.mark_attempt_started(
+            scan_url_id=claim.scan_url_id,
+            lease_owner="w1",
+            fence_token=claim.fence_token,
+        )
+        assert attempt_number == 1
+
+    updated_claim = dataclasses.replace(claim, attempt_count=attempt_number)
+    async with session_factory() as session:
+        p_svc = ResultPersistenceService(session)
+        res = await p_svc.persist_transient_failure(
+            claim=updated_claim,
+            error_code="TEST_ERROR",
+            error_message="Test error message",
+        )
+        assert res.is_replay is False
+
+    async with session_factory() as session:
+        db_url = await session.get(ScanURL, url_id)
+        assert db_url is not None
+        assert db_url.status == ScanURLStatus.RETRY_WAIT.value
+        assert db_url.attempt_count == 1
+        assert db_url.last_error_code == "TEST_ERROR"
+        assert db_url.lease_owner is None
+        assert db_url.lease_expires_at is None
+
+        db_atts = (
+            (await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id)))
+            .scalars()
+            .all()
+        )
+        assert len(db_atts) == 1
+        assert db_atts[0].error_code == "TEST_ERROR"
+
+
+@pytest.mark.anyio
+async def test_persist_transient_failure_expired_lease_rejected(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify expired lease produces LeaseLostError and zero writes."""
+    from datetime import UTC, datetime, timedelta
+
+    from email_discovery_api.models import CrawlAttempt
+    from email_discovery_api.services.result_persistence import ResultPersistenceService
+    from email_discovery_api.services.worker_contracts import URLClaim
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory.begin() as session:
+        org = Organization(id=org_id, name="Test Org", slug=f"test-org-{org_id.hex[:6]}")
+        job = ScanJob(
+            id=job_id,
+            organization_id=org_id,
+            status=ScanJobStatus.RUNNING.value,
+            total_input_count=1,
+            valid_input_count=1,
+            running_count=1,
+        )
+        url = ScanURL(
+            id=url_id,
+            scan_job_id=job_id,
+            original_index=0,
+            original_input="https://example.com",
+            status=ScanURLStatus.SCANNING.value,
+            lease_owner="w1",
+            lease_expires_at=datetime.now(UTC) - timedelta(seconds=10),
+            fence_token=1,
+            attempt_count=1,
+            max_attempts=3,
+        )
+        session.add_all([org, job, url])
+
+    expired_claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://example.com",
+        normalized_url="https://example.com",
+        normalized_domain="example.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) - timedelta(seconds=10),
+    )
+
+    async with session_factory() as session:
+        p_svc = ResultPersistenceService(session)
+        with pytest.raises(LeaseLostError):
+            await p_svc.persist_transient_failure(
+                claim=expired_claim,
+                error_code="TEST_ERROR",
+                error_message="Expired test message",
+            )
+
+    async with session_factory() as session:
+        db_url = await session.get(ScanURL, url_id)
+        assert db_url is not None
+        assert db_url.status == ScanURLStatus.SCANNING.value
+        assert db_url.lease_owner == "w1"
+        assert db_url.last_error_code is None
+
+        db_atts = (
+            (await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id)))
+            .scalars()
+            .all()
+        )
+        assert len(db_atts) == 0
+
+
+@pytest.mark.anyio
+async def test_persist_transient_failure_stale_fence_rejected(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify stale fence produces LeaseLostError and zero writes."""
+    from datetime import UTC, datetime, timedelta
+
+    from email_discovery_api.models import CrawlAttempt
+    from email_discovery_api.services.result_persistence import ResultPersistenceService
+    from email_discovery_api.services.worker_contracts import URLClaim
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory.begin() as session:
+        org = Organization(id=org_id, name="Test Org", slug=f"test-org-{org_id.hex[:6]}")
+        job = ScanJob(
+            id=job_id,
+            organization_id=org_id,
+            status=ScanJobStatus.RUNNING.value,
+            total_input_count=1,
+            valid_input_count=1,
+            running_count=1,
+        )
+        url = ScanURL(
+            id=url_id,
+            scan_job_id=job_id,
+            original_index=0,
+            original_input="https://example.com",
+            status=ScanURLStatus.SCANNING.value,
+            lease_owner="w2",
+            lease_expires_at=datetime.now(UTC) + timedelta(seconds=120),
+            fence_token=2,
+            attempt_count=1,
+            max_attempts=3,
+        )
+        session.add_all([org, job, url])
+
+    stale_claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://example.com",
+        normalized_url="https://example.com",
+        normalized_domain="example.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(seconds=120),
+    )
+
+    async with session_factory() as session:
+        p_svc = ResultPersistenceService(session)
+        with pytest.raises(LeaseLostError):
+            await p_svc.persist_transient_failure(
+                claim=stale_claim,
+                error_code="TEST_ERROR",
+                error_message="Stale fence test message",
+            )
+
+    async with session_factory() as session:
+        db_url = await session.get(ScanURL, url_id)
+        assert db_url is not None
+        assert db_url.status == ScanURLStatus.SCANNING.value
+        assert db_url.lease_owner == "w2"
+        assert db_url.fence_token == 2
+
+        db_atts = (
+            (await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id)))
+            .scalars()
+            .all()
+        )
+        assert len(db_atts) == 0
+
+
+@pytest.mark.anyio
+async def test_heartbeat_renewed_lease_persists_normally(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify heartbeat-renewed lease extends expiration and persists normally."""
+    from email_discovery_api.services.result_persistence import ResultPersistenceService
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory.begin() as session:
+        org = Organization(id=org_id, name="Test Org", slug=f"test-org-{org_id.hex[:6]}")
+        job = ScanJob(
+            id=job_id,
+            organization_id=org_id,
+            status=ScanJobStatus.QUEUED.value,
+            total_input_count=1,
+            valid_input_count=1,
+            queued_count=1,
+        )
+        url = ScanURL(
+            id=url_id,
+            scan_job_id=job_id,
+            original_index=0,
+            original_input="https://example.com",
+            status=ScanURLStatus.QUEUED.value,
+            fence_token=0,
+            attempt_count=0,
+            max_attempts=3,
+        )
+        session.add_all([org, job, url])
+
+    async with session_factory() as session:
+        service = CrawlWorkService(session)
+        claim = await service.claim_next_url(lease_owner="w1", lease_duration_seconds=5.0)
+        assert claim is not None
+        hb = await service.renew_lease(
+            scan_url_id=claim.scan_url_id,
+            lease_owner="w1",
+            fence_token=claim.fence_token,
+            lease_duration_seconds=120.0,
+        )
+        assert hb.status.value == "RENEWED"
+
+        attempt_number = await service.mark_attempt_started(
+            scan_url_id=claim.scan_url_id,
+            lease_owner="w1",
+            fence_token=claim.fence_token,
+        )
+
+    updated_claim = dataclasses.replace(claim, attempt_count=attempt_number)
+    async with session_factory() as session:
+        p_svc = ResultPersistenceService(session)
+        res = await p_svc.persist_transient_failure(
+            claim=updated_claim,
+            error_code="HEARTBEAT_RENEWED_OK",
+            error_message="Renewed lease test",
+        )
+        assert res.is_replay is False

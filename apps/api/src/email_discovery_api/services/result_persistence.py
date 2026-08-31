@@ -401,6 +401,7 @@ class ResultPersistenceService:
                     ScanURL.id == claim.scan_url_id,
                     ScanURL.status == ScanURLStatus.SCANNING.value,
                     ScanURL.lease_owner == claim.lease_owner,
+                    ScanURL.fence_token == claim.fence_token,
                     ScanURL.attempt_count == claim.attempt_count,
                     ScanURL.lease_expires_at > func.clock_timestamp(),
                 )
@@ -437,6 +438,8 @@ class ResultPersistenceService:
                     status=target_status.value,
                     lease_owner=None,
                     lease_expires_at=None,
+                    attempt_started_at=None,
+                    attempt_started_fence_token=None,
                     last_error_code=error_code,
                     last_error_message=sanitized_err_msg,
                     completed_at=current_time if not retryable else None,

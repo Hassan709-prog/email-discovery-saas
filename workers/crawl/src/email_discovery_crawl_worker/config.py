@@ -33,10 +33,13 @@ class WorkerSettings(BaseSettings):
     degraded_poll_interval: float = Field(default=2.0, description="Degraded DB poll interval")
     lease_duration: float = Field(default=120.0, description="Lease duration in seconds")
     heartbeat_interval: float = Field(default=30.0, description="Heartbeat interval in seconds")
+    shutdown_grace_period: float = Field(
+        default=60.0, description="Grace period in seconds to drain active scan tasks on shutdown"
+    )
 
     # Redis Settings
     redis_url: SecretStr = Field(
-        default=SecretStr("redis://localhost:6379/0"),
+        default=SecretStr("redis://127.0.0.1:6379/0"),
         description="Redis connection URL",
     )
     redis_required: bool = Field(default=False, description="Whether Redis is strictly required")
@@ -80,6 +83,17 @@ class WorkerSettings(BaseSettings):
                 "REDIS_RATE_LIMIT_FALLBACK_MODE must be 'single_worker_local' or 'strict_pause'"
             )
         return mode
+
+    @field_validator("shutdown_grace_period", mode="after")
+    @classmethod
+    def validate_shutdown_grace_period(cls, v: float) -> float:
+        import math
+
+        if not math.isfinite(v) or v <= 0 or v > 600.0:
+            raise ValueError(
+                "shutdown_grace_period must be a finite number > 0 and <= 600 seconds."
+            )
+        return v
 
     def model_post_init(self, __context: object) -> None:
         """Validate cross-field configuration invariant using max_domain_interval_ms."""

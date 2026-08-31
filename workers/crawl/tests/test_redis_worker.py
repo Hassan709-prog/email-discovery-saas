@@ -201,3 +201,66 @@ async def test_sanitized_worker_exception_logging(caplog: pytest.LogCaptureFixtu
     assert "target.com" not in logs
     assert "REDIS_GATE_FAILED" in logs
     assert "Exception" in logs
+
+
+@pytest.mark.anyio
+async def test_redis_gate_byte_response_decoding():
+    """Verify script_load bytes SHA and evalsha bytes array responses are decoded correctly."""
+    settings = WorkerSettings()
+    mock_redis = AsyncMock()
+    # Real redis-py returns bytes for script_load and evalsha elements
+    mock_redis.script_load.return_value = b"d41d8cd98f00b204e9800998ecf8427e"
+    mock_redis.evalsha.side_effect = [
+        [b"DEFER", b"100", b"1000"],
+        [b"RESERVED", b"50", b"1000"],
+    ]
+
+    slept_duration: list[float] = []
+
+    async def fake_sleeper(seconds: float) -> None:
+        slept_duration.append(seconds)
+
+    gate = RedisDomainRequestGate(
+        redis_client=mock_redis,
+        settings=settings,
+        async_sleeper=fake_sleeper,
+    )
+
+    url = make_norm_url("example.com", registrable_domain="example.com")
+    await gate.acquire(url)
+
+    assert gate.script_sha == "d41d8cd98f00b204e9800998ecf8427e"
+    assert mock_redis.evalsha.call_count == 2
+    assert len(slept_duration) == 2
+    assert slept_duration[0] == 0.1  # DEFER 100ms
+    assert slept_duration[1] == 0.05  # RESERVED 50ms
+
+
+@pytest.mark.anyio
+async def test_redis_gate_local_redis_integration():
+    """Bounded integration test against local Redis using real Redis responses."""
+    import os
+
+    import redis.asyncio as redis
+    from pydantic import SecretStr
+
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+    client = redis.from_url(redis_url, decode_responses=False)  # pyright: ignore[reportUnknownMemberType]
+    try:
+        await client.ping()  # pyright: ignore[reportUnknownMemberType]
+    except Exception:
+        pytest.skip("Local Redis server is not available.")
+
+    try:
+        settings = WorkerSettings(redis_url=SecretStr(redis_url))
+        gate = RedisDomainRequestGate(
+            redis_client=client,  # type: ignore[arg-type]
+            settings=settings,
+        )
+
+        url = make_norm_url("real-redis-test.com", registrable_domain="real-redis-test.com")
+        await gate.acquire(url)
+        assert gate.script_sha is not None
+        assert len(gate.script_sha) > 0
+    finally:
+        await client.aclose()

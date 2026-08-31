@@ -340,8 +340,12 @@ def map_site_scan_result(
 
     # 1. Map pages
     mapped_pages: list[MappedPage] = []
+    seen_page_urls: set[str] = set()
     for rec in site_scan_result.page_records[: pol.max_pages_per_result]:
         page_norm_url = sanitize_url(rec.requested_url)
+        if page_norm_url in seen_page_urls:
+            continue
+        seen_page_urls.add(page_norm_url)
         page_final_url = sanitize_url(rec.final_url) if rec.final_url else page_norm_url
         page_score = 0
         content_type = None

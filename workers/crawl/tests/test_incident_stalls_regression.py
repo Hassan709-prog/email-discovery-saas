@@ -794,3 +794,230 @@ async def test_finalization_case_c_cancellation(
         final_job = await job_svc.try_finalize_job(org_id, job_id)
         assert final_job is not None
         assert final_job.status == ScanJobStatus.CANCELLED.value
+
+
+async def test_worker_exception_after_attempt_start_releases_claim_without_lease_expiry(
+    isolated_db_engine: AsyncEngine,
+    test_user_and_token: dict[str, Any],
+) -> None:
+    """Verify scanner exception after attempt start releases claim to RETRY_WAIT cleanly."""
+    from pydantic import SecretStr
+
+    from email_discovery_crawl_worker.config import WorkerSettings
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    url_row = ScanURL(
+        id=url_id,
+        scan_job_id=job_id,
+        original_index=0,
+        original_input="https://error-test.com/",
+        normalized_url="https://error-test.com/",
+        normalized_domain="error-test.com",
+        status=ScanURLStatus.QUEUED.value,
+        attempt_count=0,
+        max_attempts=3,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.QUEUED.value,
+                total_input_count=1,
+                valid_input_count=1,
+                duplicate_input_count=0,
+                queued_count=1,
+                running_count=0,
+                completed_count=0,
+                failed_count=0,
+            )
+            session.add(job)
+            session.add(url_row)
+
+    class FailingOrchestrator:
+        async def scan(self, url: str) -> Any:
+            raise ValueError("simulated scanner exception after attempt start")
+
+    settings = WorkerSettings(redis_url=SecretStr("redis://127.0.0.1:1/0"))
+    worker = CrawlWorker(
+        session_factory=session_factory,
+        worker_id="failing-worker",
+        orchestrator_factory=FailingOrchestrator,
+        worker_settings=settings,
+    )
+
+    worker._running = True  # pyright: ignore[reportPrivateUsage]
+    worker._shutdown_event.clear()  # pyright: ignore[reportPrivateUsage]
+
+    claimed = await worker._fill_capacity_and_claim()  # pyright: ignore[reportPrivateUsage]
+    assert claimed is True
+    assert len(worker._active_tasks) == 1  # pyright: ignore[reportPrivateUsage]
+
+    # Await active task completion
+    await asyncio.gather(*list(worker._active_tasks), return_exceptions=True)  # pyright: ignore[reportPrivateUsage]
+
+    async with session_factory() as session:
+        db_url = await session.get(ScanURL, url_id)
+        assert db_url is not None
+        assert db_url.status == ScanURLStatus.RETRY_WAIT.value
+        assert db_url.attempt_count == 1
+        assert db_url.last_error_code == "SCAN_EXECUTION_ERROR_VALUEERROR"
+        assert db_url.last_error_message == "Scan execution failed due to ValueError."
+        assert "simulated scanner exception" not in (db_url.last_error_message or "")
+        assert db_url.lease_owner is None
+        assert db_url.lease_expires_at is None
+        assert db_url.attempt_started_fence_token is None
+
+        # Assert CrawlAttempt row was created matching attempt_count=1
+        from email_discovery_api.models import CrawlAttempt
+
+        att_res = await session.execute(
+            select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id)
+        )
+        atts = att_res.scalars().all()
+        assert len(atts) == 1
+        assert atts[0].attempt_number == 1
+        assert atts[0].outcome == "FAILED"
+        assert atts[0].error_code == "SCAN_EXECUTION_ERROR_VALUEERROR"
+        assert "simulated scanner exception" not in (atts[0].error_message or "")
+
+        db_job = await session.get(ScanJob, job_id)
+        assert db_job is not None
+        assert db_job.queued_count == 1
+        assert db_job.running_count == 0
+        assert db_job.failed_count == 0
+
+    # Prove no lease-expiry recovery is needed
+    async with session_factory() as session:
+        work_svc = CrawlWorkService(session)
+        recovered = await work_svc.recover_expired_leases()
+        assert recovered == 0
+
+    # Prove stale fence produces zero writes
+    async with session_factory() as session:
+        work_svc = CrawlWorkService(session)
+        stale_released = await work_svc.release_fenced_claim(
+            scan_url_id=url_id,
+            lease_owner="failing-worker",
+            fence_token=1,
+        )
+        assert stale_released is False
+
+
+async def test_max_scans_heartbeat_drain_regression(
+    isolated_db_engine: AsyncEngine,
+    test_user_and_token: dict[str, Any],
+) -> None:
+    """Verify max_scans stops new claims but maintains active task heartbeats during drain."""
+    from pydantic import SecretStr
+
+    from email_discovery_crawl_worker.config import WorkerSettings
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url1_id = uuid.uuid4()
+    url2_id = uuid.uuid4()
+
+    url1 = ScanURL(
+        id=url1_id,
+        scan_job_id=job_id,
+        original_index=0,
+        original_input="https://slow-scan-1.com/",
+        normalized_url="https://slow-scan-1.com/",
+        normalized_domain="slow-scan-1.com",
+        status=ScanURLStatus.QUEUED.value,
+        attempt_count=0,
+        max_attempts=3,
+    )
+    url2 = ScanURL(
+        id=url2_id,
+        scan_job_id=job_id,
+        original_index=1,
+        original_input="https://queued-scan-2.com/",
+        normalized_url="https://queued-scan-2.com/",
+        normalized_domain="queued-scan-2.com",
+        status=ScanURLStatus.QUEUED.value,
+        attempt_count=0,
+        max_attempts=3,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.QUEUED.value,
+                total_input_count=2,
+                valid_input_count=2,
+                duplicate_input_count=0,
+                queued_count=2,
+                running_count=0,
+                completed_count=0,
+                failed_count=0,
+            )
+            session.add(job)
+            session.add(url1)
+            session.add(url2)
+
+    class SlowOrchestrator:
+        async def scan(self, url: str) -> Any:
+            # Simulate scan taking longer than short lease/heartbeat window
+            await asyncio.sleep(0.3)
+            return make_fake_site_result(url, ["test@slow-scan-1.com"])
+
+    settings = WorkerSettings(
+        redis_url=SecretStr("redis://127.0.0.1:1/0"),
+        shutdown_grace_period=5.0,
+    )
+    worker = CrawlWorker(
+        session_factory=session_factory,
+        worker_id="max-scans-worker",
+        concurrency=2,
+        lease_duration_seconds=0.4,
+        heartbeat_interval_seconds=0.1,
+        max_scans=1,
+        shutdown_grace_period_seconds=5.0,
+        orchestrator_factory=SlowOrchestrator,
+        worker_settings=settings,
+    )
+
+    # Run worker until max_scans=1 triggers shutdown and drain
+    await worker.run()
+
+    # Verify worker stopped claiming after 1 URL
+    assert worker.claimed_count == 1
+    assert worker.processed_count == 1
+
+    async with session_factory() as session:
+        db_url1 = await session.get(ScanURL, url1_id)
+        assert db_url1 is not None
+        assert db_url1.status == ScanURLStatus.COMPLETED.value
+        assert db_url1.lease_owner is None
+        assert db_url1.last_error_code is None
+
+        # Verify second URL was never claimed due to max_scans=1
+        db_url2 = await session.get(ScanURL, url2_id)
+        assert db_url2 is not None
+        assert db_url2.status == ScanURLStatus.QUEUED.value
+        assert db_url2.attempt_count == 0
+
+        # Prove zero LEASE_EXPIRED failures occurred
+        work_svc = CrawlWorkService(session)
+        recovered = await work_svc.recover_expired_leases()
+        assert recovered == 0

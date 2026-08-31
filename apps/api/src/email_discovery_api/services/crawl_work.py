@@ -233,7 +233,6 @@ class CrawlWorkService:
                 org_id: uuid.UUID = job_row[1]
 
                 # Step 2: Lock & update target ScanURL atomically
-                lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
                 cte_claim_stmt = text("""
                     WITH candidate AS (
                         SELECT su.id, su.status AS pre_status, su.next_retry_at AS pre_next_retry_at
@@ -248,7 +247,8 @@ class CrawlWorkService:
                     SET status = 'SCANNING',
                         lease_owner = :lease_owner,
                         fence_token = scan_urls.fence_token + 1,
-                        lease_expires_at = :lease_expires_at,
+                        lease_expires_at = clock_timestamp() +
+                            (CAST(:lease_duration_seconds AS text) || ' seconds')::interval,
                         claimed_from_status = c.pre_status,
                         claimed_from_next_retry_at = c.pre_next_retry_at,
                         attempt_started_at = NULL,
@@ -256,14 +256,14 @@ class CrawlWorkService:
                     FROM candidate c
                     WHERE scan_urls.id = c.id
                     RETURNING scan_urls.id, scan_urls.fence_token, scan_urls.claimed_from_status,
-                              scan_urls.claimed_from_next_retry_at;
+                              scan_urls.claimed_from_next_retry_at, scan_urls.lease_expires_at;
                 """)
                 claim_res = await self.session.execute(
                     cte_claim_stmt,
                     {
                         "cand_id": cand_id,
                         "lease_owner": lease_owner,
-                        "lease_expires_at": lease_expires_at,
+                        "lease_duration_seconds": str(lease_duration_seconds),
                     },
                 )
                 claim_row = claim_res.one_or_none()
@@ -298,11 +298,7 @@ class CrawlWorkService:
                     job.queued_count = job.queued_count - 1
                 job.running_count = job.running_count + 1
 
-                # Recheck lease_expires_at
-                recheck = await self.session.execute(
-                    select(ScanURL.lease_expires_at).where(ScanURL.id == cand_id)
-                )
-                lease_expires_at = recheck.scalar_one()
+                lease_expires_at = claim_row[4]
                 if lease_expires_at is None:
                     lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
 
@@ -431,6 +427,7 @@ class CrawlWorkService:
         scan_url_id: uuid.UUID,
         lease_owner: str,
         fence_token: int,
+        error_code: str | None = None,
     ) -> bool:
         """Transactionally release a claimed SCANNING URL.
 
@@ -480,6 +477,8 @@ class CrawlWorkService:
                 restored_status = scan_url.claimed_from_status or ScanURLStatus.QUEUED.value
                 scan_url.status = restored_status
                 scan_url.next_retry_at = scan_url.claimed_from_next_retry_at
+                if error_code:
+                    scan_url.last_error_code = error_code
                 if restored_status == ScanURLStatus.QUEUED.value:
                     job.queued_count = job.queued_count + 1
             else:
@@ -489,12 +488,12 @@ class CrawlWorkService:
                     scan_url.next_retry_at = datetime.now(UTC) + timedelta(
                         seconds=self.retry_policy.compute_delay_seconds(scan_url.attempt_count)
                     )
-                    scan_url.last_error_code = "WORKER_DRAINING"
+                    scan_url.last_error_code = error_code or "WORKER_DRAINING"
                     job.queued_count = job.queued_count + 1
                 else:
                     scan_url.status = ScanURLStatus.FAILED.value
                     scan_url.completed_at = datetime.now(UTC)
-                    scan_url.last_error_code = "MAX_ATTEMPTS_EXCEEDED"
+                    scan_url.last_error_code = error_code or "MAX_ATTEMPTS_EXCEEDED"
                     job.failed_count = job.failed_count + 1
 
             # Clear transient claim fields

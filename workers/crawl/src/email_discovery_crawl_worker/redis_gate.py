@@ -107,6 +107,15 @@ class InvalidDomainError(ValueError):
     pass
 
 
+def decode_redis_value(val: bytes | str | Any) -> str:
+    """Decode a Redis response value (bytes or str) to a clean Python string."""
+    if isinstance(val, bytes):
+        return val.decode("utf-8")
+    if isinstance(val, str):
+        return val
+    return str(val)
+
+
 def derive_domain_digest(target_url: NormalizedURL) -> str:
     """Normalize target domain identity and derive stable SHA-256 digest for Redis key."""
     raw_domain = get_domain_key(target_url)
@@ -147,7 +156,8 @@ class RedisDomainRequestGate(RequestGateProtocol):
         if self.client is None:
             raise RedisRateLimitPausedError("Redis client is not initialized.")
 
-        self.script_sha = str(await self.client.script_load(DOMAIN_RESERVATION_LUA))
+        raw_sha = await self.client.script_load(DOMAIN_RESERVATION_LUA)
+        self.script_sha = decode_redis_value(raw_sha)
         return self.script_sha
 
     def update_domain_interval(
@@ -227,9 +237,13 @@ class RedisDomainRequestGate(RequestGateProtocol):
                     timeout=self.settings.redis_operation_timeout,
                 )
 
-            raw_list = cast(list[Any], raw_res) if isinstance(raw_res, list) else []
-            res_status = str(raw_list[0]) if raw_list else str(cast(object, raw_res))
-            delay_ms = int(raw_list[1]) if len(raw_list) > 1 else 0
+            raw_list: list[Any] = list(cast(Any, raw_res)) if isinstance(raw_res, list) else []
+            res_status = (
+                decode_redis_value(raw_list[0])
+                if raw_list
+                else decode_redis_value(cast(object, raw_res))
+            )
+            delay_ms = int(decode_redis_value(raw_list[1])) if len(raw_list) > 1 else 0
 
             if res_status == "DEFER":
                 retry_after_sec = delay_ms / 1000.0

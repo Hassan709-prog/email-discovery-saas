@@ -104,7 +104,10 @@ def classify_worker_outcome(
     if outcome == SiteScanOutcome.COMPLETED_NO_EMAILS:
         return WorkerExecutionOutcome.TERMINAL_NO_EMAIL
 
-    if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+    if outcome in (SiteScanOutcome.ROBOTS_BLOCKED, SiteScanOutcome.FAILED):
+        _, is_retryable = classify_error_code_and_retryability(site_scan_result)
+        if is_retryable and attempt_count < max_attempts:
+            return WorkerExecutionOutcome.RETRYABLE_FAILURE
         return WorkerExecutionOutcome.TERMINAL_FAILURE
 
     if outcome == SiteScanOutcome.PARTIAL:
@@ -118,11 +121,5 @@ def classify_worker_outcome(
 
     if outcome == SiteScanOutcome.CANCELLED:
         return WorkerExecutionOutcome.CANCELLED
-
-    if outcome == SiteScanOutcome.FAILED:
-        _, is_retryable = classify_error_code_and_retryability(site_scan_result)
-        if is_retryable and attempt_count < max_attempts:
-            return WorkerExecutionOutcome.RETRYABLE_FAILURE
-        return WorkerExecutionOutcome.TERMINAL_FAILURE
 
     return WorkerExecutionOutcome.TERMINAL_FAILURE

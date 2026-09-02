@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
@@ -39,8 +40,96 @@ from email_discovery_api.services.worker_contracts import (
     LeaseLostError,
     URLClaim,
 )
-from email_scanner.errors import SiteScanOutcome
+from email_scanner.errors import PageScanOutcome, SiteScanOutcome
 from email_scanner.models import SiteScanResult
+
+
+def _sanitize_diagnostic_message(text: str | None, max_length: int = 500) -> str | None:
+    """Sanitize and bound diagnostic error message.
+
+    Truncates stack traces, strips query strings and credentials from URLs,
+    redacts sensitive key-value/header patterns, and normalizes whitespace.
+    """
+    if not text:
+        return None
+
+    # 1. Truncate at first stack trace marker if present
+    for marker in ("Traceback (most recent call last):", 'File "', "File '"):
+        if marker in text:
+            text = text.split(marker)[0]
+
+    # 2. Sanitize any embedded HTTP/HTTPS URLs to remove query params, fragments & userinfo
+    def _clean_url_match(match: re.Match[str]) -> str:
+        return sanitize_url(match.group(0))
+
+    text = re.sub(r"https?://[^\s'\"]+", _clean_url_match, text)
+
+    # 3. Redact secret / credential / authorization header patterns
+    text = re.sub(
+        r"(?i)\b(authorization|cookie|token|api[_-]?key|password|secret|pwd|connect_string|connection_string)\b\s*[:=]\s*(?:bearer\s+)?[^\s;,]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[^\s;,]+", "Bearer [REDACTED]", text)
+
+    # 4. Standard text sanitization (control characters, whitespace, max length)
+    return sanitize_text(text, max_length=max_length)
+
+
+def _derive_diagnostic_message(
+    site_scan_result: SiteScanResult,
+    max_length: int = 500,
+) -> str | None:
+    """Derive a safe, bounded diagnostic message for ScanURL.last_error_message.
+
+    Top-level site_scan_result.error_message takes highest priority if present.
+    Otherwise, derives from the first relevant failed page using:
+      - For ROBOTS_DISALLOWED / ROBOTS_TEMPORARY_FAILURE:
+          1. robots_decision.reason
+          2. page.error_message
+      - For ordinary fetch/other failures:
+          1. fetch_result.error_message
+          2. fetch_result.status_code / page.status_code (as "HTTP <status>")
+          3. page.error_message
+    """
+    if site_scan_result.error_message and site_scan_result.error_message.strip():
+        return _sanitize_diagnostic_message(site_scan_result.error_message, max_length=max_length)
+
+    for page in site_scan_result.page_records:
+        candidate: str | None = None
+
+        if page.outcome in (
+            PageScanOutcome.ROBOTS_DISALLOWED,
+            PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        ):
+            if (
+                page.robots_decision
+                and page.robots_decision.reason
+                and page.robots_decision.reason.strip()
+            ):
+                candidate = page.robots_decision.reason
+            elif page.error_message and page.error_message.strip():
+                candidate = page.error_message
+        else:
+            if (
+                page.fetch_result
+                and page.fetch_result.error_message
+                and page.fetch_result.error_message.strip()
+            ):
+                candidate = page.fetch_result.error_message
+            elif page.fetch_result and page.fetch_result.status_code is not None:
+                candidate = f"HTTP {page.fetch_result.status_code}"
+            elif page.status_code is not None:
+                candidate = f"HTTP {page.status_code}"
+            elif page.error_message and page.error_message.strip():
+                candidate = page.error_message
+
+        if candidate:
+            sanitized = _sanitize_diagnostic_message(candidate, max_length=max_length)
+            if sanitized:
+                return sanitized
+
+    return None
 
 
 def map_outcome_to_url_status(
@@ -386,7 +475,9 @@ class ResultPersistenceService:
                 lease_owner=None,
                 lease_expires_at=None,
                 last_error_code=err_code,
-                last_error_message=site_scan_result.error_message,
+                last_error_message=_derive_diagnostic_message(
+                    site_scan_result, max_length=self._policy.max_error_message_length
+                ),
                 total_duration_seconds=diag.total_duration_seconds if diag else None,
                 pages_attempted=stats.pages_attempted if stats else None,
                 pages_fetched=stats.pages_fetched if stats else None,
@@ -449,7 +540,7 @@ class ResultPersistenceService:
         """
         current_time = now or datetime.now(UTC)
         sanitized_requested_url = sanitize_url(claim.original_input)
-        sanitized_err_msg = sanitize_text(
+        sanitized_err_msg = _sanitize_diagnostic_message(
             error_message, max_length=self._policy.max_error_message_length
         )
 

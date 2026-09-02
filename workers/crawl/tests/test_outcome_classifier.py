@@ -288,3 +288,96 @@ def test_classify_robots_temporary_failure_error_code() -> None:
     err_code, retryable = classify_error_code_and_retryability(res_temp)
     assert err_code == "ROBOTS_FETCH_ERROR"
     assert retryable is True
+
+
+def test_explicit_robots_denial_is_terminal_immediately() -> None:
+    """Verify PageScanOutcome.ROBOTS_DISALLOWED is terminal on the first attempt."""
+    robots_denied = RobotsDecision(
+        target_url="https://example.com/admin",
+        decision=RobotsDecisionCode.DISALLOWED,
+        crawl_delay=None,
+        reason="Disallowed by robots.txt rule",
+    )
+    page_denied = PageScanRecord(
+        requested_url="https://example.com/admin",
+        final_url="https://example.com/admin",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_DISALLOWED,
+        status_code=None,
+        robots_decision=robots_denied,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res = SiteScanResult(
+        starting_url="https://example.com/admin",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page_denied,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    outcome = classify_worker_outcome(res, None, attempt_count=1, max_attempts=3)
+    assert outcome == WorkerExecutionOutcome.TERMINAL_FAILURE
+
+
+def test_temporary_robots_failure_is_retryable_when_attempts_remain() -> None:
+    """Verify ROBOTS_TEMPORARY_FAILURE is retryable when attempt_count < max_attempts."""
+    robots_temp = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch timeout",
+    )
+    page_temp = PageScanRecord(
+        requested_url="https://example.com",
+        final_url="https://example.com",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page_temp,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    outcome = classify_worker_outcome(res, None, attempt_count=1, max_attempts=3)
+    assert outcome == WorkerExecutionOutcome.RETRYABLE_FAILURE
+
+
+def test_temporary_robots_failure_is_terminal_at_max_attempts() -> None:
+    """Verify ROBOTS_TEMPORARY_FAILURE is terminal when attempt_count >= max_attempts."""
+    robots_temp = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt DNS resolution failed",
+    )
+    page_temp = PageScanRecord(
+        requested_url="https://example.com",
+        final_url="https://example.com",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page_temp,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    outcome = classify_worker_outcome(res, None, attempt_count=3, max_attempts=3)
+    assert outcome == WorkerExecutionOutcome.TERMINAL_FAILURE

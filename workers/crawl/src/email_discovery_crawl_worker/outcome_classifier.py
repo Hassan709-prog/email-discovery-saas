@@ -27,9 +27,6 @@ def classify_error_code_and_retryability(
     site_scan_result: SiteScanResult,
 ) -> tuple[str, bool]:
     """Derive stable error code and retryability from page records and fetch outcomes."""
-    if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
-        return "ROBOTS_BLOCKED", False
-
     for page in site_scan_result.page_records:
         if page.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
             return "ROBOTS_BLOCKED", False
@@ -71,6 +68,9 @@ def classify_error_code_and_retryability(
                 if status_code is not None:
                     return f"HTTP_{status_code}", False
                 return "HTTP_ERROR", False
+
+    if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        return "ROBOTS_BLOCKED", False
 
     return "SCAN_FAILED", True
 

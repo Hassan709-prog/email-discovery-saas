@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,7 @@ from email_discovery_api.mappers.crawl_results import (
 )
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
+from email_discovery_api.models.scan_job import ScanJob
 from email_discovery_api.models.scan_url import ScanURL
 from email_discovery_api.repositories.crawl_results import (
     CrawlAttemptRepository,
@@ -32,13 +34,19 @@ from email_discovery_api.repositories.scan_urls import ScanURLRepository
 from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.result_policies import ResultPersistencePolicy
 from email_discovery_api.services.retry_policy import RetryBackoffPolicy
-from email_discovery_api.services.worker_contracts import LeaseLostError, URLClaim
+from email_discovery_api.services.worker_contracts import (
+    FencedCancellationResult,
+    LeaseLostError,
+    URLClaim,
+)
 from email_scanner.errors import SiteScanOutcome
 from email_scanner.models import SiteScanResult
 
 
 def map_outcome_to_url_status(
-    outcome: SiteScanOutcome, email_findings_count: int
+    outcome: SiteScanOutcome,
+    email_findings_count: int,
+    failure_code: str | None = None,
 ) -> tuple[ScanURLStatus, str | None]:
     """Pure mapping of scanner outcome to terminal ScanURLStatus and error_code."""
     if outcome in (SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS):
@@ -48,10 +56,20 @@ def map_outcome_to_url_status(
     if outcome == SiteScanOutcome.PARTIAL:
         return ScanURLStatus.COMPLETED, "PARTIAL_SCAN"
     if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        if failure_code in (
+            "ROBOTS_TEMPORARY_FAILURE",
+            "ROBOTS_FETCH_ERROR",
+            "TRANSPORT_ERROR",
+            "DNS_RESOLUTION_FAILED",
+            "CONNECT_TIMEOUT",
+            "READ_TIMEOUT",
+            "GENERIC_TIMEOUT",
+        ):
+            return ScanURLStatus.FAILED, "ROBOTS_FETCH_ERROR"
         return ScanURLStatus.FAILED, "ROBOTS_BLOCKED"
     if outcome == SiteScanOutcome.CANCELLED:
         return ScanURLStatus.CANCELLED, "JOB_CANCELLED"
-    return ScanURLStatus.FAILED, "SCAN_FAILED"
+    return ScanURLStatus.FAILED, failure_code or "SCAN_FAILED"
 
 
 class ResultPersistenceService:
@@ -88,11 +106,15 @@ class ResultPersistenceService:
 
         Guarantees:
             1. Runs inside exactly ONE transaction.
-            2. Never creates or repairs a lease; requires active SCANNING status with valid owner.
-            3. Never extends lease expiry or alters attempt_count.
-            4. Does not swallow exceptions.
+            2. Locks parent ScanJob FOR UPDATE first before ScanURL.
+            3. Never creates or repairs a lease; requires active SCANNING status with valid owner.
+            4. Never extends lease expiry or alters attempt_count.
+            5. Does not swallow exceptions.
         """
         async with self._session.begin():
+            # Acquire parent job lock first to maintain canonical lock order ScanJob -> ScanURL
+            await self._scan_job_repo.get_job_for_update(organization_id, job_id)
+
             raw_url = await self._scan_url_repo.get_url_for_update(
                 organization_id=organization_id, job_id=job_id, scan_url_id=scan_url_id
             )
@@ -161,6 +183,69 @@ class ResultPersistenceService:
                 claim=claim, site_scan_result=site_scan_result, now=now
             )
 
+    async def _execute_fenced_cancellation_in_transaction(
+        self,
+        claim: URLClaim,
+        job: ScanJob | None,
+        current_time: datetime,
+    ) -> bool:
+        """Execute strict fenced URL cancellation and job counter adjustment inside transaction.
+
+        Enforces strict 6-predicate fencing check in SQL:
+            - ScanURL.id == claim.scan_url_id
+            - ScanURL.status == 'SCANNING'
+            - ScanURL.lease_owner == claim.lease_owner
+            - ScanURL.fence_token == claim.fence_token
+            - ScanURL.attempt_count == claim.attempt_count
+            - ScanURL.lease_expires_at > clock_timestamp()
+
+        If fencing check affects 0 rows, raises LeaseLostError (rolling back T1).
+        If fencing check affects 1 row:
+            - sets status = 'CANCELLED'
+            - sets completed_at = current_time
+            - clears lease and claim-origin fields
+            - clears attempt-start fields
+            - sets last_error_code="JOB_CANCELLED", last_error_message="..."
+            - decrements job.running_count exactly once (if job is present and running_count > 0)
+            - does not increment failed_count
+            - returns True
+        """
+        stmt_cancel = (
+            update(ScanURL)
+            .where(
+                ScanURL.id == claim.scan_url_id,
+                ScanURL.status == ScanURLStatus.SCANNING.value,
+                ScanURL.lease_owner == claim.lease_owner,
+                ScanURL.fence_token == claim.fence_token,
+                ScanURL.attempt_count == claim.attempt_count,
+                ScanURL.lease_expires_at > func.clock_timestamp(),
+            )
+            .values(
+                status=ScanURLStatus.CANCELLED.value,
+                completed_at=current_time,
+                lease_owner=None,
+                lease_expires_at=None,
+                claimed_from_status=None,
+                claimed_from_next_retry_at=None,
+                attempt_started_at=None,
+                attempt_started_fence_token=None,
+                last_error_code="JOB_CANCELLED",
+                last_error_message="Scan URL cancelled by user job cancellation request.",
+            )
+        )
+        res = await self._session.execute(stmt_cancel)
+        if int(getattr(res, "rowcount", 0)) == 0:
+            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
+
+        if (
+            job is not None
+            and getattr(job, "running_count", None) is not None
+            and job.running_count > 0
+        ):
+            job.running_count = job.running_count - 1
+
+        return True
+
     async def _persist_fenced_result_in_transaction(
         self,
         claim: URLClaim,
@@ -205,29 +290,11 @@ class ResultPersistenceService:
         job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
 
         if job and job.status in (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value):
-            # Parent job is cancelled: update ScanURL to CANCELLED without inserting findings
-            stmt_cancel = (
-                update(ScanURL)
-                .where(
-                    ScanURL.id == claim.scan_url_id,
-                    ScanURL.status == ScanURLStatus.SCANNING.value,
-                    ScanURL.lease_owner == claim.lease_owner,
-                    ScanURL.fence_token == claim.fence_token,
-                )
-                .values(
-                    status=ScanURLStatus.CANCELLED.value,
-                    completed_at=current_time,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    claimed_from_status=None,
-                    claimed_from_next_retry_at=None,
-                    attempt_started_at=None,
-                    attempt_started_fence_token=None,
-                    last_error_code="JOB_CANCELLED",
-                )
+            # Parent job cancelled: execute fenced URL cancellation without inserting artifacts
+            await self._execute_fenced_cancellation_in_transaction(
+                claim=claim, job=job, current_time=current_time
             )
-            await self._session.execute(stmt_cancel)
-            raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.fence_token)
+            return CrawlAttemptResult(attempt=None, is_replay=False, is_cancelled=True)
 
         # Strict 5-predicate fencing check requiring lease_expires_at > clock_timestamp()
         stmt_check = (
@@ -246,7 +313,9 @@ class ResultPersistenceService:
             raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.fence_token)
 
         target_status, err_code = map_outcome_to_url_status(
-            site_scan_result.outcome, len(mapped_findings)
+            site_scan_result.outcome,
+            len(mapped_findings),
+            mapped_attempt.failure_code,
         )
 
         # 1. Save CrawlAttempt
@@ -297,6 +366,17 @@ class ResultPersistenceService:
         diag = getattr(site_scan_result, "diagnostics", None)
         stats = getattr(site_scan_result, "statistics", None)
 
+        redirect_target_domain = None
+        redirect_target_url = None
+        if (
+            err_code in ("OUT_OF_SCOPE_REDIRECT", "BUSINESS_DOMAIN_REDIRECT_REVIEW")
+            or mapped_attempt.failure_code == "OUT_OF_SCOPE_REDIRECT"
+        ):
+            if mapped_attempt.final_url:
+                redirect_target_url = mapped_attempt.final_url
+                parsed = urlsplit(mapped_attempt.final_url)
+                redirect_target_domain = parsed.hostname
+
         stmt_url_final = (
             update(ScanURL)
             .where(ScanURL.id == claim.scan_url_id)
@@ -312,6 +392,8 @@ class ResultPersistenceService:
                 pages_fetched=stats.pages_fetched if stats else None,
                 retry_count=diag.retry_count if diag else None,
                 last_failure_code=diag.failure_code if diag else None,
+                redirect_target_domain=redirect_target_domain,
+                redirect_target_url=redirect_target_url,
             )
         )
         await self._session.execute(stmt_url_final)
@@ -384,6 +466,17 @@ class ResultPersistenceService:
         )
 
         async with self._session.begin():
+            # 0. Acquire parent job lock first to maintain canonical lock order ScanJob -> ScanURL
+            job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
+
+            cancelling_statuses = (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value)
+            if job and job.status in cancelling_statuses:
+                # Parent job cancelled: execute fenced URL cancellation without recording attempt
+                await self._execute_fenced_cancellation_in_transaction(
+                    claim=claim, job=job, current_time=current_time
+                )
+                return CrawlAttemptResult(attempt=None, is_replay=False, is_cancelled=True)
+
             existing_attempt = await self._attempt_repo.get_by_scan_url_and_attempt(
                 scan_url_id=claim.scan_url_id, attempt_number=claim.attempt_count
             )
@@ -450,7 +543,6 @@ class ResultPersistenceService:
             )
             await self._session.execute(stmt_url_update)
 
-            job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
             if job is not None and getattr(job, "running_count", None) is not None:
                 if job.running_count > 0:
                     job.running_count = job.running_count - 1
@@ -462,44 +554,33 @@ class ResultPersistenceService:
 
             return CrawlAttemptResult(attempt=attempt_obj, is_replay=False)
 
-    async def persist_fenced_cancellation(self, claim: URLClaim) -> bool:
+    async def persist_fenced_cancellation(
+        self, claim: URLClaim, now: datetime | None = None
+    ) -> FencedCancellationResult:
         """Persist fenced URL cancellation during active scan when cancellation requested.
 
         Guarantees:
-            1. Verifies lease_expires_at > clock_timestamp().
-            2. Transitions ScanURL to CANCELLED.
-            3. Decrements running_count on ScanJob.
-            4. DOES NOT increment failed_count.
+            1. Locks parent ScanJob FOR UPDATE first.
+            2. Verifies parent ScanJob exists and is in CANCELLING or CANCELLED status.
+            3. Verifies strict 6-predicate fencing check in SQL (including owner and fence).
+            4. Transitions ScanURL to CANCELLED and clears lease/claim fields.
+            5. Decrements running_count on ScanJob exactly once without incrementing failed_count.
+            6. Returns explicit typed FencedCancellationResult(cancelled=True).
         """
+        current_time = now or datetime.now(UTC)
         async with self._session.begin():
-            stmt_cancel = (
-                update(ScanURL)
-                .where(
-                    ScanURL.id == claim.scan_url_id,
-                    ScanURL.status == ScanURLStatus.SCANNING.value,
-                    ScanURL.lease_owner == claim.lease_owner,
-                    ScanURL.attempt_count == claim.attempt_count,
-                    ScanURL.lease_expires_at > func.clock_timestamp(),
-                )
-                .values(
-                    status=ScanURLStatus.CANCELLED.value,
-                    lease_owner=None,
-                    lease_expires_at=None,
-                    completed_at=func.clock_timestamp(),
-                    last_error_code="JOB_CANCELLED",
-                    last_error_message="Scan URL cancelled by user job cancellation request.",
-                )
-            )
-            res = await self._session.execute(stmt_cancel)
-            if int(getattr(res, "rowcount", 0)) == 0:
-                raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
-
             job = await self._scan_job_repo.get_job_for_update(claim.organization_id, claim.job_id)
-            if (
-                job is not None
-                and getattr(job, "running_count", None) is not None
-                and job.running_count > 0
-            ):
-                job.running_count = job.running_count - 1
-
-            return True
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"ScanJob {claim.job_id} not found.",
+                )
+            if job.status not in (ScanJobStatus.CANCELLING.value, ScanJobStatus.CANCELLED.value):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"ScanJob {claim.job_id} status {job.status} is not CANCELLING/CANCELLED.",
+                )
+            await self._execute_fenced_cancellation_in_transaction(
+                claim=claim, job=job, current_time=current_time
+            )
+            return FencedCancellationResult(cancelled=True, scan_url_id=claim.scan_url_id)

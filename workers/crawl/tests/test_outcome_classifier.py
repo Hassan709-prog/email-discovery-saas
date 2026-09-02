@@ -256,3 +256,35 @@ def test_error_code_classification_matrix() -> None:
     err_code, retryable = classify_error_code_and_retryability(res_404)
     assert err_code == "HTTP_404"
     assert retryable is False
+
+
+def test_classify_robots_temporary_failure_error_code() -> None:
+    """Verify ROBOTS_TEMPORARY_FAILURE page outcome yields ROBOTS_FETCH_ERROR and is retryable."""
+    robots_temp_fail = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch error: Connection refused",
+    )
+    page_temp = PageScanRecord(
+        requested_url="https://example.com",
+        final_url="https://example.com",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp_fail,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_temp = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page_temp,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(res_temp)
+    assert err_code == "ROBOTS_FETCH_ERROR"
+    assert retryable is True

@@ -15,6 +15,7 @@ import {
   ScanURLApiResponse,
 } from '@/types/api';
 import {
+  approveUrlRedirect,
   cancelScanJob,
   downloadScanJobCsv,
   getScanJob,
@@ -86,6 +87,26 @@ export default function JobDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [approvingUrlId, setApprovingUrlId] = useState<string | null>(null);
+
+  const handleApproveRedirect = async (urlId: string, targetDomain: string) => {
+    try {
+      setApprovingUrlId(urlId);
+      await approveUrlRedirect(jobId, urlId, targetDomain);
+      await fetchJobDetail();
+    } catch (err: any) {
+      setError(
+        err instanceof ApiError
+          ? err
+          : new ApiError(500, {
+              code: 'APPROVE_FAILED',
+              message: err.message || 'Failed to approve redirect',
+            })
+      );
+    } finally {
+      setApprovingUrlId(null);
+    }
+  };
 
   // AbortControllers and request generation tracking to discard stale responses
   const progressAbortRef = useRef<AbortController | null>(null);
@@ -899,7 +920,31 @@ export default function JobDetailPage() {
                           )}
                         </td>
                         <td className="px-4 py-3 font-sans text-rose-700">
-                          {u.failure_reason || u.last_error_code || '—'}
+                          {u.requires_redirect_approval && u.redirect_target_domain ? (
+                            <div className="flex flex-col gap-1.5 py-1">
+                              <div className="text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5">
+                                Redirected to business domain:{' '}
+                                <span className="font-bold underline">{u.redirect_target_domain}</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleApproveRedirect(u.id, u.redirect_target_domain!)
+                                  }
+                                  disabled={approvingUrlId === u.id || !u.can_approve_redirect}
+                                  className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[11px] rounded shadow-sm disabled:opacity-50 transition-colors"
+                                >
+                                  {approvingUrlId === u.id ? 'Approving...' : 'Approve & Retry'}
+                                </button>
+                                <span className="text-[11px] text-slate-500 italic">
+                                  Keep blocked
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            u.failure_reason || u.last_error_code || '—'
+                          )}
                         </td>
                       </tr>
                     ))}

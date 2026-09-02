@@ -114,6 +114,38 @@ class PrimaryEmailSelectionResult:
     version: str = PRIMARY_EMAIL_SELECTION_VERSION
 
 
+_UNRELATED_VENDOR_DOMAINS = frozenset(
+    {
+        "wordpress.org",
+        "wordpress.com",
+        "wix.com",
+        "squarespace.com",
+        "godaddy.com",
+        "webflow.com",
+        "shopify.com",
+        "github.com",
+        "google.com",
+        "facebook.com",
+        "twitter.com",
+        "instagram.com",
+        "linkedin.com",
+        "schema.org",
+        "w3.org",
+        "sentry.io",
+        "cloudflare.com",
+        "sentry-cdn.com",
+    }
+)
+
+_UNRELATED_VENDOR_LOCAL_PARTS = frozenset(
+    {
+        "webmaster",
+        "developer",
+        "hostmaster",
+    }
+)
+
+
 def is_free_email_provider(domain: str) -> bool:
     """Check whether a domain is a known public free email provider."""
     dom_lower = domain.strip().lower()
@@ -132,18 +164,61 @@ def _is_eligible_candidate(finding: EmailFinding) -> bool:
     if finding.category == EmailCategory.NO_REPLY:
         return False
     local_lower = finding.local_part.lower()
-    if local_lower in {
-        "noreply",
-        "no-reply",
-        "do-not-reply",
-        "donotreply",
-        "nobody",
-        "bounce",
-        "mailer-daemon",
-        "null",
-    }:
+    if (
+        local_lower
+        in {
+            "noreply",
+            "no-reply",
+            "do-not-reply",
+            "donotreply",
+            "nobody",
+            "bounce",
+            "mailer-daemon",
+            "null",
+        }
+        or local_lower in _UNRELATED_VENDOR_LOCAL_PARTS
+    ):
         return False
+
+    dom_lower = finding.domain.strip().lower()
+    if dom_lower in _UNRELATED_VENDOR_DOMAINS:
+        return False
+    ext = tldextract.extract(dom_lower)
+    if (
+        ext.top_domain_under_public_suffix
+        and ext.top_domain_under_public_suffix.lower() in _UNRELATED_VENDOR_DOMAINS
+    ):
+        return False
+
     return True
+
+
+def has_strong_business_evidence(ev_records: Iterable[EmailEvidenceRecord]) -> bool:
+    """Evaluate whether candidate evidence records demonstrate strong business contact intent."""
+    for ev in ev_records:
+        if ev.source_kind == EmailSourceKind.MAILTO:
+            return True
+        snip_lower = ev.evidence_snippet.lower()
+        if any(
+            kw in snip_lower
+            for kw in (
+                "email:",
+                "contact:",
+                "support:",
+                "office:",
+                "sales:",
+                "mail:",
+                "write to us:",
+                "get in touch:",
+            )
+        ):
+            return True
+        url_lower = ev.source_url.lower()
+        if any(p in url_lower for p in ("/contact", "/about", "/reach", "/location")):
+            return True
+        if ev.page_score > 0:
+            return True
+    return False
 
 
 def sort_evidence_records(
@@ -159,11 +234,6 @@ def sort_evidence_records(
             seen.add(key)
             unique_records.append(rec)
 
-    # Sort priority:
-    # 1. source_kind weight descending
-    # 2. page_score descending
-    # 3. source_url ascending
-    # 4. evidence_snippet ascending
     unique_records.sort(
         key=lambda r: (
             -_SOURCE_KIND_WEIGHTS.get(r.source_kind, 0),
@@ -179,21 +249,7 @@ def select_primary_email(
     findings: Iterable[EmailFinding],
     website_url: str | NormalizedURL,
 ) -> PrimaryEmailSelectionResult:
-    """Select at most one deterministic primary email from accepted candidates for a website.
-
-    Two-Stage Selection Protocol:
-      Stage 1: Eligibility & Domain Affinity Tier Grouping
-        Tier A: Same-Domain (EXACT_HOST or SAME_REGISTRABLE_DOMAIN)
-        Tier B: External Business Domain (EXTERNAL and not free provider)
-        Tier C: Free Provider Fallback (EXTERNAL and free provider)
-        If Tier A has eligible candidates, Tiers B & C are strictly excluded.
-        Else if Tier B has eligible candidates, Tier C is strictly excluded.
-
-      Stage 2: Score evaluation within highest active tier:
-        - Business suitability role priority
-        - Evidence strength (source kind, page score, evidence count)
-        - Final tie-breaker: canonical_email ascending
-    """
+    """Select at most one deterministic primary email from accepted candidates for a website."""
     eligible = [f for f in findings if _is_eligible_candidate(f)]
     if not eligible:
         return PrimaryEmailSelectionResult(
@@ -203,7 +259,7 @@ def select_primary_email(
             version=PRIMARY_EMAIL_SELECTION_VERSION,
         )
 
-    # Stage 1: Categorize eligible candidates into domain-affinity tiers
+    # Categorize eligible candidates into domain-affinity groups
     tier_a_same_domain: list[EmailFinding] = []
     tier_b_external_business: list[EmailFinding] = []
     tier_c_free_provider: list[EmailFinding] = []
@@ -216,16 +272,17 @@ def select_primary_email(
         else:
             tier_b_external_business.append(f)
 
-    # Apply strict exclusion
-    if tier_a_same_domain:
-        active_candidates = tier_a_same_domain
-        affinity_tier_name = "SAME_DOMAIN"
+    # Allow strong-evidence external business candidates to compete with Same Domain candidates
+    strong_external = [
+        f for f in tier_b_external_business if has_strong_business_evidence(f.evidence_records)
+    ]
+
+    if tier_a_same_domain or strong_external:
+        active_candidates = tier_a_same_domain + strong_external
     elif tier_b_external_business:
         active_candidates = tier_b_external_business
-        affinity_tier_name = "EXTERNAL_BUSINESS"
     else:
         active_candidates = tier_c_free_provider
-        affinity_tier_name = "FREE_PROVIDER_FALLBACK"
 
     # Stage 2: Evaluate candidates in active tier
     best_candidate: EmailFinding | None = None
@@ -252,25 +309,33 @@ def select_primary_email(
         score = 0
 
         # 1. Domain Tier Signal
-        if affinity_tier_name == "SAME_DOMAIN":
-            if first_cand.domain_affinity == DomainAffinity.EXACT_HOST:
-                signals.append(PrimaryEmailSelectionSignal("domain_affinity", "EXACT_HOST", 15000))
-                score += 15000
-            else:
-                signals.append(
-                    PrimaryEmailSelectionSignal("domain_affinity", "SAME_REGISTRABLE_DOMAIN", 10000)
-                )
-                score += 10000
-        elif affinity_tier_name == "EXTERNAL_BUSINESS":
+        if first_cand.domain_affinity == DomainAffinity.EXACT_HOST:
+            signals.append(PrimaryEmailSelectionSignal("domain_affinity", "EXACT_HOST", 15000))
+            score += 15000
+        elif first_cand.domain_affinity == DomainAffinity.SAME_REGISTRABLE_DOMAIN:
             signals.append(
-                PrimaryEmailSelectionSignal("domain_affinity", "EXTERNAL_BUSINESS", 2000)
+                PrimaryEmailSelectionSignal("domain_affinity", "SAME_REGISTRABLE_DOMAIN", 10000)
             )
-            score += 2000
-        else:
+            score += 10000
+        elif is_free_email_provider(first_cand.domain):
             signals.append(
                 PrimaryEmailSelectionSignal("domain_affinity", "FREE_PROVIDER_FALLBACK", 1000)
             )
             score += 1000
+        elif has_strong_business_evidence(sorted_ev):
+            signals.append(
+                PrimaryEmailSelectionSignal(
+                    "domain_affinity", "EXTERNAL_BUSINESS_STRONG_EVIDENCE", 12000
+                )
+            )
+            score += 12000
+        else:
+            signals.append(
+                PrimaryEmailSelectionSignal(
+                    "domain_affinity", "EXTERNAL_BUSINESS_WEAK_EVIDENCE", 2000
+                )
+            )
+            score += 2000
 
         # 2. Business Suitability Signal
         if local_lower in _TOP_BUSINESS_CONTACT_ROLES:

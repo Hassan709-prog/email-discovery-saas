@@ -312,6 +312,7 @@ async def test_persist_site_scan_result_cannot_create_or_repair_lease() -> None:
 
     service = ResultPersistenceService(session=mock_session)
     service_any: Any = service
+    service_any._scan_job_repo.get_job_for_update = AsyncMock()
     sample_result = make_sample_site_scan_result()
 
     # 1. Missing lease owner raises INVALID_RESULT_STATE

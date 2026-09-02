@@ -307,3 +307,39 @@ async def cancel_scan_job(
     """Request job cancellation from QUEUED or RUNNING states."""
     job = await service.cancel_job(principal.organization_id, job_id)
     return ScanJobApiResponse.from_orm_model(job)
+
+
+@router.post(
+    "/{job_id}/urls/{url_id}/approve-redirect",
+    response_model=ScanURLApiResponse,
+    summary="Approve cross-domain redirect and retry ScanURL",
+)
+async def approve_url_redirect(
+    job_id: UUID,
+    url_id: UUID,
+    approved_target_domain: str | None = Query(default=None),
+    principal: RequestPrincipal = Depends(get_current_principal),
+    service: ScanJobService = Depends(get_scan_job_service),
+    publisher: Any = Depends(get_redis_publisher),
+) -> ScanURLApiResponse:
+    """Approve a pending cross-domain redirect for a specific target URL and re-queue it."""
+    url = await service.approve_url_redirect(
+        organization_id=principal.organization_id,
+        job_id=job_id,
+        url_id=url_id,
+        approved_target_domain=approved_target_domain,
+    )
+
+    if publisher is not None:
+        try:
+            await asyncio.wait_for(
+                publisher.publish_work_available(),
+                timeout=0.25,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Redis wake-up publish failed [code=REDIS_PUBLISH_FAILED, error_type=%s]",
+                type(exc).__name__,
+            )
+
+    return ScanURLApiResponse.from_orm_model(url)

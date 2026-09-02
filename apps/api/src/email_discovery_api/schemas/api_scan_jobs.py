@@ -31,6 +31,9 @@ class CreateScanJobApiRequest(BaseModel):
     overrides: dict[int, bool] | None = Field(
         default=None, description="Optional index-based selection overrides"
     )
+    approved_redirect_domains: dict[str, str] | None = Field(
+        default=None, description="Optional per-URL redirect domain approvals"
+    )
     configuration_snapshot: dict[str, Any] = Field(
         default_factory=dict, description="Scan job configuration settings"
     )
@@ -203,6 +206,33 @@ class ScanURLDiagnosticsApiResponse(BaseModel):
     failure_reason: str | None = None
 
 
+_FAILURE_REASON_DESCRIPTIONS: dict[str, str] = {
+    "ROBOTS_BLOCKED": "Blocked by an explicit robots.txt rule",
+    "ROBOTS_FETCH_ERROR": "Skipped because robots.txt could not be verified",
+    "ROBOTS_TEMPORARY_FAILURE": "Skipped because robots.txt could not be verified",
+    "HTTP_403": "Website denied automated access",
+    "AUTOMATED_ACCESS_DENIED": "Website denied automated access",
+    "OUT_OF_SCOPE_REDIRECT": "Redirected to another business website—approval required",
+    "BUSINESS_DOMAIN_REDIRECT_REVIEW": "Redirected to another business website—approval required",
+    "NO_EMAIL": "No public email detected",
+    "REJECTED_UNRELATED": "Public email found but rejected as unrelated",
+    "DIRECTORY_INDEX_ONLY": "No meaningful website content found across safe origin variants",
+    "TRANSPORT_ERROR": "Network or TLS connection failed",
+    "DNS_RESOLUTION_FAILED": "Network or TLS connection failed",
+    "TLS_VERIFICATION_FAILED": "Network or TLS connection failed",
+    "CONNECT_TIMEOUT": "Network or TLS connection failed",
+    "READ_TIMEOUT": "Network or TLS connection failed",
+    "GENERIC_TIMEOUT": "Network or TLS connection failed",
+}
+
+
+def format_failure_reason(fail_code: str | None, error_message: str | None) -> str:
+    """Format failure_reason into clean human-readable descriptions."""
+    if fail_code and fail_code in _FAILURE_REASON_DESCRIPTIONS:
+        return _FAILURE_REASON_DESCRIPTIONS[fail_code]
+    return fail_code or error_message or "Scan execution failed"
+
+
 class ScanURLApiResponse(BaseModel):
     """Public scan URL detail response model."""
 
@@ -226,6 +256,11 @@ class ScanURLApiResponse(BaseModel):
     primary_email_selection_version: str | None = None
     plain_language_outcome: str | None = None
     failure_reason: str | None = None
+    approved_redirect_domain: str | None = None
+    redirect_target_domain: str | None = None
+    redirect_target_url: str | None = None
+    requires_redirect_approval: bool = False
+    can_approve_redirect: bool = False
     diagnostics: ScanURLDiagnosticsApiResponse | None = None
 
     @classmethod
@@ -253,7 +288,7 @@ class ScanURLApiResponse(BaseModel):
         else:
             plain_outcome = "Failed"
             fail_code = getattr(url, "last_failure_code", None) or url.last_error_code
-            reason = fail_code or url.last_error_message or "Scan execution failed"
+            reason = format_failure_reason(fail_code, url.last_error_message)
 
         tot_dur = getattr(url, "total_duration_seconds", None)
         p_attempted = getattr(url, "pages_attempted", None)
@@ -275,6 +310,22 @@ class ScanURLApiResponse(BaseModel):
                 failure_reason=reason,
             )
 
+        app_redirect = getattr(url, "approved_redirect_domain", None)
+        target_redirect = getattr(url, "redirect_target_domain", None)
+        target_redirect_url = getattr(url, "redirect_target_url", None)
+        last_fail_code = getattr(url, "last_failure_code", None) or url.last_error_code
+
+        requires_redirect = (
+            st == ScanURLStatus.FAILED
+            and last_fail_code in ("OUT_OF_SCOPE_REDIRECT", "BUSINESS_DOMAIN_REDIRECT_REVIEW")
+            and target_redirect is not None
+            and app_redirect is None
+        )
+        job_obj = getattr(url, "scan_job", None)
+        can_approve = requires_redirect and (
+            job_obj is None or getattr(job_obj, "status", None) not in ("CANCELLED", "CANCELLING")
+        )
+
         return cls(
             id=url.id,
             scan_job_id=url.scan_job_id,
@@ -293,6 +344,11 @@ class ScanURLApiResponse(BaseModel):
             primary_email_selection_version=selection_version,
             plain_language_outcome=plain_outcome,
             failure_reason=reason,
+            approved_redirect_domain=app_redirect,
+            redirect_target_domain=target_redirect,
+            redirect_target_url=target_redirect_url,
+            requires_redirect_approval=requires_redirect,
+            can_approve_redirect=can_approve,
             diagnostics=diag_obj,
         )
 

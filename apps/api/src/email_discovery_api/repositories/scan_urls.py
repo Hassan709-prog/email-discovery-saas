@@ -32,12 +32,15 @@ class ScanURLRepository:
         status: str | None = None,
     ) -> list[ScanURL]:
         """List scan URLs with tenant JOIN and deterministic ordering."""
-        from sqlalchemy.orm import selectinload
+        from sqlalchemy.orm import contains_eager, selectinload
 
         stmt = (
             select(ScanURL)
-            .options(selectinload(ScanURL.email_finding))
             .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .options(
+                contains_eager(ScanURL.scan_job),
+                selectinload(ScanURL.email_finding),
+            )
             .where(
                 ScanJob.organization_id == organization_id,
                 ScanURL.scan_job_id == job_id,
@@ -61,9 +64,15 @@ class ScanURLRepository:
         self, organization_id: UUID, job_id: UUID, scan_url_id: UUID
     ) -> ScanURL | None:
         """Lock and retrieve tenant-scoped ScanURL row using SELECT ... FOR UPDATE."""
+        from sqlalchemy.orm import contains_eager, selectinload
+
         stmt = (
             select(ScanURL)
             .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .options(
+                contains_eager(ScanURL.scan_job),
+                selectinload(ScanURL.email_finding),
+            )
             .where(
                 ScanJob.organization_id == organization_id,
                 ScanURL.scan_job_id == job_id,

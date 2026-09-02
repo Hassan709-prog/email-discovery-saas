@@ -159,6 +159,8 @@ class FetchConfig:
     )
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     pinning_config: PinningConfig = field(default_factory=PinningConfig)
+    allow_cross_domain_redirects: bool = False
+    approved_redirect_domains: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         from email_scanner.errors import FetchConfigError, FetchConfigErrorCode

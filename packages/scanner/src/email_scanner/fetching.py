@@ -340,8 +340,19 @@ class AsyncHTTPFetcher:
                                     )
                                     try:
                                         target_url = normalize_url(target_str)
+                                        is_approved_redirect = False
+                                        if config.allow_cross_domain_redirects:
+                                            is_approved_redirect = True
+                                        elif (
+                                            target_url.registrable_domain
+                                            and target_url.registrable_domain.lower()
+                                            in [d.lower() for d in config.approved_redirect_domains]
+                                        ):
+                                            is_approved_redirect = True
+
                                         if (
                                             effective_redirect_validator is not None
+                                            and not is_approved_redirect
                                             and not effective_redirect_validator(
                                                 current_url, target_url
                                             )

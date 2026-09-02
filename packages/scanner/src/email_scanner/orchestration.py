@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from email_scanner.discovery import discover_and_rank_links
 from email_scanner.errors import (
     FetchOutcomeCode,
     PageScanOutcome,
@@ -424,11 +423,53 @@ class SiteScanOrchestrator:
                     )
 
             # Discover links using final_url
+            from email_scanner.discovery import (
+                discover_and_rank_links,
+                is_directory_index_or_placeholder,
+            )
+
             discovery_result = discover_and_rank_links(
                 final_url_str,
                 fetch_result.body_text or "",
                 cfg.discovery_config,
             )
+
+            # Check if root homepage returned a bare directory index or empty placeholder
+            if depth == 0 and (
+                is_directory_index_or_placeholder(fetch_result.body_text or "")
+                or len(discovery_result.discovered_links) == 0
+            ):
+                if norm_current.registrable_domain and not norm_current.hostname.startswith("www."):
+                    variant_str = f"{norm_current.scheme}://www.{norm_current.registrable_domain}/"
+                    if variant_str not in visited_urls:
+                        try:
+                            norm_variant = normalize_url(variant_str)
+                            var_robots = await self._robots_evaluator.evaluate(
+                                norm_variant, recorder=rec
+                            )
+                            if var_robots.decision != RobotsDecisionCode.DISALLOWED:
+                                var_fetch = await self._fetcher.fetch(
+                                    norm_variant,
+                                    redirect_validator=redirect_validator,
+                                    recorder=rec,
+                                )
+                                if (
+                                    var_fetch.outcome == FetchOutcomeCode.SUCCESS
+                                    and not is_directory_index_or_placeholder(
+                                        var_fetch.body_text or ""
+                                    )
+                                ):
+                                    var_discovery = discover_and_rank_links(
+                                        var_fetch.final_url or variant_str,
+                                        var_fetch.body_text or "",
+                                        cfg.discovery_config,
+                                    )
+                                    if len(var_discovery.discovered_links) > 0:
+                                        discovery_result = var_discovery
+                                        final_url_str = var_fetch.final_url or variant_str
+                                        fetch_result = var_fetch
+                        except Exception:
+                            pass
             rec.page_processing_duration_seconds += max(0.0, self._clock() - parse_start_t)
 
             # Queue discovered links if within depth and total URL limits
@@ -554,8 +595,6 @@ class SiteScanOrchestrator:
             if rec.failure_code is None:
                 if site_outcome == SiteScanOutcome.CANCELLED:
                     rec.failure_code = SiteScanFailureCode.CANCELLED
-                elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
-                    rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
                 elif page_records:
                     first_p = page_records[0]
                     if first_p.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
@@ -565,6 +604,10 @@ class SiteScanOrchestrator:
                     elif first_p.fetch_result is not None:
                         fetch_out = first_p.fetch_result.outcome
                         rec.failure_code = map_fetch_outcome_to_failure_code(fetch_out)
+                    elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
+                elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+                    rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
 
         diagnostics_snapshot = rec.build_diagnostics()
 

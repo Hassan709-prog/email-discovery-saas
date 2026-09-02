@@ -663,12 +663,18 @@ class CrawlWorker:
                 else:
                     from email_scanner.dns import SystemDNSResolver
                     from email_scanner.fetching import AsyncHTTPFetcher
+                    from email_scanner.models import FetchConfig
 
                     dns_resolver = SystemDNSResolver(
                         dns_cache=self.dns_cache,
                         single_flight=self.single_flight,
                     )
+                    approved_domains = (
+                        (claim.approved_redirect_domain,) if claim.approved_redirect_domain else ()
+                    )
+                    fetch_cfg = FetchConfig(approved_redirect_domains=approved_domains)
                     fetcher = AsyncHTTPFetcher(
+                        config=fetch_cfg,
                         dns_resolver=dns_resolver,
                         request_gate=request_gate,
                         cancellation_checker=is_cancelled,

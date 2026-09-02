@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -11,7 +12,6 @@ from typing import Any
 from sqlalchemy import bindparam, func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
@@ -150,6 +150,7 @@ class CrawlWorkService:
                             su.attempt_count,
                             su.max_attempts,
                             su.fence_token,
+                            su.approved_redirect_domain,
                             su.created_at,
                             ROW_NUMBER() OVER (
                                 PARTITION BY su.scan_job_id
@@ -170,7 +171,8 @@ class CrawlWorkService:
                         ru.next_retry_at,
                         ru.attempt_count,
                         ru.max_attempts,
-                        ru.fence_token
+                        ru.fence_token,
+                        ru.approved_redirect_domain
                     FROM ranked_urls ru
                     JOIN scan_jobs sj ON ru.scan_job_id = sj.id
                     WHERE ru.job_url_rank <= 5
@@ -200,6 +202,7 @@ class CrawlWorkService:
                                 "attempt_count": r[7],
                                 "max_attempts": r[8],
                                 "fence_token": r[9],
+                                "approved_redirect_domain": r[10],
                             }
                         )
                     break
@@ -316,6 +319,7 @@ class CrawlWorkService:
                     lease_expires_at=lease_expires_at,
                     claimed_from_status=claimed_from_status,
                     claimed_from_next_retry_at=claimed_from_next_retry_at,
+                    approved_redirect_domain=cand.get("approved_redirect_domain"),
                 )
 
         return None
@@ -439,10 +443,32 @@ class CrawlWorkService:
             Preserves consumed attempt_count and applies RetryBackoffPolicy.
         """
         async with self._transaction_context():
-            # Lock ScanURL and parent ScanJob
-            url_stmt = (
-                select(ScanURL, ScanJob)
+            # Step 1: Read target URL and parent Job identity (without FOR UPDATE)
+            info_stmt = (
+                select(ScanURL.scan_job_id, ScanJob.organization_id)
                 .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+                .where(
+                    ScanURL.id == scan_url_id,
+                    ScanURL.status == ScanURLStatus.SCANNING.value,
+                    ScanURL.lease_owner == lease_owner,
+                    ScanURL.fence_token == fence_token,
+                )
+            )
+            info_res = await self.session.execute(info_stmt)
+            info_row = info_res.one_or_none()
+            if info_row is None:
+                return False
+
+            job_id, org_id = info_row[0], info_row[1]
+
+            # Step 2: Lock parent ScanJob FOR UPDATE first
+            job = await self.job_repo.get_job_for_update(org_id, job_id)
+            if job is None:
+                return False
+
+            # Step 3: Lock child ScanURL FOR UPDATE second
+            url_stmt = (
+                select(ScanURL)
                 .where(
                     ScanURL.id == scan_url_id,
                     ScanURL.status == ScanURLStatus.SCANNING.value,
@@ -452,13 +478,9 @@ class CrawlWorkService:
                 .with_for_update()
             )
             res = await self.session.execute(url_stmt)
-            row = res.one_or_none()
-
-            if row is None:
+            scan_url = res.scalar_one_or_none()
+            if scan_url is None:
                 return False
-
-            scan_url: ScanURL = row[0]
-            job: ScanJob = row[1]
 
             if job.running_count > 0:
                 job.running_count = job.running_count - 1
@@ -507,68 +529,140 @@ class CrawlWorkService:
             return True
 
     async def recover_expired_leases(self, batch_size: int = 50) -> int:
-        """Recover expired SCANNING leases safely with strict parent-cancellation checks."""
+        """Recover expired SCANNING leases safely with parent-first locking and rotation.
+
+        Scheduling & Concurrency Design:
+            1. Candidate Parent Selection: Queries ScanJobs that currently have expired SCANNING
+               URLs, ordered by last_claimed_at ASC NULLS FIRST, created_at ASC, id ASC to
+               ensure rotating fairness across repeated calls.
+            2. Worker Concurrency Bound: Bounds parent locks to MAX_PARENT_JOBS_PER_RECOVERY_CALL
+               = 2 per call using FOR UPDATE SKIP LOCKED. This prevents one worker from locking
+               all eligible jobs in a single transaction and guarantees concurrent workers skip
+               locked jobs to work in parallel.
+            3. Parent-First Locking: For each bounded candidate job, parent ScanJob is locked FOR
+               UPDATE SKIP LOCKED before child ScanURL rows for that job are locked.
+            4. Job Rotation: Updates job.last_claimed_at = datetime.now(UTC) upon processing,
+               ensuring large jobs rotate behind other jobs across repeated recovery cycles.
+        """
+        if batch_size <= 0:
+            return 0
+
+        max_parent_jobs_per_call = 2
+
         recovered_count = 0
         async with self._transaction_context():
-            stmt = (
-                select(ScanURL)
-                .options(selectinload(ScanURL.scan_job))
+            # Step 1: Query IDs of candidate parent jobs with expired SCANNING URLs,
+            # ordered by last_claimed_at ASC NULLS FIRST, created_at ASC, id ASC for fair rotation.
+            candidate_jobs_stmt = (
+                select(ScanJob.id)
+                .join(ScanURL, ScanURL.scan_job_id == ScanJob.id)
                 .where(
                     ScanURL.status == ScanURLStatus.SCANNING.value,
                     ScanURL.lease_expires_at <= func.clock_timestamp(),
                 )
+                .group_by(ScanJob.id, ScanJob.last_claimed_at, ScanJob.created_at)
+                .order_by(
+                    ScanJob.last_claimed_at.asc().nulls_first(),
+                    ScanJob.created_at.asc(),
+                    ScanJob.id.asc(),
+                )
                 .limit(batch_size)
-                .with_for_update(skip_locked=True)
             )
-            res = await self.session.execute(stmt)
-            expired_urls = list(res.scalars().all())
+            res = await self.session.execute(candidate_jobs_stmt)
+            candidate_job_ids = list(res.scalars().all())
 
-            for scan_url in expired_urls:
-                job = await self.job_repo.get_job_for_update(
-                    scan_url.scan_job.organization_id, scan_url.scan_job_id
+            if not candidate_job_ids:
+                return 0
+
+            # Step 2: Lock bounded candidate parent ScanJob rows FOR UPDATE SKIP LOCKED (max 2 jobs)
+            parent_jobs_stmt = (
+                select(ScanJob)
+                .where(ScanJob.id.in_(candidate_job_ids))
+                .order_by(
+                    ScanJob.last_claimed_at.asc().nulls_first(),
+                    ScanJob.created_at.asc(),
+                    ScanJob.id.asc(),
                 )
-                if job is None:
-                    continue
+                .with_for_update(skip_locked=True)
+                .limit(max_parent_jobs_per_call)
+            )
+            parent_res = await self.session.execute(parent_jobs_stmt)
+            locked_jobs = list(parent_res.scalars().all())
 
-                if job.running_count > 0:
-                    job.running_count = job.running_count - 1
+            if not locked_jobs:
+                return 0
 
-                parent_cancelled = job.status in (
-                    ScanJobStatus.CANCELLING.value,
-                    ScanJobStatus.CANCELLED.value,
+            remaining_jobs = len(locked_jobs)
+            for job in locked_jobs:
+                remaining_batch = batch_size - recovered_count
+                if remaining_batch <= 0:
+                    break
+
+                # Fair per-job allocation limit
+                per_job_limit = min(
+                    remaining_batch, max(1, math.ceil(remaining_batch / remaining_jobs))
                 )
 
-                if parent_cancelled:
-                    scan_url.status = ScanURLStatus.CANCELLED.value
-                    scan_url.completed_at = datetime.now(UTC)
-                    scan_url.last_error_code = "JOB_CANCELLED"
-                elif scan_url.attempt_started_fence_token is None:
-                    # Pre-attempt recovery: 0 attempts consumed
-                    restored_status = scan_url.claimed_from_status or ScanURLStatus.QUEUED.value
-                    scan_url.status = restored_status
-                    scan_url.next_retry_at = scan_url.claimed_from_next_retry_at
-                    if restored_status == ScanURLStatus.QUEUED.value:
-                        job.queued_count = job.queued_count + 1
-                elif scan_url.attempt_count < scan_url.max_attempts:
-                    scan_url.status = ScanURLStatus.RETRY_WAIT.value
-                    scan_url.next_retry_at = datetime.now(UTC) + timedelta(
-                        seconds=self.retry_policy.compute_delay_seconds(scan_url.attempt_count)
+                # Step 3: Lock child ScanURL rows for this job FOR UPDATE SKIP LOCKED
+                urls_stmt = (
+                    select(ScanURL)
+                    .where(
+                        ScanURL.scan_job_id == job.id,
+                        ScanURL.status == ScanURLStatus.SCANNING.value,
+                        ScanURL.lease_expires_at <= func.clock_timestamp(),
                     )
-                    scan_url.last_error_code = "LEASE_EXPIRED"
-                    job.queued_count = job.queued_count + 1
-                else:
-                    scan_url.status = ScanURLStatus.FAILED.value
-                    scan_url.completed_at = datetime.now(UTC)
-                    scan_url.last_error_code = "LEASE_EXPIRED_MAX_ATTEMPTS"
-                    job.failed_count = job.failed_count + 1
+                    .order_by(ScanURL.created_at.asc(), ScanURL.id.asc())
+                    .with_for_update(skip_locked=True)
+                    .limit(per_job_limit)
+                )
+                urls_res = await self.session.execute(urls_stmt)
+                expired_urls = list(urls_res.scalars().all())
 
-                scan_url.lease_owner = None
-                scan_url.lease_expires_at = None
-                scan_url.claimed_from_status = None
-                scan_url.claimed_from_next_retry_at = None
-                scan_url.attempt_started_at = None
-                scan_url.attempt_started_fence_token = None
+                for scan_url in expired_urls:
+                    if job.running_count > 0:
+                        job.running_count = job.running_count - 1
 
-                recovered_count += 1
+                    parent_cancelled = job.status in (
+                        ScanJobStatus.CANCELLING.value,
+                        ScanJobStatus.CANCELLED.value,
+                    )
+
+                    if parent_cancelled:
+                        scan_url.status = ScanURLStatus.CANCELLED.value
+                        scan_url.completed_at = datetime.now(UTC)
+                        scan_url.last_error_code = "JOB_CANCELLED"
+                    elif scan_url.attempt_started_fence_token is None:
+                        # Pre-attempt recovery: 0 attempts consumed
+                        restored_status = scan_url.claimed_from_status or ScanURLStatus.QUEUED.value
+                        scan_url.status = restored_status
+                        scan_url.next_retry_at = scan_url.claimed_from_next_retry_at
+                        if restored_status == ScanURLStatus.QUEUED.value:
+                            job.queued_count = job.queued_count + 1
+                    elif scan_url.attempt_count < scan_url.max_attempts:
+                        scan_url.status = ScanURLStatus.RETRY_WAIT.value
+                        scan_url.next_retry_at = datetime.now(UTC) + timedelta(
+                            seconds=self.retry_policy.compute_delay_seconds(scan_url.attempt_count)
+                        )
+                        scan_url.last_error_code = "LEASE_EXPIRED"
+                        job.queued_count = job.queued_count + 1
+                    else:
+                        scan_url.status = ScanURLStatus.FAILED.value
+                        scan_url.completed_at = datetime.now(UTC)
+                        scan_url.last_error_code = "LEASE_EXPIRED_MAX_ATTEMPTS"
+                        job.failed_count = job.failed_count + 1
+
+                    scan_url.lease_owner = None
+                    scan_url.lease_expires_at = None
+                    scan_url.claimed_from_status = None
+                    scan_url.claimed_from_next_retry_at = None
+                    scan_url.attempt_started_at = None
+                    scan_url.attempt_started_fence_token = None
+
+                    recovered_count += 1
+
+                if expired_urls:
+                    job.last_claimed_at = datetime.now(UTC)
+
+                remaining_jobs -= 1
 
         return recovered_count

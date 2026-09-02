@@ -171,6 +171,11 @@ export interface ScanURLApiResponse {
   primary_email_selection_version?: string | null;
   plain_language_outcome?: string | null;
   failure_reason?: string | null;
+  approved_redirect_domain?: string | null;
+  redirect_target_domain?: string | null;
+  redirect_target_url?: string | null;
+  requires_redirect_approval?: boolean;
+  can_approve_redirect?: boolean;
   diagnostics?: ScanURLDiagnosticsApiResponse | null;
 }
 

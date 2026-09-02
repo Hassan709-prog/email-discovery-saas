@@ -294,6 +294,7 @@ class CrawlAttemptResult:
 
     attempt: Any
     is_replay: bool
+    is_cancelled: bool = False
 
 
 def compute_transient_attempt_checksum(

@@ -23,6 +23,7 @@ class CreateScanJobCommand(BaseModel):
     inputs: list[str] = Field(..., min_length=1)
     idempotency_key: str | None = Field(default=None, max_length=255)
     overrides: dict[int, bool] | None = Field(default=None)
+    approved_redirect_domains: dict[str, str] | None = Field(default=None)
     configuration_snapshot: dict[str, Any] = Field(default_factory=dict)
     scanner_version: str = Field(default="1.0.0", max_length=50)
     normalization_version: str = Field(default="1.0.0", max_length=50)

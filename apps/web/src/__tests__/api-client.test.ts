@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import {
   apiFetch,
+  downloadScanJobCsv,
   getAccessToken,
   setAccessToken,
   getCsrfToken,
@@ -9,12 +10,14 @@ import {
   loginUser,
   logoutUser,
   logoutAllUser,
+  setOnSessionExpired,
 } from '@/lib/api-client';
 import { ApiError } from '@/types/api';
 
 describe('api-client.ts', () => {
   beforeEach(() => {
     setAccessToken(null);
+    setOnSessionExpired(null);
     vi.restoreAllMocks();
     document.cookie = 'csrf_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
     localStorage.clear();
@@ -22,6 +25,8 @@ describe('api-client.ts', () => {
   });
 
   afterEach(() => {
+    setAccessToken(null);
+    setOnSessionExpired(null);
     vi.restoreAllMocks();
   });
 
@@ -83,7 +88,6 @@ describe('api-client.ts', () => {
           )
         );
       }
-      // Ordinary endpoint fails with 401 on first call
       if (getAccessToken() !== 'refreshed-jwt') {
         return Promise.resolve(new Response(JSON.stringify({ detail: 'Unauthorized' }), { status: 401 }));
       }
@@ -93,7 +97,6 @@ describe('api-client.ts', () => {
 
     setAccessToken('stale-jwt');
 
-    // Launch 3 concurrent requests that get 401
     const req1 = apiFetch<{ data: string }>('/api/v1/data1');
     const req2 = apiFetch<{ data: string }>('/api/v1/data2');
     const req3 = apiFetch<{ data: string }>('/api/v1/data3');
@@ -101,7 +104,7 @@ describe('api-client.ts', () => {
     const results = await Promise.all([req1, req2, req3]);
 
     expect(results).toEqual([{ data: 'ok' }, { data: 'ok' }, { data: 'ok' }]);
-    expect(refreshCount).toBe(1); // Single-flight refresh!
+    expect(refreshCount).toBe(1);
   });
 
   it('retries an ordinary request at most once after refresh', async () => {
@@ -118,7 +121,6 @@ describe('api-client.ts', () => {
           )
         );
       }
-      // Endpoint continues to fail 401 even after refresh
       return Promise.resolve(new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Forbidden' } }), { status: 401 }));
     });
     vi.stubGlobal('fetch', mockFetch);
@@ -126,7 +128,6 @@ describe('api-client.ts', () => {
     setAccessToken('old-token');
 
     await expect(apiFetch('/api/v1/protected')).rejects.toThrow(ApiError);
-    // 1 original call + 1 refresh call + 1 retry call = 3 total calls
     expect(mockFetch).toHaveBeenCalledTimes(3);
   });
 
@@ -165,6 +166,145 @@ describe('api-client.ts', () => {
       expect(apiErr.message).toBe('Invalid email address format');
       expect(apiErr.requestId).toBe('req-abc-999');
     }
+  });
+
+  it('invokes sessionExpiredListener exactly once when retried request returns 401', async () => {
+    const expiredListener = vi.fn();
+    setOnSessionExpired(expiredListener);
+    setAccessToken('stale-jwt');
+
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/auth/refresh')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-jwt',
+              token_type: 'Bearer',
+              expires_in_seconds: 900,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Unauthorized' } }), {
+          status: 401,
+        })
+      );
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await expect(apiFetch('/api/v1/business-endpoint')).rejects.toThrow(ApiError);
+    expect(getAccessToken()).toBeNull();
+    expect(expiredListener).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not clear access token or invoke sessionExpiredListener when retried request fails with 500 containing code INVALID_TOKEN', async () => {
+    const expiredListener = vi.fn();
+    setOnSessionExpired(expiredListener);
+    setAccessToken('stale-jwt');
+
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/auth/refresh')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-jwt',
+              token_type: 'Bearer',
+              expires_in_seconds: 900,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      if (getAccessToken() === 'new-jwt') {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ error: { code: 'INVALID_TOKEN', message: 'Internal Server Error' } }),
+            { status: 500 }
+          )
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Unauthorized' } }), {
+          status: 401,
+        })
+      );
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await expect(apiFetch('/api/v1/business-endpoint')).rejects.toThrow(ApiError);
+    expect(getAccessToken()).toBe('new-jwt');
+    expect(expiredListener).not.toHaveBeenCalled();
+  });
+
+  it('preserves token and does not notify listener when CSV export retried request fails with 500', async () => {
+    const expiredListener = vi.fn();
+    setOnSessionExpired(expiredListener);
+    setAccessToken('stale-jwt');
+
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/auth/refresh')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-jwt',
+              token_type: 'Bearer',
+              expires_in_seconds: 900,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      if (getAccessToken() === 'new-jwt') {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: { code: 'EXPORT_ERROR', message: 'Export 500' } }), {
+            status: 500,
+          })
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Unauthorized' } }), {
+          status: 401,
+        })
+      );
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await expect(downloadScanJobCsv('job-123')).rejects.toThrow(ApiError);
+    expect(getAccessToken()).toBe('new-jwt');
+    expect(expiredListener).not.toHaveBeenCalled();
+  });
+
+  it('clears token and notifies listener exactly once when CSV export retried request returns 401', async () => {
+    const expiredListener = vi.fn();
+    setOnSessionExpired(expiredListener);
+    setAccessToken('stale-jwt');
+
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes('/auth/refresh')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              access_token: 'new-jwt',
+              token_type: 'Bearer',
+              expires_in_seconds: 900,
+            }),
+            { status: 200 }
+          )
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'UNAUTHORIZED', message: 'Unauthorized' } }), {
+          status: 401,
+        })
+      );
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    await expect(downloadScanJobCsv('job-123')).rejects.toThrow(ApiError);
+    expect(getAccessToken()).toBeNull();
+    expect(expiredListener).toHaveBeenCalledTimes(1);
   });
 
   it('handles register, login, logout, and logout-all API functions', async () => {

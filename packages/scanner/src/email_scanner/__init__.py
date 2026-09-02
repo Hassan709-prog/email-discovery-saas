@@ -10,9 +10,13 @@ from email_scanner.cleaning import (
     get_explanation_for_decision,
     get_ui_label_for_decision,
 )
-from email_scanner.discovery import HTMLLinkExtractor, discover_and_rank_links
+from email_scanner.discovery import (
+    HTMLLinkExtractor,
+    discover_and_rank_links,
+    is_directory_index_or_placeholder,
+)
 from email_scanner.dns import AsyncDNSResolver, SystemDNSResolver
-from email_scanner.email_extraction import HTMLEmailExtractor
+from email_scanner.email_extraction import HTMLEmailExtractor, decode_cloudflare_cfemail
 from email_scanner.email_pipeline import (
     calculate_domain_affinity,
     classify_email_category,
@@ -226,4 +230,6 @@ __all__ = [
     "should_retry_fetch",
     "validate_email_candidate",
     "validate_public_host",
+    "decode_cloudflare_cfemail",
+    "is_directory_index_or_placeholder",
 ]

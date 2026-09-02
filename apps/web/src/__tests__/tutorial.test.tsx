@@ -27,6 +27,7 @@ describe('OnboardingTutorialModal & Real Focus Trap Audit', () => {
       logout: vi.fn(),
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(<OnboardingTutorialModal />);
@@ -44,6 +45,7 @@ describe('OnboardingTutorialModal & Real Focus Trap Audit', () => {
       logout: vi.fn(),
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(<OnboardingTutorialModal />);
@@ -82,6 +84,7 @@ describe('OnboardingTutorialModal & Real Focus Trap Audit', () => {
       logout: vi.fn(),
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(
@@ -127,6 +130,7 @@ describe('OnboardingTutorialModal & Real Focus Trap Audit', () => {
       logout: vi.fn(),
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(

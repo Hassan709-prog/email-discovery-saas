@@ -35,6 +35,26 @@ _REJECTED_SCHEME_PREFIXES = (
 )
 
 
+def is_directory_index_or_placeholder(html_content: str) -> bool:
+    """Check if HTML content is a bare directory listing, parking page, or empty placeholder."""
+    if not html_content or len(html_content.strip()) < 50:
+        return True
+
+    text_lower = html_content.lower()
+
+    if "index of /" in text_lower or "<title>index of" in text_lower:
+        return True
+    if "apache server at" in text_lower and "[to parent directory]" in text_lower:
+        return True
+    if "parent directory</a>" in text_lower and "last modified" in text_lower:
+        return True
+
+    if "domain is for sale" in text_lower or "this domain has expired" in text_lower:
+        return True
+
+    return False
+
+
 class HTMLLinkExtractor(html.parser.HTMLParser):
     """Resilient HTML parser extracting base href and anchor tags."""
 

@@ -27,6 +27,7 @@ class URLClaim:
     lease_expires_at: datetime
     claimed_from_status: str | None = None
     claimed_from_next_retry_at: datetime | None = None
+    approved_redirect_domain: str | None = None
 
 
 class HeartbeatStatus(StrEnum):
@@ -43,6 +44,14 @@ class HeartbeatResult:
 
     status: HeartbeatStatus
     lease_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FencedCancellationResult:
+    """Typed result returned when a fenced URL cancellation is committed."""
+
+    cancelled: bool
+    scan_url_id: uuid.UUID
 
 
 class LeaseLostError(ServiceError):

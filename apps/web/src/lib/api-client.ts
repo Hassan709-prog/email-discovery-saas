@@ -128,9 +128,6 @@ export async function apiFetch<T>(
           code: 'UNAUTHORIZED',
           message: 'Authentication failed after token refresh.',
         };
-        if (retryRes.status === 401 && sessionExpiredListener) {
-          sessionExpiredListener();
-        }
         throw new ApiError(retryRes.status, detail);
       }
 
@@ -140,9 +137,11 @@ export async function apiFetch<T>(
 
       return (await retryRes.json()) as T;
     } catch (refreshErr) {
-      setAccessToken(null);
-      if (sessionExpiredListener) {
-        sessionExpiredListener();
+      if (refreshErr instanceof ApiError && refreshErr.status === 401) {
+        setAccessToken(null);
+        if (sessionExpiredListener) {
+          sessionExpiredListener();
+        }
       }
       throw refreshErr;
     }
@@ -196,10 +195,14 @@ export async function loginUser(
   return data;
 }
 
-export async function getCurrentUser(): Promise<UserProfileResponse> {
-  return apiFetch<UserProfileResponse>('/api/v1/auth/me', {
-    method: 'GET',
-  });
+export async function getCurrentUser(allowRetryOn401 = true): Promise<UserProfileResponse> {
+  return apiFetch<UserProfileResponse>(
+    '/api/v1/auth/me',
+    {
+      method: 'GET',
+    },
+    allowRetryOn401
+  );
 }
 
 export async function logoutUser(): Promise<void> {
@@ -441,9 +444,15 @@ export async function downloadScanJobCsv(jobId: string): Promise<string> {
         headers,
         credentials: 'same-origin',
       });
+      if (res.status === 401) {
+        setAccessToken(null);
+        if (sessionExpiredListener) sessionExpiredListener();
+      }
     } catch (refreshErr) {
-      setAccessToken(null);
-      if (sessionExpiredListener) sessionExpiredListener();
+      if (refreshErr instanceof ApiError && refreshErr.status === 401) {
+        setAccessToken(null);
+        if (sessionExpiredListener) sessionExpiredListener();
+      }
       throw refreshErr;
     }
   }
@@ -500,4 +509,20 @@ export async function downloadScanJobCsv(jobId: string): Promise<string> {
       }, 200);
     }
   }
+}
+
+export async function approveUrlRedirect(
+  jobId: string,
+  urlId: string,
+  approvedTargetDomain?: string
+): Promise<ScanURLApiResponse> {
+  const query = approvedTargetDomain
+    ? `?approved_target_domain=${encodeURIComponent(approvedTargetDomain)}`
+    : '';
+  return apiFetch<ScanURLApiResponse>(
+    `/api/v1/scan-jobs/${jobId}/urls/${urlId}/approve-redirect${query}`,
+    {
+      method: 'POST',
+    }
+  );
 }

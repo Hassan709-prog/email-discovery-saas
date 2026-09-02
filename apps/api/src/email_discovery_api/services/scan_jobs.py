@@ -215,6 +215,12 @@ class ScanJobService:
                 url_id = uuid.uuid4()
                 target_parsed = urlsplit(item.canonical_target)
                 target_domain = target_parsed.hostname
+                app_domain = None
+                if command.approved_redirect_domains:
+                    app_domain = command.approved_redirect_domains.get(
+                        item.original_input
+                    ) or command.approved_redirect_domains.get(item.canonical_target)
+
                 scan_urls.append(
                     ScanURL(
                         id=url_id,
@@ -224,6 +230,7 @@ class ScanJobService:
                         normalized_url=item.canonical_target,
                         normalized_domain=target_domain,
                         status=ScanURLStatus.PENDING.value,
+                        approved_redirect_domain=app_domain,
                     )
                 )
 
@@ -915,3 +922,111 @@ class ScanJobService:
             started_at=job.started_at,
             completed_at=job.completed_at,
         )
+
+    async def approve_url_redirect(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        url_id: uuid.UUID,
+        approved_target_domain: str | None = None,
+    ) -> ScanURL:
+        """Approve and retry a ScanURL stuck in OUT_OF_SCOPE_REDIRECT."""
+        async with self.session.begin():
+            # 1. Lock parent ScanJob FOR UPDATE first to enforce canonical lock order
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Job {job_id} was not found for organization {organization_id}.",
+                )
+            if job.status in (ScanJobStatus.CANCELLED.value, ScanJobStatus.CANCELLING.value):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Cannot approve redirect for cancelled job {job_id}.",
+                )
+
+            # 2. Lock target ScanURL FOR UPDATE second
+            url = await self.url_repo.get_url_for_update(organization_id, job_id, url_id)
+            if url is None:
+                raise ServiceError(
+                    ServiceErrorCode.SCAN_URL_NOT_FOUND,
+                    f"ScanURL {url_id} not found in job {job_id}.",
+                )
+
+            if url.approved_redirect_domain is not None and url.status in (
+                ScanURLStatus.QUEUED.value,
+                ScanURLStatus.SCANNING.value,
+                ScanURLStatus.LEASED.value,
+            ):
+                return url
+
+            if url.status != ScanURLStatus.FAILED.value:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {url_id} in status {url.status!r} cannot receive redirect approval. "
+                    "Only FAILED URLs can be approved.",
+                )
+
+            error_code = url.last_failure_code or url.last_error_code
+            if error_code not in ("OUT_OF_SCOPE_REDIRECT", "BUSINESS_DOMAIN_REDIRECT_REVIEW"):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL error code {error_code!r} does not permit redirect approval.",
+                )
+
+            target_domain: str | None = url.redirect_target_domain
+            if not target_domain:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    "ScanURL does not have a pending redirect target to approve.",
+                )
+
+            if (
+                approved_target_domain
+                and approved_target_domain.strip().lower() != target_domain.strip().lower()
+            ):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"Target domain mismatch. Requested {approved_target_domain!r} "
+                    f"does not match persisted target {target_domain!r}.",
+                )
+
+            url.approved_redirect_domain = target_domain
+            url.status = ScanURLStatus.QUEUED.value
+            current_attempts: int = url.attempt_count or 0
+            if current_attempts >= (url.max_attempts or 3):
+                url.max_attempts = current_attempts + 1
+            url.completed_at = None
+            url.lease_owner = None
+            url.lease_expires_at = None
+            url.last_error_code = None
+            url.last_error_message = None
+            url.last_failure_code = None
+            url.total_duration_seconds = None
+
+            if job.failed_count > 0:
+                job.failed_count = job.failed_count - 1
+            job.queued_count = job.queued_count + 1
+            if job.completed_at is not None:
+                job.completed_at = None
+            if job.status in (
+                ScanJobStatus.COMPLETED_WITH_ERRORS.value,
+                ScanJobStatus.FAILED.value,
+                ScanJobStatus.COMPLETED.value,
+            ):
+                job.status = ScanJobStatus.RUNNING.value
+
+            seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+            if seq is not None:
+                event = JobEvent(
+                    scan_job_id=job_id,
+                    event_type="REDIRECT_APPROVED",
+                    sequence_number=seq,
+                    payload={
+                        "scan_url_id": str(url_id),
+                        "approved_redirect_domain": target_domain,
+                    },
+                )
+                self.event_repo.append_event(event)
+
+            return url

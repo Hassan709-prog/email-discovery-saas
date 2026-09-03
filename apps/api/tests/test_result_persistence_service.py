@@ -699,3 +699,270 @@ async def test_persist_fenced_result_passes_derived_sanitized_message_to_scan_ur
     assert "api_key=privkey" not in persisted_msg
     assert "https://db.internal/query" in persisted_msg
     assert "Generic page failed" not in persisted_msg
+
+
+@pytest.mark.anyio
+async def test_successful_result_persistence_clean_diagnostics(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify COMPLETED_NO_EMAILS and COMPLETED store clean success diagnostics."""
+    from email_scanner.models import SiteScanDiagnostics
+
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id_1 = uuid.uuid4()
+    url_id_2 = uuid.uuid4()
+    url_id_3 = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=3,
+                valid_input_count=3,
+                queued_count=0,
+                running_count=3,
+                completed_count=0,
+                failed_count=0,
+            )
+            url1 = ScanURL(
+                id=url_id_1,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://site1.com",
+                normalized_url="https://site1.com/",
+                normalized_domain="site1.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            url2 = ScanURL(
+                id=url_id_2,
+                scan_job_id=job_id,
+                original_index=1,
+                original_input="https://site2.com",
+                normalized_url="https://site2.com/",
+                normalized_domain="site2.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            url3 = ScanURL(
+                id=url_id_3,
+                scan_job_id=job_id,
+                original_index=2,
+                original_input="https://site3.com",
+                normalized_url="https://site3.com/",
+                normalized_domain="site3.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url1, url2, url3])
+
+    diag_stale = SiteScanDiagnostics(
+        total_duration_seconds=1.0,
+        dns_resolution_duration_seconds=0.1,
+        gate_wait_duration_seconds=0.0,
+        robots_fetch_duration_seconds=0.1,
+        robots_evaluation_duration_seconds=0.1,
+        http_fetch_duration_seconds=0.5,
+        page_processing_duration_seconds=0.2,
+        retry_count=2,
+        total_retry_delay_seconds=0.5,
+        redirect_count=0,
+        http_status=200,
+        failure_code="UNEXPECTED_INTERNAL_ERROR",
+        time_budget_exhausted=False,
+        cancellation_occurred=False,
+        retry_budget_exhausted=False,
+    )
+
+    page_rec_200 = PageScanRecord(
+        requested_url="https://site1.com/",
+        final_url="https://site1.com/",
+        depth=0,
+        outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+        status_code=200,
+        robots_decision=RobotsDecision(
+            target_url="https://site1.com/",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=FetchResult(
+            final_url="https://site1.com/",
+            status_code=200,
+            content_type="text/html",
+            body_text="<html>no email here</html>",
+            redirect_history=(),
+            outcome=FetchOutcomeCode.SUCCESS,
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+
+    claim1 = URLClaim(
+        scan_url_id=url_id_1,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://site1.com",
+        normalized_url="https://site1.com/",
+        normalized_domain="site1.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    result_no_emails = SiteScanResult(
+        starting_url="https://site1.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=1,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="QUEUE_EXHAUSTED",
+        ),
+        page_records=(page_rec_200,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_stale,
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim1, result_no_emails)
+
+    async with session_factory() as session:
+        url_obj = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_1))
+        ).scalar_one()
+        attempt_obj = (
+            await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id_1))
+        ).scalar_one()
+
+        assert url_obj.status == ScanURLStatus.NO_EMAIL.value
+        assert url_obj.last_error_code is None
+        assert url_obj.last_error_message is None
+        assert url_obj.last_failure_code is None
+        assert attempt_obj.failure_code is None
+
+    # Test 2: COMPLETED outcome with findings
+    claim2 = URLClaim(
+        scan_url_id=url_id_2,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://site2.com",
+        normalized_url="https://site2.com/",
+        normalized_domain="site2.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    result_completed = make_sample_site_scan_result(
+        starting_url="https://site2.com/",
+        outcome=SiteScanOutcome.COMPLETED,
+        emails=("found@site2.com",),
+    )
+    result_completed = SiteScanResult(
+        starting_url=result_completed.starting_url,
+        outcome=result_completed.outcome,
+        statistics=result_completed.statistics,
+        page_records=result_completed.page_records,
+        email_findings=result_completed.email_findings,
+        rejected_email_candidates=result_completed.rejected_email_candidates,
+        diagnostics=diag_stale,
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim2, result_completed)
+
+    async with session_factory() as session:
+        url_obj2 = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_2))
+        ).scalar_one()
+        attempt_obj2 = (
+            await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id_2))
+        ).scalar_one()
+
+        assert url_obj2.status == ScanURLStatus.COMPLETED.value
+        assert url_obj2.last_error_code is None
+        assert url_obj2.last_error_message is None
+        assert url_obj2.last_failure_code is None
+        assert attempt_obj2.failure_code is None
+
+    # Test 3: PARTIAL outcome retains diagnostics
+    claim3 = URLClaim(
+        scan_url_id=url_id_3,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://site3.com",
+        normalized_url="https://site3.com/",
+        normalized_domain="site3.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    result_partial = SiteScanResult(
+        starting_url="https://site3.com/",
+        outcome=SiteScanOutcome.PARTIAL,
+        statistics=SiteScanStatistics(
+            pages_queued=2,
+            pages_attempted=2,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=2,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="MAX_PAGES_REACHED",
+        ),
+        page_records=(page_rec_200,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_stale,
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim3, result_partial)
+
+    async with session_factory() as session:
+        url_obj3 = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_3))
+        ).scalar_one()
+        attempt_obj3 = (
+            await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id_3))
+        ).scalar_one()
+
+        assert url_obj3.status == ScanURLStatus.COMPLETED.value
+        assert url_obj3.last_error_code == "PARTIAL_SCAN"
+        assert url_obj3.last_failure_code == "UNEXPECTED_INTERNAL_ERROR"
+        assert attempt_obj3.failure_code == "UNEXPECTED_INTERNAL_ERROR"

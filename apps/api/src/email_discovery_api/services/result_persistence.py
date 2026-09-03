@@ -92,6 +92,12 @@ def _derive_diagnostic_message(
           2. fetch_result.status_code / page.status_code (as "HTTP <status>")
           3. page.error_message
     """
+    if site_scan_result.outcome in (
+        SiteScanOutcome.COMPLETED,
+        SiteScanOutcome.COMPLETED_NO_EMAILS,
+    ):
+        return None
+
     if site_scan_result.error_message and site_scan_result.error_message.strip():
         return _sanitize_diagnostic_message(site_scan_result.error_message, max_length=max_length)
 
@@ -466,6 +472,20 @@ class ResultPersistenceService:
                 parsed = urlsplit(mapped_attempt.final_url)
                 redirect_target_domain = parsed.hostname
 
+        if site_scan_result.outcome in (
+            SiteScanOutcome.COMPLETED,
+            SiteScanOutcome.COMPLETED_NO_EMAILS,
+        ):
+            last_error_code_val = None
+            last_error_message_val = None
+            last_failure_code_val = None
+        else:
+            last_error_code_val = err_code
+            last_error_message_val = _derive_diagnostic_message(
+                site_scan_result, max_length=self._policy.max_error_message_length
+            )
+            last_failure_code_val = diag.failure_code if diag else None
+
         stmt_url_final = (
             update(ScanURL)
             .where(ScanURL.id == claim.scan_url_id)
@@ -474,15 +494,13 @@ class ResultPersistenceService:
                 completed_at=current_time,
                 lease_owner=None,
                 lease_expires_at=None,
-                last_error_code=err_code,
-                last_error_message=_derive_diagnostic_message(
-                    site_scan_result, max_length=self._policy.max_error_message_length
-                ),
+                last_error_code=last_error_code_val,
+                last_error_message=last_error_message_val,
                 total_duration_seconds=diag.total_duration_seconds if diag else None,
                 pages_attempted=stats.pages_attempted if stats else None,
                 pages_fetched=stats.pages_fetched if stats else None,
                 retry_count=diag.retry_count if diag else None,
-                last_failure_code=diag.failure_code if diag else None,
+                last_failure_code=last_failure_code_val,
                 redirect_target_domain=redirect_target_domain,
                 redirect_target_url=redirect_target_url,
             )

@@ -328,3 +328,102 @@ def test_result_mapper_deduplicates_page_records_and_retains_evidence() -> None:
     assert attempt1.result_checksum == attempt2.result_checksum
     assert len(pages1) == len(pages2)
     assert len(findings1) == len(findings2)
+
+
+def test_mapper_enforces_none_failure_code_for_successful_outcomes() -> None:
+    """Verify API mapper sets failure_code=None for COMPLETED and COMPLETED_NO_EMAILS."""
+    from email_scanner.models import SiteScanDiagnostics
+
+    now = datetime.now(UTC)
+    diag_with_failure = SiteScanDiagnostics(
+        total_duration_seconds=1.0,
+        dns_resolution_duration_seconds=0.1,
+        gate_wait_duration_seconds=0.0,
+        robots_fetch_duration_seconds=0.1,
+        robots_evaluation_duration_seconds=0.1,
+        http_fetch_duration_seconds=0.5,
+        page_processing_duration_seconds=0.2,
+        retry_count=1,
+        total_retry_delay_seconds=0.5,
+        redirect_count=0,
+        http_status=200,
+        failure_code="UNEXPECTED_INTERNAL_ERROR",
+        time_budget_exhausted=False,
+        cancellation_occurred=False,
+        retry_budget_exhausted=False,
+    )
+
+    res_completed_no_emails = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=1,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED_NO_EMAILS",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_no_emails, _, _, _, _ = map_site_scan_result(
+        res_completed_no_emails, attempt_number=1, now=now
+    )
+    assert attempt_no_emails.failure_code is None
+
+    res_completed = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=1,
+            accepted_email_findings=1,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_completed, _, _, _, _ = map_site_scan_result(res_completed, attempt_number=1, now=now)
+    assert attempt_completed.failure_code is None
+
+    # PARTIAL outcome should retain failure code
+    res_partial = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.PARTIAL,
+        statistics=SiteScanStatistics(
+            pages_queued=2,
+            pages_attempted=2,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=2,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="MAX_PAGES_REACHED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_partial, _, _, _, _ = map_site_scan_result(res_partial, attempt_number=1, now=now)
+    assert attempt_partial.failure_code == "UNEXPECTED_INTERNAL_ERROR"

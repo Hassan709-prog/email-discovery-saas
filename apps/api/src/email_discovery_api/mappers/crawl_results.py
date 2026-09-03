@@ -527,6 +527,11 @@ def map_site_scan_result(
 
     diag = getattr(site_scan_result, "diagnostics", None)
     failure_code_val = diag.failure_code if diag else None
+    if site_scan_result.outcome in (
+        SiteScanOutcome.COMPLETED,
+        SiteScanOutcome.COMPLETED_NO_EMAILS,
+    ):
+        failure_code_val = None
     dns_sec = diag.dns_resolution_duration_seconds if diag else None
     gate_sec = diag.gate_wait_duration_seconds if diag else None
     robots_sec = (

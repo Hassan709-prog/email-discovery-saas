@@ -472,3 +472,60 @@ def test_cancellation_with_partial_results() -> None:
         assert res.email_findings[0].canonical_email == "sales@acme.com"
 
     asyncio.run(_test())
+
+
+def test_successful_site_outcomes_clear_recorder_failure_code() -> None:
+    """Verify COMPLETED and COMPLETED_NO_EMAILS clear any stale recorder failure_code."""
+    from email_scanner.errors import SiteScanFailureCode
+    from email_scanner.models import SiteScanDiagnosticRecorder
+
+    async def _test() -> None:
+        start_url = "https://acme.com/"
+        html_with_email = "<html><body>contact@acme.com</body></html>"
+        html_no_email = "<html><body>Hello World</body></html>"
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=html_no_email,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                )
+            }
+        )
+        robots = MockRobotsEvaluator()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+
+        rec = SiteScanDiagnosticRecorder()
+        rec.failure_code = SiteScanFailureCode.UNEXPECTED_INTERNAL_ERROR
+
+        res_no_email = await orchestrator.scan(start_url, recorder=rec)
+        assert res_no_email.outcome == SiteScanOutcome.COMPLETED_NO_EMAILS
+        assert res_no_email.diagnostics is not None
+        assert res_no_email.diagnostics.failure_code is None
+
+        fetcher_email = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=html_with_email,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                )
+            }
+        )
+        orchestrator_email = SiteScanOrchestrator(fetcher=fetcher_email, robots_evaluator=robots)
+        rec2 = SiteScanDiagnosticRecorder()
+        rec2.failure_code = SiteScanFailureCode.UNEXPECTED_INTERNAL_ERROR
+
+        res_completed = await orchestrator_email.scan(start_url, recorder=rec2)
+        assert res_completed.outcome == SiteScanOutcome.COMPLETED
+        assert res_completed.diagnostics is not None
+        assert res_completed.diagnostics.failure_code is None
+
+    asyncio.run(_test())

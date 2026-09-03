@@ -591,7 +591,9 @@ class SiteScanOrchestrator:
 
         from email_scanner.errors import SiteScanFailureCode, map_fetch_outcome_to_failure_code
 
-        if site_outcome not in {SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS}:
+        if site_outcome in {SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS}:
+            rec.failure_code = None
+        else:
             if rec.failure_code is None:
                 if site_outcome == SiteScanOutcome.CANCELLED:
                     rec.failure_code = SiteScanFailureCode.CANCELLED

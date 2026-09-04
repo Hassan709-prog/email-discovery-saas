@@ -310,6 +310,8 @@ class AsyncHTTPFetcher:
 
                     hop_attempt += 1
                     global_attempt_counter += 1
+                    if hop_attempt > 1:
+                        retries_occurred += 1
 
                     # Re-acquire domain rate-limiting gate permission before every request attempt
                     try:
@@ -565,8 +567,6 @@ class AsyncHTTPFetcher:
                             attempts=tuple(attempts),
                         )
 
-                    retries_occurred += 1
-
                     # Calculate retry backoff delay
                     if retry_reason == DelaySource.RETRY_AFTER_HEADER and response_obj is not None:
                         retry_after_hdr = response_obj.headers.get("retry-after", "")
@@ -585,9 +585,6 @@ class AsyncHTTPFetcher:
                         next_delay_sec, next_delay_source = calculate_backoff_delay(
                             hop_attempt, retry_policy, self._jitter_source
                         )
-
-                    if recorder is not None:
-                        recorder.total_retry_delay_seconds += next_delay_sec
 
                     # Safely close response stream before backoff sleep
                     if response_obj is not None:
@@ -608,6 +605,8 @@ class AsyncHTTPFetcher:
 
                     if next_delay_sec > 0.0 and self._sleeper is not None:
                         await self._sleeper(next_delay_sec)
+                        if recorder is not None:
+                            recorder.total_retry_delay_seconds += next_delay_sec
 
                     # Check cancellation after sleep
                     if self._cancellation_checker is not None and self._cancellation_checker():

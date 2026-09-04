@@ -426,14 +426,16 @@ def test_robots_certificate_failure_is_terminal_on_first_attempt() -> None:
 def make_dummy_attempt(
     hop_attempt: int = 1,
     outcome: FetchOutcomeCode = FetchOutcomeCode.TIMEOUT,
+    hop_index: int = 0,
+    status_code: int | None = None,
 ) -> FetchAttempt:
     """Helper to create dummy FetchAttempt with recorded attempt number."""
     return FetchAttempt(
-        hop_index=0,
+        hop_index=hop_index,
         hop_attempt_number=hop_attempt,
         global_attempt_number=hop_attempt,
         request_url="https://example.com",
-        status_code=None,
+        status_code=status_code,
         outcome=outcome,
         pinned_ip="93.184.215.14",
         delay_before_attempt_seconds=0.0,
@@ -674,6 +676,179 @@ def test_robots_temporary_failure_with_typed_proof_of_internal_retries_is_termin
     )
     err_code, retryable = classify_error_code_and_retryability(result)
     assert err_code == "ROBOTS_FETCH_ERROR"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_redirect_followed_by_first_attempt_timeout_is_retryable() -> None:
+    """Redirect at hop 0 followed by first-attempt timeout at hop 1 is retryable."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.SUCCESS, hop_index=0, status_code=301),
+        make_dummy_attempt(1, FetchOutcomeCode.TIMEOUT, hop_index=1),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TIMEOUT,
+        attempts=attempts,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert len(attempts) == 2
+    assert attempts[-1].hop_attempt_number == 1
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TIMEOUT"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_redirect_followed_by_first_attempt_transport_error_is_retryable() -> None:
+    """Redirect at hop 0 followed by first-attempt transport error at hop 1 is retryable."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.SUCCESS, hop_index=0, status_code=301),
+        make_dummy_attempt(1, FetchOutcomeCode.TRANSPORT_ERROR, hop_index=1),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TRANSPORT_ERROR,
+        attempts=attempts,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert len(attempts) == 2
+    assert attempts[-1].hop_attempt_number == 1
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TRANSPORT_ERROR"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_redirect_followed_by_first_attempt_http_503_is_retryable() -> None:
+    """Redirect at hop 0 followed by first-attempt HTTP 503 at hop 1 is retryable."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.SUCCESS, hop_index=0, status_code=301),
+        make_dummy_attempt(1, FetchOutcomeCode.HTTP_ERROR, hop_index=1, status_code=503),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.HTTP_ERROR,
+        attempts=attempts,
+        status_code=503,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert len(attempts) == 2
+    assert attempts[-1].hop_attempt_number == 1
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "HTTP_503"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_final_timeout_with_hop_attempt_two_is_terminal() -> None:
+    """A final timeout with hop_attempt_number == 2 is terminal."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.TIMEOUT, hop_index=0),
+        make_dummy_attempt(2, FetchOutcomeCode.TIMEOUT, hop_index=0),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TIMEOUT,
+        attempts=attempts,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert attempts[-1].hop_attempt_number == 2
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TIMEOUT"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_final_transport_error_with_hop_attempt_two_is_terminal() -> None:
+    """A final transport error with hop_attempt_number == 2 is terminal."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.TRANSPORT_ERROR, hop_index=0),
+        make_dummy_attempt(2, FetchOutcomeCode.TRANSPORT_ERROR, hop_index=0),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TRANSPORT_ERROR,
+        attempts=attempts,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert attempts[-1].hop_attempt_number == 2
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TRANSPORT_ERROR"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_final_http_503_with_hop_attempt_two_is_terminal() -> None:
+    """A final HTTP 503 with hop_attempt_number == 2 is terminal."""
+    attempts = (
+        make_dummy_attempt(1, FetchOutcomeCode.HTTP_ERROR, hop_index=0, status_code=503),
+        make_dummy_attempt(2, FetchOutcomeCode.HTTP_ERROR, hop_index=0, status_code=503),
+    )
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.HTTP_ERROR,
+        attempts=attempts,
+        status_code=503,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    assert attempts[-1].hop_attempt_number == 2
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "HTTP_503"
     assert retryable is False
     assert (
         classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)

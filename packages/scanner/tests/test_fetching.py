@@ -393,3 +393,107 @@ def test_request_retry_records_retry_count_and_scheduled_delay() -> None:
         assert diagnostics.total_retry_delay_seconds == 1.5
 
     asyncio.run(_test())
+
+
+def test_cancellation_before_retry_sleep_records_zero_retries_and_zero_delay() -> None:
+    """Cancellation before retry sleep: request handler called once, retry_count 0, delay 0."""
+
+    async def _test() -> None:
+        attempt_count = 0
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count, cancelled
+            attempt_count += 1
+            cancelled = True
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            slept_durations.append(seconds)
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+            cancellation_checker=lambda: cancelled,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-cancel-before", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.TIMEOUT
+        assert result.error_message == "Fetch operation cancelled prior to retry sleep"
+        assert attempt_count == 1
+        assert slept_durations == []
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_cancellation_after_retry_sleep_records_zero_retries_and_completed_delay() -> None:
+    """Cancellation after completed sleep: request handler called once, retry_count 0,
+
+    delay equals completed sleep.
+    """
+
+    async def _test() -> None:
+        attempt_count = 0
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            nonlocal cancelled
+            slept_durations.append(seconds)
+            cancelled = True
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+            cancellation_checker=lambda: cancelled,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-cancel-after", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.TIMEOUT
+        assert result.error_message == "Fetch operation cancelled after retry sleep"
+        assert attempt_count == 1
+        assert slept_durations == [1.5]
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 1.5
+
+    asyncio.run(_test())

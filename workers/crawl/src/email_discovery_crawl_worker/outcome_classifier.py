@@ -6,9 +6,22 @@ from enum import StrEnum
 
 from email_discovery_api.services.worker_contracts import LeaseLostError
 from email_scanner import FetchOutcomeCode, PageScanOutcome, SiteScanOutcome
-from email_scanner.models import SiteScanResult
+from email_scanner.models import FetchResult, SiteScanResult
 
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _final_failed_hop_was_retried(fetch_result: FetchResult) -> bool:
+    """Determine whether the final failed HTTP hop was internally retried.
+
+    Inspects the final FetchAttempt associated with the failure. It is evidence of
+    an internal repeated request only when its hop_attempt_number > 1. Multiple
+    attempts across different redirect hops (hop_attempt_number == 1) do not count.
+    """
+    if not fetch_result.attempts:
+        return False
+    final_attempt = fetch_result.attempts[-1]
+    return final_attempt.hop_attempt_number > 1
 
 
 class WorkerExecutionOutcome(StrEnum):
@@ -48,12 +61,12 @@ def classify_error_code_and_retryability(
 
         if page.fetch_result:
             fetch_code = page.fetch_result.outcome
-            has_multiple_attempts = len(page.fetch_result.attempts) > 1
+            was_retried = _final_failed_hop_was_retried(page.fetch_result)
 
             if fetch_code == FetchOutcomeCode.TIMEOUT:
-                return "TIMEOUT", not has_multiple_attempts
+                return "TIMEOUT", not was_retried
             if fetch_code == FetchOutcomeCode.TRANSPORT_ERROR:
-                return "TRANSPORT_ERROR", not has_multiple_attempts
+                return "TRANSPORT_ERROR", not was_retried
             if fetch_code == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
                 return "DNS_RESOLUTION_FAILED", True
             if fetch_code == FetchOutcomeCode.UNSAFE_HOST:
@@ -73,7 +86,7 @@ def classify_error_code_and_retryability(
             if fetch_code == FetchOutcomeCode.HTTP_ERROR:
                 status_code = page.fetch_result.status_code
                 if status_code in RETRYABLE_HTTP_STATUSES:
-                    return f"HTTP_{status_code}", not has_multiple_attempts
+                    return f"HTTP_{status_code}", not was_retried
                 if status_code is not None:
                     return f"HTTP_{status_code}", False
                 return "HTTP_ERROR", False

@@ -126,6 +126,7 @@ class RobotsPolicyEvaluator:
     ) -> RobotsDecision:
         """Evaluate robots.txt policy for a target URL asynchronously."""
         eval_start_t = self._clock()
+        robots_fetch_elapsed = 0.0
         if isinstance(url, str):
             try:
                 target_url = normalize_url(url)
@@ -173,6 +174,7 @@ class RobotsPolicyEvaluator:
                     )
                     if recorder is not None:
                         dt = max(0.0, self._clock() - r_fetch_start)
+                        robots_fetch_elapsed += dt
                         recorder.robots_fetch_duration_seconds += dt
 
                     cached_policy = self._build_policy(robots_result, token, now)
@@ -183,7 +185,10 @@ class RobotsPolicyEvaluator:
 
         res = self._evaluate_cached_policy(cached_policy, target_url.normalized_url, token)
         if recorder is not None:
-            recorder.robots_evaluation_duration_seconds += max(0.0, self._clock() - eval_start_t)
+            total_elapsed = max(0.0, self._clock() - eval_start_t)
+            recorder.robots_evaluation_duration_seconds += max(
+                0.0, total_elapsed - robots_fetch_elapsed
+            )
         return res
 
     def _build_policy(

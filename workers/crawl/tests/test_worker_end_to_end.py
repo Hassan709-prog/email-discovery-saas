@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import select
 
-from email_discovery_api.models import EmailFinding, ScanJob, ScanURL
+from email_discovery_api.models import CrawlAttempt, EmailFinding, ScanJob, ScanURL
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_crawl_worker.worker import CrawlWorker
 from email_scanner.errors import PageScanOutcome, SiteScanOutcome
@@ -19,6 +19,7 @@ from email_scanner.models import (
     PageScanRecord,
     RobotsDecision,
     RobotsDecisionCode,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -189,13 +190,25 @@ async def test_crawl_worker_robots_temporary_failure_routes_to_transient_persist
             urls_discovered=0,
             accepted_email_findings=0,
             rejected_email_candidates=0,
-            elapsed_seconds=0.1,
+            elapsed_seconds=1.25,
             stop_reason="ROBOTS_BLOCKED",
         ),
         page_records=(page_record,),
         email_findings=(),
         rejected_email_candidates=(),
         error_message=None,
+        diagnostics=SiteScanDiagnostics(
+            total_duration_seconds=1.25,
+            dns_resolution_duration_seconds=0.15,
+            gate_wait_duration_seconds=0.10,
+            robots_fetch_duration_seconds=0.70,
+            robots_evaluation_duration_seconds=0.05,
+            http_fetch_duration_seconds=0.20,
+            page_processing_duration_seconds=0.05,
+            retry_count=2,
+            total_retry_delay_seconds=0.30,
+            failure_code="ROBOTS_TEMPORARY_FAILURE",
+        ),
     )
 
     mock_orchestrator = AsyncMock()
@@ -221,6 +234,18 @@ async def test_crawl_worker_robots_temporary_failure_routes_to_transient_persist
         assert url.last_error_code == "ROBOTS_FETCH_ERROR"
         assert url.lease_owner is None
         assert url.next_retry_at is not None
+
+        attempt_res = await session.execute(
+            select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id1)
+        )
+        attempt = attempt_res.scalar_one()
+        assert attempt.elapsed_seconds == pytest.approx(1.25)
+        assert attempt.dns_duration_seconds == pytest.approx(0.15)
+        assert attempt.gate_wait_seconds == pytest.approx(0.10)
+        assert attempt.robots_duration_seconds == pytest.approx(0.75)
+        assert attempt.http_duration_seconds == pytest.approx(0.20)
+        assert attempt.parse_duration_seconds == pytest.approx(0.05)
+        assert attempt.failure_code == "ROBOTS_TEMPORARY_FAILURE"
 
         job_res = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
         job = job_res.scalar_one()

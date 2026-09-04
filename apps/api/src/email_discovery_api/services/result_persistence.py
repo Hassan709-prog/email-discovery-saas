@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
@@ -550,6 +551,7 @@ class ResultPersistenceService:
         error_code: str,
         error_message: str,
         now: datetime | None = None,
+        site_scan_result: SiteScanResult | None = None,
     ) -> CrawlAttemptResult:
         """Record transient failure CrawlAttempt and schedule RETRY_WAIT or mark FAILED.
 
@@ -613,22 +615,38 @@ class ResultPersistenceService:
             if int(getattr(fence_res, "rowcount", 0)) == 0:
                 raise LeaseLostError(claim.scan_url_id, claim.lease_owner, claim.attempt_count)
 
-            mapped_attempt = MappedAttempt(
-                attempt_number=claim.attempt_count,
-                outcome="FAILED",
-                retryable=retryable,
-                requested_url=sanitized_requested_url,
-                final_url=sanitized_requested_url,
-                status_code=None,
-                error_code=error_code,
-                error_message=sanitized_err_msg,
-                redirect_history=None,
-                connection_attempts=None,
-                started_at=current_time,
-                completed_at=current_time,
-                elapsed_seconds=0.0,
-                result_checksum=checksum,
-            )
+            if site_scan_result is not None:
+                mapped_attempt, _, _, _, _ = map_site_scan_result(
+                    site_scan_result=site_scan_result,
+                    attempt_number=claim.attempt_count,
+                    now=current_time,
+                    policy=self._policy,
+                )
+                mapped_attempt = replace(
+                    mapped_attempt,
+                    outcome="FAILED",
+                    retryable=retryable,
+                    error_code=error_code,
+                    error_message=sanitized_err_msg,
+                    result_checksum=checksum,
+                )
+            else:
+                mapped_attempt = MappedAttempt(
+                    attempt_number=claim.attempt_count,
+                    outcome="FAILED",
+                    retryable=retryable,
+                    requested_url=sanitized_requested_url,
+                    final_url=sanitized_requested_url,
+                    status_code=None,
+                    error_code=error_code,
+                    error_message=sanitized_err_msg,
+                    redirect_history=None,
+                    connection_attempts=None,
+                    started_at=current_time,
+                    completed_at=current_time,
+                    elapsed_seconds=0.0,
+                    result_checksum=checksum,
+                )
             attempt_obj = await self._attempt_repo.create(claim.scan_url_id, mapped_attempt)
 
             target_status = ScanURLStatus.RETRY_WAIT if retryable else ScanURLStatus.FAILED
@@ -644,6 +662,24 @@ class ResultPersistenceService:
                     attempt_started_fence_token=None,
                     last_error_code=error_code,
                     last_error_message=sanitized_err_msg,
+                    total_duration_seconds=mapped_attempt.elapsed_seconds,
+                    pages_attempted=(
+                        site_scan_result.statistics.pages_attempted
+                        if site_scan_result is not None
+                        else None
+                    ),
+                    pages_fetched=(
+                        site_scan_result.statistics.pages_fetched
+                        if site_scan_result is not None
+                        else None
+                    ),
+                    retry_count=(
+                        site_scan_result.diagnostics.retry_count
+                        if site_scan_result is not None
+                        and site_scan_result.diagnostics is not None
+                        else None
+                    ),
+                    last_failure_code=mapped_attempt.failure_code,
                     completed_at=current_time if not retryable else None,
                     next_retry_at=(func.clock_timestamp() + timedelta(seconds=delay_seconds))
                     if retryable

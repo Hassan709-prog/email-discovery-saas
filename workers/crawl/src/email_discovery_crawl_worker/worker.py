@@ -730,6 +730,7 @@ class CrawlWorker:
                                 claim=updated_claim,
                                 error_code=err_code,
                                 error_message="Temporary scan failure; retry scheduled.",
+                                site_scan_result=orchestration_result,
                             )
                     else:
                         async with self.session_factory() as session:

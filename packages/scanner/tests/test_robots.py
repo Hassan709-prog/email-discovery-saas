@@ -4,14 +4,16 @@ import asyncio
 
 import httpx
 
-from email_scanner.errors import HostSafetyError, HostSafetyErrorCode
+from email_scanner.errors import FetchOutcomeCode, HostSafetyError, HostSafetyErrorCode
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
 from email_scanner.models import (
     FetchConfig,
+    FetchResult,
     HostType,
     NormalizedURL,
     RobotsDecisionCode,
+    SiteScanDiagnosticRecorder,
 )
 from email_scanner.robots import RobotsPolicyEvaluator
 
@@ -198,5 +200,48 @@ def test_stable_deterministic_results() -> None:
         res2 = await evaluator2.evaluate("https://example.com/bad/thing")
 
         assert res1 == res2
+
+    asyncio.run(_test())
+
+
+def test_robots_evaluation_timing_excludes_fetch_time() -> None:
+    """Robots parsing/evaluation timing must not count the robots network fetch twice."""
+
+    async def _test() -> None:
+        current_time = 100.0
+
+        def fake_clock() -> float:
+            return current_time
+
+        class TimedFetcher:
+            config = FetchConfig()
+
+            async def fetch(self, *_args: object, **_kwargs: object) -> FetchResult:
+                nonlocal current_time
+                current_time += 2.0
+                return FetchResult(
+                    final_url="https://example.com/robots.txt",
+                    status_code=200,
+                    content_type="text/plain",
+                    body_text="User-agent: *\nAllow: /",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                )
+
+            class RequestGate:
+                def update_domain_interval(self, *_args: object) -> None:
+                    return None
+
+            request_gate = RequestGate()
+
+        recorder = SiteScanDiagnosticRecorder()
+        evaluator = RobotsPolicyEvaluator(fetcher=TimedFetcher(), clock=fake_clock)  # type: ignore[arg-type]
+
+        decision = await evaluator.evaluate("https://example.com/", recorder=recorder)
+
+        assert decision.decision == RobotsDecisionCode.ALLOWED
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.robots_fetch_duration_seconds == 2.0
+        assert diagnostics.robots_evaluation_duration_seconds == 0.0
 
     asyncio.run(_test())

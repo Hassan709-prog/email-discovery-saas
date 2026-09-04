@@ -15,6 +15,7 @@ from email_scanner.models import (
     EmailCategory,
     EmailFinding,
     EmailSourceKind,
+    FetchAttempt,
     FetchResult,
     PageScanRecord,
     RobotsDecision,
@@ -415,6 +416,264 @@ def test_robots_certificate_failure_is_terminal_on_first_attempt() -> None:
 
     error_code, retryable = classify_error_code_and_retryability(result)
     assert error_code == "TLS_VERIFICATION_FAILED"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def make_dummy_attempt(
+    hop_attempt: int = 1,
+    outcome: FetchOutcomeCode = FetchOutcomeCode.TIMEOUT,
+) -> FetchAttempt:
+    """Helper to create dummy FetchAttempt with recorded attempt number."""
+    return FetchAttempt(
+        hop_index=0,
+        hop_attempt_number=hop_attempt,
+        global_attempt_number=hop_attempt,
+        request_url="https://example.com",
+        status_code=None,
+        outcome=outcome,
+        pinned_ip="93.184.215.14",
+        delay_before_attempt_seconds=0.0,
+        delay_source=None,
+        connection_attempts=(),
+        error_message=None,
+    )
+
+
+def _make_dummy_page_with_fetch(
+    outcome: FetchOutcomeCode,
+    attempts: tuple[FetchAttempt, ...] = (),
+    status_code: int | None = None,
+) -> PageScanRecord:
+    robots_ok = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.ALLOWED,
+        crawl_delay=None,
+        reason="OK",
+    )
+    fetch_res = FetchResult(
+        final_url="https://example.com",
+        status_code=status_code,
+        content_type="text/html",
+        body_text="",
+        redirect_history=(),
+        outcome=outcome,
+        error_message=outcome.value,
+        attempts=attempts,
+    )
+    return PageScanRecord(
+        requested_url="https://example.com",
+        final_url="https://example.com",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=status_code,
+        robots_decision=robots_ok,
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+
+
+def test_timeout_with_one_request_attempt_is_retryable() -> None:
+    """Timeout with exactly one recorded attempt remains eligible for worker retry."""
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TIMEOUT,
+        attempts=(make_dummy_attempt(1, FetchOutcomeCode.TIMEOUT),),
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TIMEOUT"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_timeout_with_three_request_attempts_is_terminal() -> None:
+    """Timeout with multiple recorded attempts is terminal after fetcher exhaustion."""
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TIMEOUT,
+        attempts=(
+            make_dummy_attempt(1, FetchOutcomeCode.TIMEOUT),
+            make_dummy_attempt(2, FetchOutcomeCode.TIMEOUT),
+            make_dummy_attempt(3, FetchOutcomeCode.TIMEOUT),
+        ),
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TIMEOUT"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_transport_error_with_one_request_attempt_is_retryable() -> None:
+    """Transport error with one recorded attempt remains eligible for worker retry."""
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TRANSPORT_ERROR,
+        attempts=(make_dummy_attempt(1, FetchOutcomeCode.TRANSPORT_ERROR),),
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TRANSPORT_ERROR"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_transport_error_with_three_request_attempts_is_terminal() -> None:
+    """Transport error with multiple recorded attempts is terminal after fetcher exhaustion."""
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.TRANSPORT_ERROR,
+        attempts=(
+            make_dummy_attempt(1, FetchOutcomeCode.TRANSPORT_ERROR),
+            make_dummy_attempt(2, FetchOutcomeCode.TRANSPORT_ERROR),
+            make_dummy_attempt(3, FetchOutcomeCode.TRANSPORT_ERROR),
+        ),
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "TRANSPORT_ERROR"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_dns_failure_is_retryable() -> None:
+    """DNS failure remains worker-retryable because the fetcher performs no DNS retry."""
+    page = _make_dummy_page_with_fetch(
+        FetchOutcomeCode.DNS_RESOLUTION_FAILED,
+        attempts=(make_dummy_attempt(1, FetchOutcomeCode.DNS_RESOLUTION_FAILED),),
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "DNS_RESOLUTION_FAILED"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_unexpected_worker_exception_is_retryable() -> None:
+    """Unexpected worker/process exceptions remain worker-retryable when attempts remain."""
+    exc = RuntimeError("Worker worker task failed unexpectedly")
+    outcome = classify_worker_outcome(None, exc, attempt_count=1, max_attempts=3)
+    assert outcome == WorkerExecutionOutcome.RETRYABLE_FAILURE
+
+
+def test_robots_temporary_failure_with_no_proof_of_internal_retries_is_retryable() -> None:
+    """Robots temporary failure without proof of internal retries is worker-retryable."""
+    robots_temp = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt DNS resolution failed",
+    )
+    page = PageScanRecord(
+        requested_url="https://example.com",
+        final_url=None,
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(retry_count=0),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "ROBOTS_FETCH_ERROR"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+
+
+def test_robots_temporary_failure_with_typed_proof_of_internal_retries_is_terminal() -> None:
+    """Robots temporary failure with typed proof of internal retries is terminal."""
+    robots_temp = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch timed out",
+    )
+    page = PageScanRecord(
+        requested_url="https://example.com",
+        final_url=None,
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(retry_count=2, failure_code="GENERIC_TIMEOUT"),
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "ROBOTS_FETCH_ERROR"
     assert retryable is False
     assert (
         classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)

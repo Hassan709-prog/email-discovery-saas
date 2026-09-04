@@ -205,8 +205,8 @@ async def test_crawl_worker_robots_temporary_failure_routes_to_transient_persist
             robots_evaluation_duration_seconds=0.05,
             http_fetch_duration_seconds=0.20,
             page_processing_duration_seconds=0.05,
-            retry_count=2,
-            total_retry_delay_seconds=0.30,
+            retry_count=0,
+            total_retry_delay_seconds=0.0,
             failure_code="ROBOTS_TEMPORARY_FAILURE",
         ),
     )

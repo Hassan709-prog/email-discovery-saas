@@ -34,6 +34,10 @@ def classify_error_code_and_retryability(
             diagnostics = site_scan_result.diagnostics
             if diagnostics is not None and diagnostics.failure_code == "TLS_VERIFICATION_FAILED":
                 return "TLS_VERIFICATION_FAILED", False
+            if diagnostics is not None and (
+                diagnostics.retry_count > 0 or diagnostics.retry_budget_exhausted
+            ):
+                return "ROBOTS_FETCH_ERROR", False
             return "ROBOTS_FETCH_ERROR", True
         if page.outcome == PageScanOutcome.UNSAFE_HOST:
             return "UNSAFE_HOST", False
@@ -44,10 +48,12 @@ def classify_error_code_and_retryability(
 
         if page.fetch_result:
             fetch_code = page.fetch_result.outcome
+            has_multiple_attempts = len(page.fetch_result.attempts) > 1
+
             if fetch_code == FetchOutcomeCode.TIMEOUT:
-                return "TIMEOUT", True
+                return "TIMEOUT", not has_multiple_attempts
             if fetch_code == FetchOutcomeCode.TRANSPORT_ERROR:
-                return "TRANSPORT_ERROR", True
+                return "TRANSPORT_ERROR", not has_multiple_attempts
             if fetch_code == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
                 return "DNS_RESOLUTION_FAILED", True
             if fetch_code == FetchOutcomeCode.UNSAFE_HOST:
@@ -67,7 +73,7 @@ def classify_error_code_and_retryability(
             if fetch_code == FetchOutcomeCode.HTTP_ERROR:
                 status_code = page.fetch_result.status_code
                 if status_code in RETRYABLE_HTTP_STATUSES:
-                    return f"HTTP_{status_code}", True
+                    return f"HTTP_{status_code}", not has_multiple_attempts
                 if status_code is not None:
                     return f"HTTP_{status_code}", False
                 return "HTTP_ERROR", False

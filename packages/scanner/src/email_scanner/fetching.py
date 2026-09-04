@@ -165,6 +165,7 @@ class AsyncHTTPFetcher:
 
         global_start_time = self._clock()
         global_attempt_counter = 0
+        retries_occurred = 0
         hop_index = 0
         status_code: int | None = None
 
@@ -504,9 +505,7 @@ class AsyncHTTPFetcher:
                             attempt_outcome = FetchOutcomeCode.TLS_VERIFICATION_FAILED
                             error_msg = "TLS certificate verification failed"
                             if recorder is not None:
-                                recorder.failure_code = (
-                                    SiteScanFailureCode.TLS_VERIFICATION_FAILED
-                                )
+                                recorder.failure_code = SiteScanFailureCode.TLS_VERIFICATION_FAILED
                         else:
                             attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                             error_msg = f"Transport network error: {net_err}"
@@ -566,6 +565,8 @@ class AsyncHTTPFetcher:
                             attempts=tuple(attempts),
                         )
 
+                    retries_occurred += 1
+
                     # Calculate retry backoff delay
                     if retry_reason == DelaySource.RETRY_AFTER_HEADER and response_obj is not None:
                         retry_after_hdr = response_obj.headers.get("retry-after", "")
@@ -584,6 +585,9 @@ class AsyncHTTPFetcher:
                         next_delay_sec, next_delay_source = calculate_backoff_delay(
                             hop_attempt, retry_policy, self._jitter_source
                         )
+
+                    if recorder is not None:
+                        recorder.total_retry_delay_seconds += next_delay_sec
 
                     # Safely close response stream before backoff sleep
                     if response_obj is not None:
@@ -622,7 +626,7 @@ class AsyncHTTPFetcher:
             if recorder is not None:
                 fetch_elapsed = max(0.0, self._clock() - global_start_time)
                 recorder.http_fetch_duration_seconds += fetch_elapsed
-                recorder.retry_count += max(0, global_attempt_counter - 1)
+                recorder.retry_count += retries_occurred
                 recorder.redirect_count += len(redirect_history)
                 if status_code is not None:
                     recorder.http_status = status_code

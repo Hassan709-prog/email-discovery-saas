@@ -15,7 +15,14 @@ from email_scanner.errors import (
 )
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
-from email_scanner.models import FetchConfig, HostType, NormalizedURL
+from email_scanner.models import (
+    FetchConfig,
+    HostType,
+    NormalizedURL,
+    RetryPolicy,
+    SiteScanDiagnosticRecorder,
+)
+from email_scanner.request_gate import DomainRequestGate
 
 
 class FakeDNSResolver:
@@ -291,5 +298,98 @@ def test_non_2xx_http_error_preserves_status_code() -> None:
         assert result.outcome == FetchOutcomeCode.HTTP_ERROR
         assert result.status_code == 404
         assert result.body_text == "<html>Not Found</html>"
+
+    asyncio.run(_test())
+
+
+def test_redirect_without_retry_records_zero_retries() -> None:
+    """Redirecting once and succeeding without retry must produce:
+
+    redirect_count == 1, retry_count == 0.
+    """
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/redirect":
+                return httpx.Response(302, headers={"Location": "/target"})
+            if request.url.path == "/target":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html"},
+                    content=b"<html>Success</html>",
+                )
+            return httpx.Response(404)
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/redirect", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.final_url == "https://example.com/target"
+        assert len(result.redirect_history) == 1
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.redirect_count == 1
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_request_retry_records_retry_count_and_scheduled_delay() -> None:
+    """A request failing once and succeeding on retry must produce:
+
+    retry_count == 1 and the exact scheduled retry delay.
+    """
+
+    async def _test() -> None:
+        attempt_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Content-Type": "text/html"},
+                    content=b"Service Unavailable",
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html>OK</html>",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            slept_durations.append(seconds)
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-test", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.status_code == 200
+        assert attempt_count == 2
+        assert slept_durations == [1.5]
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.redirect_count == 0
+        assert diagnostics.retry_count == 1
+        assert diagnostics.total_retry_delay_seconds == 1.5
 
     asyncio.run(_test())

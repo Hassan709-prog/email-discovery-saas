@@ -497,3 +497,60 @@ def test_cancellation_after_retry_sleep_records_zero_retries_and_completed_delay
         assert diagnostics.total_retry_delay_seconds == 1.5
 
     asyncio.run(_test())
+
+
+def test_cancellation_during_request_gate_acquire_on_retry_records_zero_retries() -> None:
+    """A repeated request waiting at request gate cancelled prior to HTTP attempt
+
+    must produce retry_count 0.
+    """
+
+    class CancellingRequestGate(DomainRequestGate):
+        def __init__(self) -> None:
+            super().__init__(default_minimum_interval_seconds=0.0)
+            self.acquire_calls = 0
+
+        async def acquire(
+            self,
+            target_url: NormalizedURL,
+            recorder: SiteScanDiagnosticRecorder | None = None,
+        ) -> None:
+            self.acquire_calls += 1
+            if self.acquire_calls > 1:
+                raise asyncio.CancelledError("Cancelled at request gate on retry attempt")
+            await super().acquire(target_url, recorder=recorder)
+
+    async def _test() -> None:
+        attempt_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=CancellingRequestGate(),
+            async_sleeper=lambda _: asyncio.sleep(0),
+            jitter_source=lambda _: 0.0,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        with pytest.raises(asyncio.CancelledError):
+            await fetcher.fetch("https://example.com/retry-gate-cancel", recorder=recorder)
+
+        assert attempt_count == 1
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+
+    asyncio.run(_test())

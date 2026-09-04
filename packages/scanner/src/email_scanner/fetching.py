@@ -310,14 +310,15 @@ class AsyncHTTPFetcher:
 
                     hop_attempt += 1
                     global_attempt_counter += 1
-                    if hop_attempt > 1:
-                        retries_occurred += 1
 
                     # Re-acquire domain rate-limiting gate permission before every request attempt
                     try:
                         await self._request_gate.acquire(current_url, recorder=recorder)
                     except TypeError:
                         await self._request_gate.acquire(current_url)
+
+                    if hop_attempt > 1:
+                        retries_occurred += 1
 
                     # Prepare request-scoped connection evidence collector
                     conn_list: list[IPConnectionAttempt] = []

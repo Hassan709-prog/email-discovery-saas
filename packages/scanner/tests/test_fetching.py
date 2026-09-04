@@ -1,6 +1,7 @@
 """Tests for scanner-core AsyncHTTPFetcher."""
 
 import asyncio
+import ssl
 
 import httpx
 import pytest
@@ -153,6 +154,34 @@ def test_transport_error_classification() -> None:
         result = await fetcher.fetch("https://example.com/refused")
         assert result.outcome == FetchOutcomeCode.TRANSPORT_ERROR
         assert result.status_code is None
+
+    asyncio.run(_test())
+
+
+def test_wrapped_tls_verification_error_is_terminal() -> None:
+    """A certificate error wrapped by HTTPX must not become a retryable transport error."""
+
+    async def _test() -> None:
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            certificate_error = ssl.SSLCertVerificationError(
+                1, "certificate verify failed: unable to get local issuer certificate"
+            )
+            raise httpx.ConnectError(
+                "TLS connection failed", request=request
+            ) from certificate_error
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
+
+        result = await fetcher.fetch("https://example.com/certificate-error")
+
+        assert result.outcome == FetchOutcomeCode.TLS_VERIFICATION_FAILED
+        assert result.error_message == "TLS certificate verification failed"
+        assert request_count == 1
 
     asyncio.run(_test())
 

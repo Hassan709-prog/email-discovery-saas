@@ -47,6 +47,30 @@ from email_scanner.retry import (
 )
 
 
+def _contains_tls_error(error: BaseException) -> bool:
+    """Return whether an exception chain contains a typed TLS/SSL failure."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+
+    while pending:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        if isinstance(current, ssl.SSLError):
+            return True
+
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+
+    return False
+
+
 class AsyncHTTPFetcher:
     """Asynchronous HTTP fetcher enforcing scanner-core safety policies and DNS pinning."""
 
@@ -476,10 +500,18 @@ class AsyncHTTPFetcher:
                         httpcore.ConnectError,
                         httpcore.NetworkError,
                     ) as net_err:
-                        attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
-                        error_msg = f"Transport network error: {net_err}"
-                        if recorder is not None:
-                            recorder.failure_code = SiteScanFailureCode.TRANSPORT_ERROR
+                        if _contains_tls_error(net_err):
+                            attempt_outcome = FetchOutcomeCode.TLS_VERIFICATION_FAILED
+                            error_msg = "TLS certificate verification failed"
+                            if recorder is not None:
+                                recorder.failure_code = (
+                                    SiteScanFailureCode.TLS_VERIFICATION_FAILED
+                                )
+                        else:
+                            attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
+                            error_msg = f"Transport network error: {net_err}"
+                            if recorder is not None:
+                                recorder.failure_code = SiteScanFailureCode.TRANSPORT_ERROR
                     except Exception as gen_err:
                         attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                         error_msg = f"Unexpected network error: {gen_err}"

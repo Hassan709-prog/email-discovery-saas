@@ -31,6 +31,9 @@ def classify_error_code_and_retryability(
         if page.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
             return "ROBOTS_BLOCKED", False
         if page.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+            diagnostics = site_scan_result.diagnostics
+            if diagnostics is not None and diagnostics.failure_code == "TLS_VERIFICATION_FAILED":
+                return "TLS_VERIFICATION_FAILED", False
             return "ROBOTS_FETCH_ERROR", True
         if page.outcome == PageScanOutcome.UNSAFE_HOST:
             return "UNSAFE_HOST", False

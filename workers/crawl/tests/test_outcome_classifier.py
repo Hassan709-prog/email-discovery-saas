@@ -18,6 +18,7 @@ from email_scanner.models import (
     FetchResult,
     PageScanRecord,
     RobotsDecision,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -381,3 +382,41 @@ def test_temporary_robots_failure_is_terminal_at_max_attempts() -> None:
     )
     outcome = classify_worker_outcome(res, None, attempt_count=3, max_attempts=3)
     assert outcome == WorkerExecutionOutcome.TERMINAL_FAILURE
+
+
+def test_robots_certificate_failure_is_terminal_on_first_attempt() -> None:
+    """A certificate failure fetching robots.txt must not trigger full-site retries."""
+    robots_temp = RobotsDecision(
+        target_url="https://example.com",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch error: TLS certificate verification failed",
+    )
+    page = PageScanRecord(
+        requested_url="https://example.com",
+        final_url=None,
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    result = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="TLS_VERIFICATION_FAILED"),
+    )
+
+    error_code, retryable = classify_error_code_and_retryability(result)
+    assert error_code == "TLS_VERIFICATION_FAILED"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )

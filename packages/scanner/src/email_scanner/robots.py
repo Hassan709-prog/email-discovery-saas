@@ -216,14 +216,6 @@ class RobotsPolicyEvaluator:
             and fetch_result.status_code is not None
         ):
             status = fetch_result.status_code
-            if status in {401, 403}:
-                return _CachedRobotsPolicy(
-                    policy_type="ALWAYS_DISALLOW",
-                    parser=None,
-                    crawl_delay=None,
-                    reason=f"robots.txt access denied with HTTP status {status}",
-                    expires_at=now + self._cache_ttl,
-                )
             if status == 429 or status >= 500:
                 return _CachedRobotsPolicy(
                     policy_type="TEMPORARY_FAILURE",
@@ -232,7 +224,9 @@ class RobotsPolicyEvaluator:
                     reason=f"robots.txt temporary failure with HTTP status {status}",
                     expires_at=now + self._temp_fail_ttl,
                 )
-            # Other 4xx status codes (404, 410, etc.) mean robots.txt unavailable -> ALLOW
+            # RFC 9309 section 2.3.1.3 treats 4xx responses (including
+            # 401 and 403) as robots.txt being unavailable. This is not an
+            # explicit Disallow rule, so public resources may still be crawled.
             return _CachedRobotsPolicy(
                 policy_type="ALWAYS_ALLOW",
                 parser=None,

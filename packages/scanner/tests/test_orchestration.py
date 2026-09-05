@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -14,7 +14,9 @@ from email_scanner.errors import (
     SiteScanConfigErrorCode,
     SiteScanOutcome,
 )
+from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.models import (
+    FetchConfig,
     FetchResult,
     NormalizedURL,
     RedirectHop,
@@ -22,6 +24,7 @@ from email_scanner.models import (
     SiteScanConfig,
 )
 from email_scanner.orchestration import SiteScanOrchestrator
+from email_scanner.robots import RobotsPolicyEvaluator
 
 
 class FakeClock:
@@ -102,6 +105,55 @@ class MockRobotsEvaluator:
             crawl_delay=None,
             reason="Allowed by default mock",
         )
+
+
+def test_robots_403_unavailable_proceeds_to_homepage() -> None:
+    """A robots.txt 403 is unavailable, not an explicit crawl prohibition."""
+
+    class NoOpRequestGate:
+        def update_domain_interval(self, *_args: object) -> None:
+            return None
+
+    class Robots403Fetcher(MockHTTPFetcher):
+        config = FetchConfig()
+        request_gate = NoOpRequestGate()
+
+    async def _test() -> None:
+        start_url = "https://acme.com/"
+        robots_url = "https://acme.com/robots.txt"
+        fetcher = Robots403Fetcher(
+            {
+                robots_url: FetchResult(
+                    final_url=robots_url,
+                    status_code=403,
+                    content_type="text/plain",
+                    body_text="Forbidden",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.HTTP_ERROR,
+                    error_message="HTTP status 403",
+                ),
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text="<html><body>Email: hello@acme.com</body></html>",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        typed_fetcher = cast(AsyncHTTPFetcher, fetcher)
+        robots = RobotsPolicyEvaluator(fetcher=typed_fetcher)
+        orchestrator = SiteScanOrchestrator(fetcher=typed_fetcher, robots_evaluator=robots)
+
+        result = await orchestrator.scan(start_url)
+
+        assert fetcher.fetched_urls[:2] == [robots_url, start_url]
+        assert result.outcome == SiteScanOutcome.COMPLETED
+        assert result.statistics.pages_fetched == 1
+        assert [finding.canonical_email for finding in result.email_findings] == ["hello@acme.com"]
+
+    asyncio.run(_test())
 
 
 def test_site_scan_config_nan_inf_rejection() -> None:

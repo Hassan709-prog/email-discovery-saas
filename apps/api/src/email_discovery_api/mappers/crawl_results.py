@@ -522,7 +522,11 @@ def map_site_scan_result(
         and elapsed >= 0.0
         else 0.0
     )
-    started_at_val = now - timedelta(seconds=safe_elapsed)
+    try:
+        started_at_val = now - timedelta(seconds=safe_elapsed)
+    except OverflowError, ValueError:
+        safe_elapsed = 0.0
+        started_at_val = now
 
     checksum = compute_result_checksum(
         starting_url=requested_url,
@@ -579,7 +583,7 @@ def map_site_scan_result(
         connection_attempts=connection_attempts_clean if connection_attempts_clean else None,
         started_at=started_at_val,
         completed_at=now,
-        elapsed_seconds=elapsed,
+        elapsed_seconds=safe_elapsed,
         result_checksum=checksum,
         failure_code=failure_code_val,
         dns_duration_seconds=dns_sec,

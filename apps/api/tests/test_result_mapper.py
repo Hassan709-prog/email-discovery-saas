@@ -645,6 +645,7 @@ def test_map_site_scan_result_preserves_timezone_awareness() -> None:
         True,
         False,
         "invalid_str",
+        1e308,
     ],
 )
 def test_map_site_scan_result_defensive_invalid_elapsed_values(invalid_elapsed: Any) -> None:
@@ -667,7 +668,8 @@ def test_map_site_scan_result_defensive_invalid_elapsed_values(invalid_elapsed: 
     assert attempt.completed_at is not None
     assert attempt.completed_at == now
     assert attempt.started_at == now
-    assert attempt.started_at <= attempt.completed_at
+    assert attempt.started_at == attempt.completed_at
+    assert attempt.elapsed_seconds == 0.0
 
 
 def test_map_site_scan_result_defensive_missing_statistics() -> None:
@@ -686,3 +688,5 @@ def test_map_site_scan_result_defensive_missing_statistics() -> None:
     assert attempt.completed_at is not None
     assert attempt.completed_at == now
     assert attempt.started_at == now
+    assert attempt.started_at == attempt.completed_at
+    assert attempt.elapsed_seconds == 0.0

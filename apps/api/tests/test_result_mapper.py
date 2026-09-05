@@ -1,6 +1,9 @@
 """Unit tests for deterministic scanner result mapper, URL privacy, and candidate masking."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
+
+import pytest
 
 from email_discovery_api.mappers.crawl_results import (
     map_site_scan_result,
@@ -533,3 +536,153 @@ def test_map_site_scan_result_none_redirect_target_url() -> None:
 
     attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
     assert attempt.redirect_target_url is None
+
+
+def test_map_site_scan_result_execution_interval_12_5_seconds() -> None:
+    """Verify a 12.5-second result creates a 12.5-second timestamp interval."""
+    now = datetime(2026, 9, 5, 12, 0, 15, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=12.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now - timedelta(seconds=12.5)
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 12.5
+    assert attempt.elapsed_seconds == 12.5
+
+
+def test_map_site_scan_result_execution_interval_zero_seconds() -> None:
+    """Verify zero duration remains valid and creates identical start and completion timestamps."""
+    now = datetime(2026, 9, 5, 12, 0, 15, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 0.0
+    assert attempt.elapsed_seconds == 0.0
+
+
+def test_map_site_scan_result_preserves_timezone_awareness() -> None:
+    """Verify timezone-aware datetime instances preserve their exact timezone awareness."""
+    custom_tz = timezone(timedelta(hours=-5))
+    now = datetime(2026, 9, 5, 8, 30, 0, tzinfo=custom_tz)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=7.25,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at.tzinfo == custom_tz
+    assert attempt.started_at.tzinfo == custom_tz
+    assert attempt.completed_at == now
+    assert attempt.started_at == now - timedelta(seconds=7.25)
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 7.25
+
+
+@pytest.mark.parametrize(
+    "invalid_elapsed",
+    [
+        -5.0,
+        -0.001,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        None,
+        True,
+        False,
+        "invalid_str",
+    ],
+)
+def test_map_site_scan_result_defensive_invalid_elapsed_values(invalid_elapsed: Any) -> None:
+    """Verify invalid elapsed values do not produce future timestamps or unhandled errors."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+
+    class FakeStats:
+        elapsed_seconds = invalid_elapsed
+
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=FakeStats(),  # type: ignore[arg-type]
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now
+    assert attempt.started_at <= attempt.completed_at
+
+
+def test_map_site_scan_result_defensive_missing_statistics() -> None:
+    """Verify missing statistics produces valid non-future timestamps."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=None,  # type: ignore[arg-type]
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now

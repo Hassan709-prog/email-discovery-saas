@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -508,7 +509,20 @@ def map_site_scan_result(
         # For FAILED or PARTIAL outcomes, evaluate retryability from page records
         retryable = _evaluate_retryability(site_scan_result)
     err_msg = sanitize_text(site_scan_result.error_message, max_length=pol.max_error_message_length)
-    elapsed = site_scan_result.statistics.elapsed_seconds if site_scan_result.statistics else 0.0
+    elapsed = (
+        getattr(site_scan_result.statistics, "elapsed_seconds", 0.0)
+        if site_scan_result.statistics
+        else 0.0
+    )
+    safe_elapsed = (
+        float(elapsed)
+        if isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0.0
+        else 0.0
+    )
+    started_at_val = now - timedelta(seconds=safe_elapsed)
 
     checksum = compute_result_checksum(
         starting_url=requested_url,
@@ -563,7 +577,7 @@ def map_site_scan_result(
         error_message=err_msg,
         redirect_history=redirect_history_clean if redirect_history_clean else None,
         connection_attempts=connection_attempts_clean if connection_attempts_clean else None,
-        started_at=now,
+        started_at=started_at_val,
         completed_at=now,
         elapsed_seconds=elapsed,
         result_checksum=checksum,

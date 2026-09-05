@@ -1585,3 +1585,98 @@ async def test_persist_fenced_result_same_domain_redirect_does_not_populate_pend
         assert persisted.status == ScanURLStatus.NO_EMAIL.value
         assert persisted.redirect_target_domain is None
         assert persisted.redirect_target_url is None
+
+
+@pytest.mark.anyio
+async def test_persist_fenced_result_stores_mapped_execution_interval(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify persistence accurately stores the mapped execution interval in crawl_attempts."""
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=1,
+                valid_input_count=1,
+                queued_count=0,
+                running_count=1,
+                completed_count=0,
+                failed_count=0,
+            )
+            url = ScanURL(
+                id=url_id,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://example.com/interval",
+                normalized_url="https://example.com/interval",
+                normalized_domain="example.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url])
+
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/interval",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=12.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(),
+    )
+
+    claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://example.com/interval",
+        normalized_url="https://example.com/interval",
+        normalized_domain="example.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim, scan_res)
+
+    async with session_factory() as session:
+        attempt = (
+            await session.execute(select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id))
+        ).scalar_one()
+        assert attempt.started_at is not None
+        assert attempt.completed_at is not None
+        assert attempt.started_at.tzinfo is not None
+        assert attempt.completed_at.tzinfo is not None
+        interval = (attempt.completed_at - attempt.started_at).total_seconds()
+        assert interval == pytest.approx(12.5, abs=0.01)
+        assert attempt.elapsed_seconds == pytest.approx(12.5, abs=0.01)

@@ -33,6 +33,7 @@ from email_scanner.models import (
     FetchResult,
     PageScanRecord,
     RobotsDecision,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -112,6 +113,274 @@ def test_map_outcome_completed_no_emails() -> None:
     status, err_code = map_outcome_to_url_status(SiteScanOutcome.COMPLETED_NO_EMAILS, 0)
     assert status == ScanURLStatus.NO_EMAIL
     assert err_code is None
+
+
+def test_map_outcome_robots_blocked_tls_failure() -> None:
+    """Verify ROBOTS_BLOCKED with TLS_VERIFICATION_FAILED maps to TLS_VERIFICATION_FAILED."""
+    status, err_code = map_outcome_to_url_status(
+        SiteScanOutcome.ROBOTS_BLOCKED, 0, "TLS_VERIFICATION_FAILED"
+    )
+    assert status == ScanURLStatus.FAILED
+    assert err_code == "TLS_VERIFICATION_FAILED"
+
+
+def test_map_outcome_robots_blocked_explicit_disallow() -> None:
+    """Verify SiteScanOutcome.ROBOTS_BLOCKED with ROBOTS_BLOCKED or None maps to ROBOTS_BLOCKED."""
+    status, err_code = map_outcome_to_url_status(
+        SiteScanOutcome.ROBOTS_BLOCKED, 0, "ROBOTS_BLOCKED"
+    )
+    assert status == ScanURLStatus.FAILED
+    assert err_code == "ROBOTS_BLOCKED"
+
+    status_none, err_code_none = map_outcome_to_url_status(SiteScanOutcome.ROBOTS_BLOCKED, 0, None)
+    assert status_none == ScanURLStatus.FAILED
+    assert err_code_none == "ROBOTS_BLOCKED"
+
+
+def test_map_outcome_robots_blocked_fetch_errors() -> None:
+    """Verify ROBOTS_BLOCKED with transient failure codes maps to ROBOTS_FETCH_ERROR."""
+    codes = (
+        "ROBOTS_TEMPORARY_FAILURE",
+        "ROBOTS_FETCH_ERROR",
+        "TRANSPORT_ERROR",
+        "DNS_RESOLUTION_FAILED",
+        "CONNECT_TIMEOUT",
+        "READ_TIMEOUT",
+        "GENERIC_TIMEOUT",
+    )
+    for code in codes:
+        status, err_code = map_outcome_to_url_status(SiteScanOutcome.ROBOTS_BLOCKED, 0, code)
+        assert status == ScanURLStatus.FAILED
+        assert err_code == "ROBOTS_FETCH_ERROR"
+
+
+@pytest.mark.anyio
+async def test_persist_fenced_result_robots_blocked_classifications(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify persistence of ROBOTS_BLOCKED with TLS, disallow, and transport error."""
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id_tls = uuid.uuid4()
+    url_id_disallow = uuid.uuid4()
+    url_id_timeout = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=3,
+                valid_input_count=3,
+                queued_count=0,
+                running_count=3,
+                completed_count=0,
+                failed_count=0,
+            )
+            url_tls = ScanURL(
+                id=url_id_tls,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://tls-fail.com",
+                normalized_url="https://tls-fail.com/",
+                normalized_domain="tls-fail.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            url_disallow = ScanURL(
+                id=url_id_disallow,
+                scan_job_id=job_id,
+                original_index=1,
+                original_input="https://disallow.com",
+                normalized_url="https://disallow.com/",
+                normalized_domain="disallow.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            url_timeout = ScanURL(
+                id=url_id_timeout,
+                scan_job_id=job_id,
+                original_index=2,
+                original_input="https://timeout.com",
+                normalized_url="https://timeout.com/",
+                normalized_domain="timeout.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url_tls, url_disallow, url_timeout])
+
+    def make_robots_scan_result(
+        start_url: str,
+        failure_code: str,
+        page_outcome: PageScanOutcome,
+        robots_decision_code: RobotsDecisionCode,
+    ) -> SiteScanResult:
+        page_record = PageScanRecord(
+            requested_url=start_url,
+            final_url=None,
+            depth=0,
+            outcome=page_outcome,
+            status_code=None,
+            robots_decision=RobotsDecision(
+                target_url=start_url,
+                decision=robots_decision_code,
+                crawl_delay=None,
+                reason="Robots decision test",
+            ),
+            fetch_result=None,
+            emails_found_count=0,
+            links_discovered_count=0,
+            error_message="Robots test error",
+        )
+        return SiteScanResult(
+            starting_url=start_url,
+            outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+            statistics=SiteScanStatistics(
+                pages_queued=1,
+                pages_attempted=1,
+                pages_fetched=0,
+                pages_blocked_by_robots=1,
+                pages_failed=0,
+                urls_discovered=0,
+                accepted_email_findings=0,
+                rejected_email_candidates=0,
+                elapsed_seconds=0.5,
+                stop_reason="ROBOTS_BLOCKED",
+            ),
+            page_records=(page_record,),
+            email_findings=(),
+            rejected_email_candidates=(),
+            diagnostics=SiteScanDiagnostics(
+                total_duration_seconds=0.5,
+                dns_resolution_duration_seconds=0.05,
+                gate_wait_duration_seconds=0.0,
+                robots_fetch_duration_seconds=0.45,
+                robots_evaluation_duration_seconds=0.0,
+                http_fetch_duration_seconds=0.0,
+                page_processing_duration_seconds=0.0,
+                retry_count=0,
+                total_retry_delay_seconds=0.0,
+                redirect_count=0,
+                http_status=None,
+                failure_code=failure_code,
+                time_budget_exhausted=False,
+                cancellation_occurred=False,
+                retry_budget_exhausted=False,
+            ),
+        )
+
+    # 1. TLS verification failure
+    claim_tls = URLClaim(
+        scan_url_id=url_id_tls,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://tls-fail.com",
+        normalized_url="https://tls-fail.com/",
+        normalized_domain="tls-fail.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    res_tls = make_robots_scan_result(
+        "https://tls-fail.com/",
+        "TLS_VERIFICATION_FAILED",
+        PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        RobotsDecisionCode.TEMPORARY_FAILURE,
+    )
+
+    # 2. Explicit robots disallow
+    claim_disallow = URLClaim(
+        scan_url_id=url_id_disallow,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://disallow.com",
+        normalized_url="https://disallow.com/",
+        normalized_domain="disallow.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    res_disallow = make_robots_scan_result(
+        "https://disallow.com/",
+        "ROBOTS_BLOCKED",
+        PageScanOutcome.ROBOTS_DISALLOWED,
+        RobotsDecisionCode.DISALLOWED,
+    )
+
+    # 3. Timeout / transport error
+    claim_timeout = URLClaim(
+        scan_url_id=url_id_timeout,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://timeout.com",
+        normalized_url="https://timeout.com/",
+        normalized_domain="timeout.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    res_timeout = make_robots_scan_result(
+        "https://timeout.com/",
+        "GENERIC_TIMEOUT",
+        PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        RobotsDecisionCode.TEMPORARY_FAILURE,
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim_tls, res_tls)
+        await persistence.persist_fenced_result(claim_disallow, res_disallow)
+        await persistence.persist_fenced_result(claim_timeout, res_timeout)
+
+    async with session_factory() as session:
+        u_tls = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_tls))
+        ).scalar_one()
+        u_disallow = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_disallow))
+        ).scalar_one()
+        u_timeout = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_timeout))
+        ).scalar_one()
+
+        # Terminal TLS failure produces TLS_VERIFICATION_FAILED for both codes
+        assert u_tls.status == ScanURLStatus.FAILED.value
+        assert u_tls.last_error_code == "TLS_VERIFICATION_FAILED"
+        assert u_tls.last_failure_code == "TLS_VERIFICATION_FAILED"
+
+        # Explicit robots disallow persists as ROBOTS_BLOCKED
+        assert u_disallow.status == ScanURLStatus.FAILED.value
+        assert u_disallow.last_error_code == "ROBOTS_BLOCKED"
+        assert u_disallow.last_failure_code == "ROBOTS_BLOCKED"
+
+        # Timeout/transport maps to ROBOTS_FETCH_ERROR
+        assert u_timeout.status == ScanURLStatus.FAILED.value
+        assert u_timeout.last_error_code == "ROBOTS_FETCH_ERROR"
+        assert u_timeout.last_failure_code == "GENERIC_TIMEOUT"
 
 
 @pytest.mark.anyio

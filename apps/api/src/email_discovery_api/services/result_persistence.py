@@ -152,6 +152,8 @@ def map_outcome_to_url_status(
     if outcome == SiteScanOutcome.PARTIAL:
         return ScanURLStatus.COMPLETED, "PARTIAL_SCAN"
     if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        if failure_code == "TLS_VERIFICATION_FAILED":
+            return ScanURLStatus.FAILED, "TLS_VERIFICATION_FAILED"
         if failure_code in (
             "ROBOTS_TEMPORARY_FAILURE",
             "ROBOTS_FETCH_ERROR",
@@ -675,8 +677,7 @@ class ResultPersistenceService:
                     ),
                     retry_count=(
                         site_scan_result.diagnostics.retry_count
-                        if site_scan_result is not None
-                        and site_scan_result.diagnostics is not None
+                        if site_scan_result is not None and site_scan_result.diagnostics is not None
                         else None
                     ),
                     last_failure_code=mapped_attempt.failure_code,

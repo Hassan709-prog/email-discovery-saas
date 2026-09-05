@@ -275,6 +275,7 @@ class AsyncHTTPFetcher:
                 hop_attempt = 0
                 next_delay_sec = 0.0
                 next_delay_source: DelaySource | None = None
+                rejected_redirect_target: str | None = None
 
                 while True:
                     # Check global retry attempt limit and elapsed time budget
@@ -386,6 +387,7 @@ class AsyncHTTPFetcher:
                                             )
                                         ):
                                             attempt_outcome = FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+                                            rejected_redirect_target = target_url.normalized_url
                                             error_msg = (
                                                 f"Redirect to {target_str} rejected by scope policy"
                                             )
@@ -566,6 +568,7 @@ class AsyncHTTPFetcher:
                             outcome=attempt_outcome,
                             error_message=error_msg,
                             attempts=tuple(attempts),
+                            redirect_target_url=rejected_redirect_target,
                         )
 
                     # Calculate retry backoff delay

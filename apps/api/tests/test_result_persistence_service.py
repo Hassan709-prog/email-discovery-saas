@@ -1235,3 +1235,353 @@ async def test_successful_result_persistence_clean_diagnostics(
         assert url_obj3.last_error_code == "PARTIAL_SCAN"
         assert url_obj3.last_failure_code == "UNEXPECTED_INTERNAL_ERROR"
         assert attempt_obj3.failure_code == "UNEXPECTED_INTERNAL_ERROR"
+
+
+@pytest.mark.anyio
+async def test_persist_fenced_result_out_of_scope_redirect_typed_target(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify out-of-scope redirect persists destination domain/URL from typed target."""
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=1,
+                valid_input_count=1,
+                queued_count=0,
+                running_count=1,
+                completed_count=0,
+                failed_count=0,
+            )
+            url = ScanURL(
+                id=url_id,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://carefreeair.com",
+                normalized_url="https://carefreeair.com/",
+                normalized_domain="carefreeair.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url])
+
+    fetch_res = FetchResult(
+        final_url="https://carefreeair.com/",
+        status_code=301,
+        content_type=None,
+        body_text=None,
+        redirect_history=(),
+        outcome=FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,
+        error_message="Redirect rejected by scope policy",
+        redirect_target_url="https://carefreeacandheating.com/landing?token=123#sec",
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://carefreeair.com/",
+        final_url="https://carefreeair.com/",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=301,
+        robots_decision=RobotsDecision(
+            target_url="https://carefreeair.com/",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://carefreeair.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="FAILED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="OUT_OF_SCOPE_REDIRECT"),
+    )
+
+    claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://carefreeair.com",
+        normalized_url="https://carefreeair.com/",
+        normalized_domain="carefreeair.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim, scan_res)
+
+    async with session_factory() as session:
+        persisted = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id))
+        ).scalar_one()
+        assert persisted.status == ScanURLStatus.FAILED.value
+        assert persisted.redirect_target_domain == "carefreeacandheating.com"
+        assert persisted.redirect_target_url == "https://carefreeacandheating.com/landing"
+
+
+@pytest.mark.anyio
+async def test_persist_fenced_result_out_of_scope_missing_target_no_fallback(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify missing typed redirect_target_url leaves fields null without fallback."""
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=1,
+                valid_input_count=1,
+                queued_count=0,
+                running_count=1,
+                completed_count=0,
+                failed_count=0,
+            )
+            url = ScanURL(
+                id=url_id,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://carefreeair.com",
+                normalized_url="https://carefreeair.com/",
+                normalized_domain="carefreeair.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url])
+
+    fetch_res = FetchResult(
+        final_url="https://carefreeair.com/",
+        status_code=301,
+        content_type=None,
+        body_text=None,
+        redirect_history=(),
+        outcome=FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,
+        error_message="Redirect rejected by scope policy",
+        redirect_target_url=None,
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://carefreeair.com/",
+        final_url="https://carefreeair.com/",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=301,
+        robots_decision=RobotsDecision(
+            target_url="https://carefreeair.com/",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://carefreeair.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="FAILED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="OUT_OF_SCOPE_REDIRECT"),
+    )
+
+    claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://carefreeair.com",
+        normalized_url="https://carefreeair.com/",
+        normalized_domain="carefreeair.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim, scan_res)
+
+    async with session_factory() as session:
+        persisted = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id))
+        ).scalar_one()
+        assert persisted.status == ScanURLStatus.FAILED.value
+        assert persisted.redirect_target_domain is None
+        assert persisted.redirect_target_url is None
+
+
+@pytest.mark.anyio
+async def test_persist_fenced_result_same_domain_redirect_does_not_populate_pending_approval(
+    isolated_db_engine: Any, test_user_and_token: dict[str, Any]
+) -> None:
+    """Verify same-domain redirects succeed and do not populate redirect_target fields."""
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+    org_id = test_user_and_token["org_id"]
+    user_id = test_user_and_token["user_id"]
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=1,
+                valid_input_count=1,
+                queued_count=0,
+                running_count=1,
+                completed_count=0,
+                failed_count=0,
+            )
+            url = ScanURL(
+                id=url_id,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://example.com/start",
+                normalized_url="https://example.com/start",
+                normalized_domain="example.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url])
+
+    fetch_res = FetchResult(
+        final_url="https://example.com/finish",
+        status_code=200,
+        content_type="text/html",
+        body_text="<html>OK</html>",
+        redirect_history=(),
+        outcome=FetchOutcomeCode.SUCCESS,
+        redirect_target_url=None,
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://example.com/start",
+        final_url="https://example.com/finish",
+        depth=0,
+        outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+        status_code=200,
+        robots_decision=RobotsDecision(
+            target_url="https://example.com/start",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/start",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(),
+    )
+
+    claim = URLClaim(
+        scan_url_id=url_id,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://example.com/start",
+        normalized_url="https://example.com/start",
+        normalized_domain="example.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+
+    async with session_factory() as session:
+        persistence = ResultPersistenceService(session)
+        await persistence.persist_fenced_result(claim, scan_res)
+
+    async with session_factory() as session:
+        persisted = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id))
+        ).scalar_one()
+        assert persisted.status == ScanURLStatus.NO_EMAIL.value
+        assert persisted.redirect_target_domain is None
+        assert persisted.redirect_target_url is None

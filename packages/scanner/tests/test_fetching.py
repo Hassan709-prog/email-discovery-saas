@@ -554,3 +554,163 @@ def test_cancellation_during_request_gate_acquire_on_retry_records_zero_retries(
         assert diagnostics.retry_count == 0
 
     asyncio.run(_test())
+
+
+def test_fetch_cross_domain_redirect_rejected_by_scope_policy() -> None:
+    """Out-of-scope redirect preserves final_url as source and sets redirect_target_url."""
+
+    async def _test() -> None:
+        requested_urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_urls.append(str(request.url))
+            if request.url.host == "carefreeair.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://carefreeacandheating.com/landing?foo=bar#frag"},
+                )
+            return httpx.Response(200, content=b"<html>Should not be reached</html>")
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        result = await fetcher.fetch("https://carefreeair.com/start")
+
+        assert result.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+        assert result.final_url == "https://carefreeair.com/start"
+        assert result.redirect_target_url == "https://carefreeacandheating.com/landing?foo=bar"
+        assert len(result.redirect_history) == 0
+        assert requested_urls == ["https://carefreeair.com/start"]
+
+    asyncio.run(_test())
+
+
+def test_fetch_userinfo_credential_bearing_redirect_rejected() -> None:
+    """Redirect Location containing user credentials is rejected as INVALID_URL without target."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                301,
+                headers={"Location": "https://user:pass@carefreeacandheating.com/landing"},
+            )
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(dns_resolver=dns, client=client)
+
+        result = await fetcher.fetch("https://carefreeair.com/start")
+
+        assert result.outcome == FetchOutcomeCode.INVALID_URL
+        assert result.final_url == "https://carefreeair.com/start"
+        assert result.redirect_target_url is None
+
+    asyncio.run(_test())
+
+
+def test_fetch_same_domain_redirect_continues_normally() -> None:
+    """Same-domain redirect succeeds and does not populate redirect_target_url."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/start":
+                return httpx.Response(301, headers={"Location": "/finish"})
+            return httpx.Response(
+                200, headers={"Content-Type": "text/html"}, content=b"<html>OK</html>"
+            )
+
+        dns = FakeDNSResolver()
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        result = await fetcher.fetch("https://example.com/start")
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.final_url == "https://example.com/finish"
+        assert result.redirect_target_url is None
+        assert len(result.redirect_history) == 1
+
+    asyncio.run(_test())
+
+
+def test_fetch_approved_redirect_domain_permits_destination_and_rejects_unapproved() -> None:
+    """Approved redirect domain allows destination; unapproved domain remains rejected."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "carefreeair.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://carefreeacandheating.com/landing"},
+                )
+            if request.url.host == "carefreeacandheating.com":
+                return httpx.Response(
+                    200, headers={"Content-Type": "text/html"}, content=b"<html>Approved</html>"
+                )
+            if request.url.host == "other.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://unapproved.com/landing"},
+                )
+            return httpx.Response(404)
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+                "other.com": ("93.184.215.16",),
+                "unapproved.com": ("93.184.215.17",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        config = FetchConfig(approved_redirect_domains=("carefreeacandheating.com",))
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            config=config,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        # 1. Approved destination succeeds
+        res_approved = await fetcher.fetch("https://carefreeair.com/start")
+        assert res_approved.outcome == FetchOutcomeCode.SUCCESS
+        assert res_approved.final_url == "https://carefreeacandheating.com/landing"
+        assert res_approved.redirect_target_url is None
+        assert len(res_approved.redirect_history) == 1
+
+        # 2. Unapproved destination is rejected as OUT_OF_SCOPE_REDIRECT
+        res_unapproved = await fetcher.fetch("https://other.com/start")
+        assert res_unapproved.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+        assert res_unapproved.final_url == "https://other.com/start"
+        assert res_unapproved.redirect_target_url == "https://unapproved.com/landing"
+
+    asyncio.run(_test())

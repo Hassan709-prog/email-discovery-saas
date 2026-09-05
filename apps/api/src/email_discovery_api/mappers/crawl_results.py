@@ -158,6 +158,7 @@ class MappedAttempt:
     robots_duration_seconds: float | None = None
     http_duration_seconds: float | None = None
     parse_duration_seconds: float | None = None
+    redirect_target_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +543,15 @@ def map_site_scan_result(
     http_sec = diag.http_fetch_duration_seconds if diag else None
     parse_sec = diag.page_processing_duration_seconds if diag else None
 
+    redirect_target_val: str | None = None
+    if (
+        first_page_rec
+        and first_page_rec.fetch_result
+        and getattr(first_page_rec.fetch_result, "redirect_target_url", None)
+    ):
+        sanitized_target = sanitize_url(first_page_rec.fetch_result.redirect_target_url)
+        redirect_target_val = sanitized_target if sanitized_target else None
+
     mapped_attempt = MappedAttempt(
         attempt_number=attempt_number,
         outcome=attempt_outcome,
@@ -563,6 +573,7 @@ def map_site_scan_result(
         robots_duration_seconds=robots_sec,
         http_duration_seconds=http_sec,
         parse_duration_seconds=parse_sec,
+        redirect_target_url=redirect_target_val,
     )
 
     return (

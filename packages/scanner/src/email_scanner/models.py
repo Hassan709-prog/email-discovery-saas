@@ -218,6 +218,7 @@ class FetchResult:
     outcome: FetchOutcomeCode
     error_message: str | None = None
     attempts: tuple[FetchAttempt, ...] = ()
+    redirect_target_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

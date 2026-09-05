@@ -427,3 +427,109 @@ def test_mapper_enforces_none_failure_code_for_successful_outcomes() -> None:
 
     attempt_partial, _, _, _, _ = map_site_scan_result(res_partial, attempt_number=1, now=now)
     assert attempt_partial.failure_code == "UNEXPECTED_INTERNAL_ERROR"
+
+
+def test_map_site_scan_result_preserves_and_sanitizes_redirect_target_url() -> None:
+    """Verify mapper preserves redirect_target_url and strips query/fragment via sanitize_url."""
+    now = datetime.now(UTC)
+    fetch_res = FetchResult(
+        final_url="https://carefreeair.com/start",
+        status_code=301,
+        content_type=None,
+        body_text=None,
+        redirect_history=(),
+        outcome=FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,
+        error_message="Redirect rejected by scope policy",
+        redirect_target_url="https://carefreeacandheating.com/landing?token=secret123&foo=bar#section1",
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://carefreeair.com/start",
+        final_url="https://carefreeair.com/start",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=301,
+        robots_decision=RobotsDecision(
+            target_url="https://carefreeair.com/start",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://carefreeair.com/start",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="FAILED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.final_url == "https://carefreeair.com/start"
+    assert attempt.redirect_target_url == "https://carefreeacandheating.com/landing"
+
+
+def test_map_site_scan_result_none_redirect_target_url() -> None:
+    """Verify mapper leaves redirect_target_url None when fetch_result has no target."""
+    now = datetime.now(UTC)
+    fetch_res = FetchResult(
+        final_url="https://example.com/",
+        status_code=200,
+        content_type="text/html",
+        body_text="<html>content</html>",
+        redirect_history=(),
+        outcome=FetchOutcomeCode.SUCCESS,
+        redirect_target_url=None,
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://example.com/",
+        final_url="https://example.com/",
+        depth=0,
+        outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+        status_code=200,
+        robots_decision=RobotsDecision(
+            target_url="https://example.com/",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.redirect_target_url is None

@@ -470,10 +470,13 @@ class ResultPersistenceService:
             err_code in ("OUT_OF_SCOPE_REDIRECT", "BUSINESS_DOMAIN_REDIRECT_REVIEW")
             or mapped_attempt.failure_code == "OUT_OF_SCOPE_REDIRECT"
         ):
-            if mapped_attempt.final_url:
-                redirect_target_url = mapped_attempt.final_url
-                parsed = urlsplit(mapped_attempt.final_url)
-                redirect_target_domain = parsed.hostname
+            target_cand: str | None = mapped_attempt.redirect_target_url
+            if target_cand:
+                parsed = urlsplit(target_cand)
+                hostname: str | None = parsed.hostname
+                if hostname:
+                    redirect_target_url = target_cand
+                    redirect_target_domain = hostname.lower()
 
         if site_scan_result.outcome in (
             SiteScanOutcome.COMPLETED,

@@ -12,6 +12,7 @@ from email_scanner.errors import (
     FetchOutcomeCode,
     HostSafetyError,
     HostSafetyErrorCode,
+    SiteScanFailureCode,
 )
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
@@ -712,5 +713,54 @@ def test_fetch_approved_redirect_domain_permits_destination_and_rejects_unapprov
         assert res_unapproved.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
         assert res_unapproved.final_url == "https://other.com/start"
         assert res_unapproved.redirect_target_url == "https://unapproved.com/landing"
+
+    asyncio.run(_test())
+
+
+def test_fetch_permanent_dns_failure_no_retries() -> None:
+    async def _test() -> None:
+        class PermanentFailResolver:
+            async def resolve(
+                self, url: NormalizedURL, *args: object, **kwargs: object
+            ) -> tuple[str, ...]:
+                raise HostSafetyError(
+                    code=HostSafetyErrorCode.DNS_NAME_NOT_FOUND,
+                    message="Host nonexistent.example does not exist",
+                )
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=PermanentFailResolver())
+        recorder = SiteScanDiagnosticRecorder()
+        res = await fetcher.fetch("https://nonexistent.example/", recorder=recorder)
+
+        assert res.outcome == FetchOutcomeCode.DNS_NAME_NOT_FOUND
+        assert len(res.attempts) == 1
+        assert recorder.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        assert diagnostics.retry_count == 0
+
+    asyncio.run(_test())
+
+
+def test_fetch_transient_dns_failure() -> None:
+    async def _test() -> None:
+        class TransientFailResolver:
+            async def resolve(
+                self, url: NormalizedURL, *args: object, **kwargs: object
+            ) -> tuple[str, ...]:
+                raise HostSafetyError(
+                    code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
+                    message="Temporary failure in name resolution",
+                )
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=TransientFailResolver())
+        recorder = SiteScanDiagnosticRecorder()
+        res = await fetcher.fetch("https://transient.example/", recorder=recorder)
+
+        assert res.outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED
+        assert len(res.attempts) == 1
+        assert recorder.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
 
     asyncio.run(_test())

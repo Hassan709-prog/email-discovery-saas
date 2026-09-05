@@ -1,11 +1,17 @@
 """Tests for scanner-core RobotsPolicyEvaluator."""
 
 import asyncio
+from typing import Any
 
 import httpx
 import pytest
 
-from email_scanner.errors import FetchOutcomeCode, HostSafetyError, HostSafetyErrorCode
+from email_scanner.errors import (
+    FetchOutcomeCode,
+    HostSafetyError,
+    HostSafetyErrorCode,
+    SiteScanFailureCode,
+)
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
 from email_scanner.models import (
@@ -225,5 +231,44 @@ def test_robots_evaluation_timing_excludes_fetch_time() -> None:
         diagnostics = recorder.build_diagnostics()
         assert diagnostics.robots_fetch_duration_seconds == 2.0
         assert diagnostics.robots_evaluation_duration_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_robots_permanent_dns_failure_diagnostics() -> None:
+    async def _test() -> None:
+        class PermanentDNSFailFetcher:
+            config = FetchConfig()
+
+            async def fetch(
+                self, *_args: object, recorder: Any | None = None, **_kwargs: object
+            ) -> FetchResult:
+                if recorder is not None and hasattr(recorder, "failure_code"):
+                    recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                return FetchResult(
+                    final_url="https://nonexistent.example/robots.txt",
+                    status_code=None,
+                    content_type=None,
+                    body_text=None,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+                    error_message="Host nonexistent.example does not exist",
+                )
+
+            class RequestGate:
+                def update_domain_interval(self, *_args: object) -> None:
+                    return None
+
+            request_gate = RequestGate()
+
+        recorder = SiteScanDiagnosticRecorder()
+        evaluator = RobotsPolicyEvaluator(fetcher=PermanentDNSFailFetcher())  # type: ignore[arg-type]
+        decision = await evaluator.evaluate("https://nonexistent.example/", recorder=recorder)
+
+        assert decision.decision == RobotsDecisionCode.TEMPORARY_FAILURE
+        assert "robots.txt fetch error" in decision.reason
+        assert recorder.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
 
     asyncio.run(_test())

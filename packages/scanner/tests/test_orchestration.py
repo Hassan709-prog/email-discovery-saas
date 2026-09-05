@@ -12,6 +12,7 @@ from email_scanner.errors import (
     RobotsDecisionCode,
     SiteScanConfigError,
     SiteScanConfigErrorCode,
+    SiteScanFailureCode,
     SiteScanOutcome,
 )
 from email_scanner.fetching import AsyncHTTPFetcher
@@ -22,6 +23,7 @@ from email_scanner.models import (
     RedirectHop,
     RobotsDecision,
     SiteScanConfig,
+    SiteScanDiagnosticRecorder,
 )
 from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.robots import RobotsPolicyEvaluator
@@ -579,5 +581,91 @@ def test_successful_site_outcomes_clear_recorder_failure_code() -> None:
         assert res_completed.outcome == SiteScanOutcome.COMPLETED
         assert res_completed.diagnostics is not None
         assert res_completed.diagnostics.failure_code is None
+
+    asyncio.run(_test())
+
+
+def test_orchestration_homepage_permanent_dns_failure() -> None:
+    async def _test() -> None:
+        start_url = "https://nonexistent.example"
+
+        class MockPermanentDNSFetcher(AsyncHTTPFetcher):
+            def __init__(self) -> None:
+                super().__init__(config=FetchConfig(), pinned=False)
+
+            async def fetch(
+                self,
+                url: str | NormalizedURL,
+                allowed_content_types: tuple[str, ...] | None = None,
+                redirect_validator: Callable[[NormalizedURL, NormalizedURL], bool] | None = None,
+                recorder: Any | None = None,
+            ) -> FetchResult:
+                if recorder is not None:
+                    recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                return FetchResult(
+                    final_url=str(url),
+                    status_code=None,
+                    content_type=None,
+                    body_text=None,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+                    error_message="Host nonexistent.example does not exist",
+                )
+
+        fetcher = MockPermanentDNSFetcher()
+        robots = MockRobotsEvaluator()  # Allows crawling
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+
+        rec = SiteScanDiagnosticRecorder()
+        res = await orchestrator.scan(start_url, recorder=rec)
+
+        assert res.outcome == SiteScanOutcome.FAILED
+        assert len(res.page_records) == 1
+        assert res.page_records[0].outcome == PageScanOutcome.FETCH_FAILED
+        assert res.page_records[0].fetch_result is not None
+        assert res.page_records[0].fetch_result.outcome == FetchOutcomeCode.DNS_NAME_NOT_FOUND
+        assert res.diagnostics is not None
+        assert res.diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        assert res.diagnostics.retry_count == 0
+
+    asyncio.run(_test())
+
+
+def test_orchestration_robots_permanent_dns_failure() -> None:
+    async def _test() -> None:
+        start_url = "https://nonexistent.example"
+
+        class MockRobotsPermanentDNS(RobotsPolicyEvaluator):
+            def __init__(self) -> None:
+                pass
+
+            async def evaluate(
+                self,
+                url: str | NormalizedURL,
+                user_agent_token: str | None = None,
+                recorder: Any | None = None,
+            ) -> RobotsDecision:
+                if recorder is not None:
+                    recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                return RobotsDecision(
+                    target_url=str(url),
+                    decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+                    crawl_delay=None,
+                    reason="robots.txt fetch error: Host nonexistent.example does not exist",
+                )
+
+        fetcher = MockHTTPFetcher({})
+        robots = MockRobotsPermanentDNS()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+
+        rec = SiteScanDiagnosticRecorder()
+        res = await orchestrator.scan(start_url, recorder=rec)
+
+        assert res.outcome == SiteScanOutcome.ROBOTS_BLOCKED
+        assert len(res.page_records) == 1
+        assert res.page_records[0].outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE
+        assert res.diagnostics is not None
+        assert res.diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        assert res.diagnostics.retry_count == 0
 
     asyncio.run(_test())

@@ -234,6 +234,16 @@ class AsyncDNSResolver(Protocol):
         ...
 
 
+def is_permanent_dns_error(err: socket.gaierror) -> bool:
+    """Classify socket.gaierror into permanent versus transient using platform constants."""
+    permanent_errnos: set[int] = set()
+    for name in ("EAI_NONAME", "EAI_NODATA"):
+        val = getattr(socket, name, None)
+        if isinstance(val, int):
+            permanent_errnos.add(val)
+    return isinstance(err.errno, int) and err.errno in permanent_errnos
+
+
 class SystemDNSResolver:
     """Production DNS resolver using socket.getaddrinfo via asyncio.to_thread."""
 
@@ -333,8 +343,13 @@ class SystemDNSResolver:
             except socket.gaierror as err:
                 if recorder is not None:
                     recorder.dns_resolution_duration_seconds += max(0.0, get_time() - start_t)
+                code = (
+                    HostSafetyErrorCode.DNS_NAME_NOT_FOUND
+                    if is_permanent_dns_error(err)
+                    else HostSafetyErrorCode.NO_RESOLVED_ADDRESSES
+                )
                 raise HostSafetyError(
-                    code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
+                    code=code,
                     message=f"DNS resolution failed for {cleaned_host}: {err}",
                 ) from err
 
@@ -344,7 +359,7 @@ class SystemDNSResolver:
             addresses = tuple(str(res[4][0]) for res in results if res[4])
             if not addresses:
                 raise HostSafetyError(
-                    code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
+                    code=HostSafetyErrorCode.DNS_NAME_NOT_FOUND,
                     message=f"No IP addresses resolved for {cleaned_host}",
                 )
 

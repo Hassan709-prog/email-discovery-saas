@@ -234,17 +234,20 @@ class AsyncHTTPFetcher:
                     except TypeError:
                         await self._dns_resolver.resolve(current_url)
                 except HostSafetyError as err:
-                    outcome = (
-                        FetchOutcomeCode.DNS_RESOLUTION_FAILED
-                        if err.code == HostSafetyErrorCode.NO_RESOLVED_ADDRESSES
-                        else FetchOutcomeCode.UNSAFE_HOST
-                    )
+                    if err.code == HostSafetyErrorCode.DNS_NAME_NOT_FOUND:
+                        outcome = FetchOutcomeCode.DNS_NAME_NOT_FOUND
+                    elif err.code == HostSafetyErrorCode.NO_RESOLVED_ADDRESSES:
+                        outcome = FetchOutcomeCode.DNS_RESOLUTION_FAILED
+                    else:
+                        outcome = FetchOutcomeCode.UNSAFE_HOST
+
                     if recorder is not None:
-                        recorder.failure_code = (
-                            SiteScanFailureCode.DNS_RESOLUTION_FAILED
-                            if outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED
-                            else SiteScanFailureCode.UNSAFE_HOST
-                        )
+                        if outcome == FetchOutcomeCode.DNS_NAME_NOT_FOUND:
+                            recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                        elif outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
+                            recorder.failure_code = SiteScanFailureCode.DNS_RESOLUTION_FAILED
+                        else:
+                            recorder.failure_code = SiteScanFailureCode.UNSAFE_HOST
                     attempts.append(
                         FetchAttempt(
                             hop_index=hop_index,

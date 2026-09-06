@@ -179,6 +179,29 @@ export interface ScanURLApiResponse {
   diagnostics?: ScanURLDiagnosticsApiResponse | null;
 }
 
+export type BulkRedirectDisposition = 'APPROVED' | 'REJECTED' | 'ALREADY_APPLIED' | 'SKIPPED';
+export type BulkRedirectAction = 'APPROVE' | 'REJECT';
+
+export interface BulkRedirectItemResult {
+  scan_url_id: string;
+  disposition: BulkRedirectDisposition;
+  target_domain: string | null;
+  message: string | null;
+}
+
+export interface BulkRedirectApiResponse {
+  job_id: string;
+  action: BulkRedirectAction;
+  requested_count: number;
+  unique_requested_count: number;
+  affected_count: number;
+  results: BulkRedirectItemResult[];
+}
+
+export interface BulkRedirectApiRequest {
+  scan_url_ids: string[];
+}
+
 export interface RepresentativeEvidenceApiResponse {
   evidence_id: string;
   source_type: EmailSourceType | string;

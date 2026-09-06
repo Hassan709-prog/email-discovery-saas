@@ -3,6 +3,8 @@ import {
   ApiError,
   ApiErrorEnvelope,
   AuthSuccessResponse,
+  BulkRedirectApiRequest,
+  BulkRedirectApiResponse,
   CreateScanJobApiRequest,
   FindingEvidenceItemApiResponse,
   LoginRequest,
@@ -298,12 +300,20 @@ export async function getScanJobProgress(
 
 export async function listScanJobUrls(
   jobId: string,
-  params?: { limit?: number; cursor?: string; status?: string }
+  params?: {
+    limit?: number;
+    cursor?: string;
+    status?: string;
+    requires_redirect_approval?: boolean;
+  }
 ): Promise<PaginatedResponse<ScanURLApiResponse>> {
   const query = new URLSearchParams();
   if (params?.limit) query.set('limit', params.limit.toString());
   if (params?.cursor) query.set('cursor', params.cursor);
   if (params?.status) query.set('status', params.status);
+  if (params?.requires_redirect_approval !== undefined) {
+    query.set('requires_redirect_approval', params.requires_redirect_approval.toString());
+  }
 
   const url = `/api/v1/scan-jobs/${jobId}/urls${query.toString() ? `?${query.toString()}` : ''}`;
   return apiFetch<PaginatedResponse<ScanURLApiResponse>>(url, { method: 'GET' });
@@ -523,6 +533,32 @@ export async function approveUrlRedirect(
     `/api/v1/scan-jobs/${jobId}/urls/${urlId}/approve-redirect${query}`,
     {
       method: 'POST',
+    }
+  );
+}
+
+export async function bulkApproveUrlRedirects(
+  jobId: string,
+  payload: BulkRedirectApiRequest
+): Promise<BulkRedirectApiResponse> {
+  return apiFetch<BulkRedirectApiResponse>(
+    `/api/v1/scan-jobs/${jobId}/urls/bulk-approve-redirects`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export async function bulkRejectUrlRedirects(
+  jobId: string,
+  payload: BulkRedirectApiRequest
+): Promise<BulkRedirectApiResponse> {
+  return apiFetch<BulkRedirectApiResponse>(
+    `/api/v1/scan-jobs/${jobId}/urls/bulk-reject-redirects`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }
   );
 }

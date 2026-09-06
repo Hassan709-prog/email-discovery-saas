@@ -704,6 +704,7 @@ class CrawlWorker:
                     claim_digest,
                     sanitized_error_code,
                     type(exc).__name__,
+                    exc_info=True,
                 )
 
             if lease_lost_event.is_set():

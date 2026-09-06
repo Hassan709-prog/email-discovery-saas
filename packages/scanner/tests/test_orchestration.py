@@ -669,3 +669,80 @@ def test_orchestration_robots_permanent_dns_failure() -> None:
         assert res.diagnostics.retry_count == 0
 
     asyncio.run(_test())
+
+
+def test_orchestration_recovers_and_extracts_when_href_malformed() -> None:
+    """Orchestration continues, discovers valid links, and extracts emails
+    when a malformed href is present.
+    """
+
+    async def _test() -> None:
+        start_url = "https://hardyarchitecture.com/"
+        home_html = """
+        <html>
+          <body>
+            <h1>Hardy Architecture</h1>
+            <a href="http://[album-1]">DeKalb County, GA Courthouse</a>
+            <a href="/contact">Contact Page</a>
+            <p>Direct info: info@hardyarchitecture.com</p>
+          </body>
+        </html>
+        """
+        contact_html = """
+        <html>
+          <body>
+            <h1>Contact Us</h1>
+            <p>Reach out: team@hardyarchitecture.com</p>
+          </body>
+        </html>
+        """
+        responses = {
+            "https://hardyarchitecture.com/": FetchResult(
+                final_url="https://hardyarchitecture.com/",
+                status_code=200,
+                content_type="text/html",
+                body_text=home_html,
+                redirect_history=(),
+                outcome=FetchOutcomeCode.SUCCESS,
+            ),
+            "https://hardyarchitecture.com/contact": FetchResult(
+                final_url="https://hardyarchitecture.com/contact",
+                status_code=200,
+                content_type="text/html",
+                body_text=contact_html,
+                redirect_history=(),
+                outcome=FetchOutcomeCode.SUCCESS,
+            ),
+        }
+
+        class MockRobotsAllowed(RobotsPolicyEvaluator):
+            def __init__(self) -> None:
+                pass
+
+            async def evaluate(
+                self,
+                url: str | NormalizedURL,
+                user_agent_token: str | None = None,
+                recorder: Any | None = None,
+            ) -> RobotsDecision:
+                return RobotsDecision(
+                    target_url=str(url),
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                )
+
+        fetcher = MockHTTPFetcher(responses)
+        robots = MockRobotsAllowed()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+
+        res = await orchestrator.scan(start_url)
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        assert len(res.email_findings) == 1
+        assert res.email_findings[0].canonical_email == "info@hardyarchitecture.com"
+        fetched_pages = {p.requested_url for p in res.page_records}
+        assert "https://hardyarchitecture.com/" in fetched_pages
+        assert "https://hardyarchitecture.com/contact" in fetched_pages
+        assert res.page_records[1].emails_found_count == 1
+
+    asyncio.run(_test())

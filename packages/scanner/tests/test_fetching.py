@@ -2,6 +2,7 @@
 
 import asyncio
 import ssl
+from typing import Any
 
 import httpx
 import pytest
@@ -762,5 +763,35 @@ def test_fetch_transient_dns_failure() -> None:
         assert recorder.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
         diagnostics = recorder.build_diagnostics()
         assert diagnostics.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
+
+    asyncio.run(_test())
+
+
+def test_redirect_malformed_bracketed_location_returns_invalid_url() -> None:
+    """Verify malformed redirect Location with bracketed host returns sanitized INVALID_URL."""
+
+    async def _test() -> None:
+        from unittest.mock import MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 302
+        mock_resp.headers = {"location": "http://[album-1]"}
+
+        class MockStream:
+            async def __aenter__(self) -> MagicMock:
+                return mock_resp
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, tb: Any) -> None:
+                return None
+
+        mock_client = MagicMock()
+        mock_client.stream.return_value = MockStream()
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=mock_client)
+
+        result = await fetcher.fetch("https://example.com/redirect-malformed")
+        assert result.outcome == FetchOutcomeCode.INVALID_URL
+        assert result.error_message == "Invalid redirect Location URL."
+        assert "album-1" not in (result.error_message or "")
 
     asyncio.run(_test())

@@ -367,10 +367,10 @@ class AsyncHTTPFetcher:
                                         f"(status {status_code})"
                                     )
                                 else:
-                                    target_str = urllib.parse.urljoin(
-                                        current_url.normalized_url, location
-                                    )
                                     try:
+                                        target_str = urllib.parse.urljoin(
+                                            current_url.normalized_url, location
+                                        )
                                         target_url = normalize_url(target_str)
                                         is_approved_redirect = False
                                         if config.allow_cross_domain_redirects:
@@ -436,6 +436,9 @@ class AsyncHTTPFetcher:
                                     except URLNormalizationError as norm_err:
                                         attempt_outcome = FetchOutcomeCode.INVALID_URL
                                         error_msg = f"Invalid redirect Location URL: {norm_err}"
+                                    except ValueError:
+                                        attempt_outcome = FetchOutcomeCode.INVALID_URL
+                                        error_msg = "Invalid redirect Location URL."
 
                             else:
                                 # Validate content-type for non-redirects

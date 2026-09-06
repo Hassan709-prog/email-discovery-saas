@@ -151,3 +151,36 @@ def test_pipeline_repeatability() -> None:
     res2 = discover_and_rank_links("https://example.com/", html, config)
 
     assert res1 == res2
+
+
+def test_malformed_candidate_href_bracketed_host_skipped() -> None:
+    """Verify malformed candidate href with bracketed host is skipped without raising ValueError."""
+    html = """
+    <html>
+      <body>
+        <a href="http://[album-1]">DeKalb County, GA Courthouse</a>
+        <a href="/about-us">About Us</a>
+        <a href="https://example.com/contact">Contact Us</a>
+      </body>
+    </html>
+    """
+    res = discover_and_rank_links("https://example.com/", html)
+    urls = [link.normalized_url for link in res.discovered_links]
+    assert "https://example.com/about-us" in urls
+    assert "https://example.com/contact" in urls
+    assert not any("album-1" in u for u in urls)
+
+
+def test_malformed_base_href_bracketed_host_fallback() -> None:
+    """Verify malformed base href with bracketed host falls back to source URL safely."""
+    html = """
+    <html>
+      <head><base href="http://[album-1]/gallery/"></head>
+      <body>
+        <a href="page.html">Sub Page</a>
+      </body>
+    </html>
+    """
+    res = discover_and_rank_links("https://example.com/root/", html)
+    urls = [link.normalized_url for link in res.discovered_links]
+    assert "https://example.com/root/page.html" in urls

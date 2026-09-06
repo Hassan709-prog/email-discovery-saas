@@ -115,10 +115,10 @@ def _get_effective_base_url(raw_base_href: str | None, source_url: NormalizedURL
     if not raw_base_href or not raw_base_href.strip():
         return source_url.normalized_url
 
-    resolved_base = urllib.parse.urljoin(source_url.normalized_url, raw_base_href.strip())
     try:
+        resolved_base = urllib.parse.urljoin(source_url.normalized_url, raw_base_href.strip())
         norm_base = normalize_url(resolved_base)
-    except URLNormalizationError:
+    except ValueError:
         return source_url.normalized_url
 
     if norm_base.scheme not in {"http", "https"}:
@@ -177,10 +177,10 @@ def discover_and_rank_links(
         if any(href_lower.startswith(prefix) for prefix in _REJECTED_SCHEME_PREFIXES):
             continue
 
-        resolved_target = urllib.parse.urljoin(effective_base_url, raw_href.strip())
         try:
+            resolved_target = urllib.parse.urljoin(effective_base_url, raw_href.strip())
             target_norm = normalize_url(resolved_target)
-        except URLNormalizationError:
+        except ValueError:
             continue
 
         if not is_in_scope(target_norm, norm_source, cfg.scope_mode):

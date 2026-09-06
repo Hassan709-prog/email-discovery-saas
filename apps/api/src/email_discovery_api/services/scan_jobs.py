@@ -934,6 +934,33 @@ class ScanJobService:
             completed_at=job.completed_at,
         )
 
+    @staticmethod
+    def _validate_and_apply_approval_counters(job: ScanJob, affected_count: int) -> None:
+        """Validate counter integrity and apply counter updates for redirect approvals.
+
+        Ensures job.failed_count >= affected_count. Raises ServiceError(INVALID_STATE_TRANSITION)
+        if violated, rolling back the transaction. Does not leak internal counter numbers
+        in the public error response message.
+        """
+        if affected_count <= 0:
+            return
+        if job.failed_count < affected_count:
+            raise ServiceError(
+                ServiceErrorCode.INVALID_STATE_TRANSITION,
+                f"Cannot approve redirect for job {job.id}: "
+                "job state does not permit redirect approval.",
+            )
+        job.failed_count -= affected_count
+        job.queued_count += affected_count
+        if job.completed_at is not None:
+            job.completed_at = None
+        if job.status in (
+            ScanJobStatus.COMPLETED_WITH_ERRORS.value,
+            ScanJobStatus.FAILED.value,
+            ScanJobStatus.COMPLETED.value,
+        ):
+            job.status = ScanJobStatus.RUNNING.value
+
     async def approve_url_redirect(
         self,
         organization_id: uuid.UUID,
@@ -1018,17 +1045,7 @@ class ScanJobService:
 
             apply_url_redirect_approval(url)
 
-            if job.failed_count > 0:
-                job.failed_count = job.failed_count - 1
-            job.queued_count = job.queued_count + 1
-            if job.completed_at is not None:
-                job.completed_at = None
-            if job.status in (
-                ScanJobStatus.COMPLETED_WITH_ERRORS.value,
-                ScanJobStatus.FAILED.value,
-                ScanJobStatus.COMPLETED.value,
-            ):
-                job.status = ScanJobStatus.RUNNING.value
+            self._validate_and_apply_approval_counters(job, 1)
 
             seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
             if seq is not None:
@@ -1145,19 +1162,9 @@ class ScanJobService:
             affected_count = len(pending_mutations)
             skipped_count = len(already_applied_ids)
 
-            # 6. Update job counters once
+            # 6. Update job counters once with strict invariant validation
             if affected_count > 0:
-                if job.failed_count > 0:
-                    job.failed_count = max(0, job.failed_count - affected_count)
-                job.queued_count = job.queued_count + affected_count
-                if job.completed_at is not None:
-                    job.completed_at = None
-                if job.status in (
-                    ScanJobStatus.COMPLETED_WITH_ERRORS.value,
-                    ScanJobStatus.FAILED.value,
-                    ScanJobStatus.COMPLETED.value,
-                ):
-                    job.status = ScanJobStatus.RUNNING.value
+                self._validate_and_apply_approval_counters(job, affected_count)
 
                 seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
                 if seq is not None:

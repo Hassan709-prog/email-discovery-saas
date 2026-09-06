@@ -1144,3 +1144,233 @@ def test_redirect_rejected_failure_reason_formatting() -> None:
     """Verify public failure reason description for REDIRECT_REJECTED."""
     desc = format_failure_reason(REDIRECT_REJECTED_CODE, None)
     assert desc == "External redirect rejected by user"
+
+
+@pytest.mark.anyio
+async def test_bulk_approve_counter_invariant_violation_aborts_atomically(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify bulk approval aborts with INVALID_STATE_TRANSITION when failed_count < affected_count.
+
+    Ensures zero mutations on URLs, job counters, events, and zero Redis publication.
+    """
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url1_id = uuid.uuid4()
+    url2_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            org = Organization(id=org_id, name="Org", slug=f"org-{org_id.hex[:6]}")
+            user = User(
+                id=user_id,
+                email=f"u-{user_id.hex[:6]}@example.com",
+                normalized_email=f"u-{user_id.hex[:6]}@example.com",
+                password_hash="hash",
+            )
+            # Job only has failed_count=1, but 2 URLs are requested for approval
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.COMPLETED_WITH_ERRORS.value,
+                total_input_count=2,
+                valid_input_count=2,
+                completed_count=0,
+                failed_count=1,
+                queued_count=0,
+            )
+            u1 = ScanURL(
+                id=url1_id,
+                scan_job_id=job_id,
+                original_input="https://u1.com",
+                original_index=0,
+                status=ScanURLStatus.FAILED.value,
+                last_error_code="OUT_OF_SCOPE_REDIRECT",
+                redirect_target_domain="dest1.com",
+            )
+            u2 = ScanURL(
+                id=url2_id,
+                scan_job_id=job_id,
+                original_input="https://u2.com",
+                original_index=1,
+                status=ScanURLStatus.FAILED.value,
+                last_error_code="OUT_OF_SCOPE_REDIRECT",
+                redirect_target_domain="dest2.com",
+            )
+            session.add_all([org, user, job, u1, u2])
+
+    # 1. Service layer invariant failure check
+    async with session_factory() as session:
+        service = ScanJobService(session)
+        cmd = BulkRedirectCommand(url_ids=[url1_id, url2_id])
+        with pytest.raises(ServiceError) as exc_info:
+            await service.bulk_approve_url_redirects(org_id, job_id, cmd)
+        assert exc_info.value.code == ServiceErrorCode.INVALID_STATE_TRANSITION
+        # Public message must not leak internal counter numbers
+        assert "counter" not in exc_info.value.message.lower()
+        assert "does not permit redirect approval" in exc_info.value.message
+
+    # Verify zero database mutations
+    async with session_factory() as session:
+        j_check = (await session.execute(select(ScanJob).where(ScanJob.id == job_id))).scalar_one()
+        assert j_check.failed_count == 1
+        assert j_check.queued_count == 0
+        assert j_check.status == ScanJobStatus.COMPLETED_WITH_ERRORS.value
+
+        u1_check = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url1_id))
+        ).scalar_one()
+        assert u1_check.status == ScanURLStatus.FAILED.value
+        assert u1_check.approved_redirect_domain is None
+
+        u2_check = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url2_id))
+        ).scalar_one()
+        assert u2_check.status == ScanURLStatus.FAILED.value
+        assert u2_check.approved_redirect_domain is None
+
+        events = (
+            (await session.execute(select(JobEvent).where(JobEvent.scan_job_id == job_id)))
+            .scalars()
+            .all()
+        )
+        assert len(events) == 0
+
+    # 2. HTTP route layer verification with Redis mock
+    db_manager = MagicMock()
+    db_manager.session_factory = session_factory
+    app.state.db_manager = db_manager
+
+    principal = RequestPrincipal(
+        user_id=user_id, organization_id=org_id, request_id="test-invariant-fail"
+    )
+    mock_publisher = AsyncMock()
+
+    app.dependency_overrides[get_current_principal] = lambda: principal
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
+    app.dependency_overrides[get_redis_publisher] = lambda: mock_publisher
+
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                f"/api/v1/scan-jobs/{job_id}/urls/bulk-approve-redirects",
+                json={"url_ids": [str(url1_id), str(url2_id)]},
+            )
+            assert res.status_code == 409
+            assert res.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
+            # Ensure Redis publish was NOT called
+            mock_publisher.publish_work_available.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+        app.state.db_manager = None
+
+
+@pytest.mark.anyio
+async def test_single_approve_counter_invariant_violation_aborts_atomically(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify single approval aborts with INVALID_STATE_TRANSITION when failed_count is zero.
+
+    Ensures zero mutations on URLs, job counters, events, and zero Redis publication.
+    """
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    url_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            org = Organization(id=org_id, name="Org", slug=f"org-{org_id.hex[:6]}")
+            user = User(
+                id=user_id,
+                email=f"u-{user_id.hex[:6]}@example.com",
+                normalized_email=f"u-{user_id.hex[:6]}@example.com",
+                password_hash="hash",
+            )
+            # Job has failed_count=0 (corrupted or already decremented counter)
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.COMPLETED.value,
+                total_input_count=1,
+                valid_input_count=1,
+                completed_count=1,
+                failed_count=0,
+                queued_count=0,
+            )
+            u = ScanURL(
+                id=url_id,
+                scan_job_id=job_id,
+                original_input="https://u-single-inv.com",
+                original_index=0,
+                status=ScanURLStatus.FAILED.value,
+                last_error_code="OUT_OF_SCOPE_REDIRECT",
+                redirect_target_domain="dest-inv.com",
+            )
+            session.add_all([org, user, job, u])
+
+    # 1. Service layer check
+    async with session_factory() as session:
+        service = ScanJobService(session)
+        with pytest.raises(ServiceError) as exc_info:
+            await service.approve_url_redirect(org_id, job_id, url_id)
+        assert exc_info.value.code == ServiceErrorCode.INVALID_STATE_TRANSITION
+        assert "counter" not in exc_info.value.message.lower()
+        assert "does not permit redirect approval" in exc_info.value.message
+
+    # Verify zero mutations
+    async with session_factory() as session:
+        j_check = (await session.execute(select(ScanJob).where(ScanJob.id == job_id))).scalar_one()
+        assert j_check.failed_count == 0
+        assert j_check.queued_count == 0
+        assert j_check.status == ScanJobStatus.COMPLETED.value
+
+        u_check = (await session.execute(select(ScanURL).where(ScanURL.id == url_id))).scalar_one()
+        assert u_check.status == ScanURLStatus.FAILED.value
+        assert u_check.approved_redirect_domain is None
+
+        events = (
+            (await session.execute(select(JobEvent).where(JobEvent.scan_job_id == job_id)))
+            .scalars()
+            .all()
+        )
+        assert len(events) == 0
+
+    # 2. HTTP route layer check with Redis mock
+    db_manager = MagicMock()
+    db_manager.session_factory = session_factory
+    app.state.db_manager = db_manager
+
+    principal = RequestPrincipal(
+        user_id=user_id, organization_id=org_id, request_id="test-single-inv-fail"
+    )
+    mock_publisher = AsyncMock()
+
+    app.dependency_overrides[get_current_principal] = lambda: principal
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
+    app.dependency_overrides[get_redis_publisher] = lambda: mock_publisher
+
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            res = await client.post(
+                f"/api/v1/scan-jobs/{job_id}/urls/{url_id}/approve-redirect",
+            )
+            assert res.status_code == 409
+            assert res.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
+            mock_publisher.publish_work_available.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+        app.state.db_manager = None

@@ -154,6 +154,8 @@ def map_outcome_to_url_status(
     if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
         if failure_code == "TLS_VERIFICATION_FAILED":
             return ScanURLStatus.FAILED, "TLS_VERIFICATION_FAILED"
+        if failure_code == "DNS_NAME_NOT_FOUND":
+            return ScanURLStatus.FAILED, "DNS_NAME_NOT_FOUND"
         if failure_code in (
             "ROBOTS_TEMPORARY_FAILURE",
             "ROBOTS_FETCH_ERROR",

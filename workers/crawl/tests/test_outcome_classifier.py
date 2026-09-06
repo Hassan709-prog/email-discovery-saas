@@ -854,3 +854,89 @@ def test_final_http_503_with_hop_attempt_two_is_terminal() -> None:
         classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
         == WorkerExecutionOutcome.TERMINAL_FAILURE
     )
+
+
+def test_classify_permanent_dns_failure_direct_fetch() -> None:
+    """Direct page fetch permanent DNS failure produces DNS_NAME_NOT_FOUND and is terminal."""
+    page = _make_dummy_page_with_fetch(FetchOutcomeCode.DNS_NAME_NOT_FOUND)
+    diag = SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND")
+    result = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag,
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "DNS_NAME_NOT_FOUND"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_classify_permanent_dns_failure_under_robots_temporary_failure() -> None:
+    """ROBOTS_TEMPORARY_FAILURE with DNS_NAME_NOT_FOUND produces terminal DNS_NAME_NOT_FOUND."""
+    robots_temp_fail = RobotsDecision(
+        target_url="https://nonexistent.example",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch error: Host nonexistent.example does not exist",
+    )
+    page_temp = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp_fail,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    diag = SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND")
+    result = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=make_dummy_stats(0),
+        page_records=(page_temp,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag,
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "DNS_NAME_NOT_FOUND"
+    assert retryable is False
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )
+
+
+def test_classify_transient_dns_failure_remains_retryable() -> None:
+    """Transient DNS failure DNS_RESOLUTION_FAILED remains retryable."""
+    page = _make_dummy_page_with_fetch(FetchOutcomeCode.DNS_RESOLUTION_FAILED)
+    diag = SiteScanDiagnostics(failure_code="DNS_RESOLUTION_FAILED")
+    result = SiteScanResult(
+        starting_url="https://transient.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=make_dummy_stats(0),
+        page_records=(page,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag,
+    )
+    err_code, retryable = classify_error_code_and_retryability(result)
+    assert err_code == "DNS_RESOLUTION_FAILED"
+    assert retryable is True
+    assert (
+        classify_worker_outcome(result, None, attempt_count=1, max_attempts=3)
+        == WorkerExecutionOutcome.RETRYABLE_FAILURE
+    )
+    assert (
+        classify_worker_outcome(result, None, attempt_count=3, max_attempts=3)
+        == WorkerExecutionOutcome.TERMINAL_FAILURE
+    )

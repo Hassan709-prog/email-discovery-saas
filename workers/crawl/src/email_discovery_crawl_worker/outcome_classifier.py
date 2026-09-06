@@ -47,6 +47,8 @@ def classify_error_code_and_retryability(
             diagnostics = site_scan_result.diagnostics
             if diagnostics is not None and diagnostics.failure_code == "TLS_VERIFICATION_FAILED":
                 return "TLS_VERIFICATION_FAILED", False
+            if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+                return "DNS_NAME_NOT_FOUND", False
             if diagnostics is not None and (
                 diagnostics.retry_count > 0 or diagnostics.retry_budget_exhausted
             ):
@@ -67,6 +69,8 @@ def classify_error_code_and_retryability(
                 return "TIMEOUT", not was_retried
             if fetch_code == FetchOutcomeCode.TRANSPORT_ERROR:
                 return "TRANSPORT_ERROR", not was_retried
+            if fetch_code == FetchOutcomeCode.DNS_NAME_NOT_FOUND:
+                return "DNS_NAME_NOT_FOUND", False
             if fetch_code == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
                 return "DNS_RESOLUTION_FAILED", True
             if fetch_code == FetchOutcomeCode.UNSAFE_HOST:
@@ -90,6 +94,10 @@ def classify_error_code_and_retryability(
                 if status_code is not None:
                     return f"HTTP_{status_code}", False
                 return "HTTP_ERROR", False
+
+    diagnostics = site_scan_result.diagnostics
+    if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+        return "DNS_NAME_NOT_FOUND", False
 
     if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
         return "ROBOTS_BLOCKED", False

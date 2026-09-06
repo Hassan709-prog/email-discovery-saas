@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from email_discovery_api.mappers.crawl_results import (
+    _evaluate_retryability,  # pyright: ignore[reportPrivateUsage]
     map_site_scan_result,
     mask_email_candidate,
     sanitize_text,
@@ -26,6 +27,7 @@ from email_scanner.models import (
     PageScanRecord,
     RedirectHop,
     RobotsDecision,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -690,3 +692,157 @@ def test_map_site_scan_result_defensive_missing_statistics() -> None:
     assert attempt.started_at == now
     assert attempt.started_at == attempt.completed_at
     assert attempt.elapsed_seconds == 0.0
+
+
+def _make_dummy_stats() -> SiteScanStatistics:
+    return SiteScanStatistics(
+        pages_queued=1,
+        pages_attempted=1,
+        pages_fetched=0,
+        pages_blocked_by_robots=0,
+        pages_failed=1,
+        urls_discovered=0,
+        accepted_email_findings=0,
+        rejected_email_candidates=0,
+        elapsed_seconds=0.1,
+        stop_reason="FAILED",
+    )
+
+
+def _make_dummy_robots(url: str = "https://example.com") -> RobotsDecision:
+    return RobotsDecision(
+        target_url=url,
+        decision=RobotsDecisionCode.ALLOWED,
+        crawl_delay=None,
+        reason="Allowed",
+    )
+
+
+def test_evaluate_retryability_permanent_vs_transient_dns() -> None:
+    """Verify permanent DNS is terminal and transient DNS is retryable."""
+    # 1. Direct page fetch permanent DNS failure is non-retryable
+    page_perm = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://nonexistent.example"),
+        fetch_result=FetchResult(
+            final_url="https://nonexistent.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+            error_message="Host nonexistent.example does not exist",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_perm = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_perm,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+    assert _evaluate_retryability(res_perm) is False
+
+    # 2. ROBOTS_TEMPORARY_FAILURE carrying DNS_NAME_NOT_FOUND is non-retryable
+    page_robots = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=RobotsDecision(
+            target_url="https://nonexistent.example",
+            decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+            crawl_delay=None,
+            reason="robots.txt fetch error: Host nonexistent.example does not exist",
+        ),
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_robots = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_robots,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+    assert _evaluate_retryability(res_robots) is False
+
+    # 3. Direct page fetch transient DNS failure is retryable
+    page_trans = PageScanRecord(
+        requested_url="https://transient.example",
+        final_url="https://transient.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://transient.example"),
+        fetch_result=FetchResult(
+            final_url="https://transient.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_RESOLUTION_FAILED,
+            error_message="Temporary failure in name resolution",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_trans = SiteScanResult(
+        starting_url="https://transient.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_trans,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_RESOLUTION_FAILED"),
+    )
+    assert _evaluate_retryability(res_trans) is True
+
+
+def test_map_site_scan_result_permanent_dns_is_not_retryable() -> None:
+    """Verify map_site_scan_result sets retryable=False for permanent DNS."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    page_perm = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://nonexistent.example"),
+        fetch_result=FetchResult(
+            final_url="https://nonexistent.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+            error_message="Host nonexistent.example does not exist",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_perm,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.retryable is False
+    assert attempt.failure_code == "DNS_NAME_NOT_FOUND"

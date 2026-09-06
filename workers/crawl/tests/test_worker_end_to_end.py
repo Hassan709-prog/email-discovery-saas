@@ -11,11 +11,12 @@ from sqlalchemy.sql import select
 from email_discovery_api.models import CrawlAttempt, EmailFinding, ScanJob, ScanURL
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_crawl_worker.worker import CrawlWorker
-from email_scanner.errors import PageScanOutcome, SiteScanOutcome
+from email_scanner.errors import FetchOutcomeCode, PageScanOutcome, SiteScanOutcome
 from email_scanner.models import (
     DomainAffinity,
     EmailCategory,
     EmailSourceKind,
+    FetchResult,
     PageScanRecord,
     RobotsDecision,
     RobotsDecisionCode,
@@ -320,6 +321,188 @@ async def test_crawl_worker_explicit_robots_disallowed_routes_to_fenced_persiste
         assert url.last_error_code == "ROBOTS_BLOCKED"
         assert url.attempt_count == 1
         assert url.lease_owner is None
+
+        job_res = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
+        job = job_res.scalar_one()
+        assert job.status == ScanJobStatus.FAILED.value
+
+
+async def test_crawl_worker_permanent_dns_failure_under_robots_terminal(
+    seeded_queued_job: dict[str, Any],
+) -> None:
+    """Verify permanent DNS error on robots fetch terminates URL on attempt 1 without retry."""
+    session_factory = seeded_queued_job["session_factory"]
+    job_id = seeded_queued_job["job_id"]
+    url_id1 = seeded_queued_job["url_id1"]
+
+    robots_temp_fail = RobotsDecision(
+        target_url="https://e2e-test.com/admin",
+        decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+        crawl_delay=None,
+        reason="robots.txt fetch error: Host e2e-test.com does not exist",
+    )
+    page_record = PageScanRecord(
+        requested_url="https://e2e-test.com/admin",
+        final_url=None,
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=robots_temp_fail,
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+        error_message="Host e2e-test.com does not exist",
+    )
+    mock_scan_result = SiteScanResult(
+        starting_url="https://e2e-test.com/admin",
+        outcome=SiteScanOutcome.ROBOTS_BLOCKED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=1,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.15,
+            stop_reason="ROBOTS_BLOCKED",
+        ),
+        page_records=(page_record,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(
+            total_duration_seconds=0.15,
+            failure_code="DNS_NAME_NOT_FOUND",
+        ),
+    )
+
+    mock_orchestrator = AsyncMock()
+    mock_orchestrator.scan = AsyncMock(return_value=mock_scan_result)
+
+    worker = CrawlWorker(
+        session_factory=session_factory,
+        worker_id="e2e-worker-robots-dns",
+        poll_interval_seconds=0.05,
+        heartbeat_interval_seconds=10.0,
+        max_scans=1,
+        orchestrator_factory=lambda: mock_orchestrator,
+    )
+
+    await worker.start()
+
+    # DB Assertions: ScanURL should be FAILED (terminal), 1 attempt, DNS_NAME_NOT_FOUND
+    async with session_factory() as session:
+        url_res = await session.execute(select(ScanURL).where(ScanURL.id == url_id1))
+        url = url_res.scalar_one()
+        assert url.status == ScanURLStatus.FAILED.value
+        assert url.last_error_code == "DNS_NAME_NOT_FOUND"
+        assert url.last_failure_code == "DNS_NAME_NOT_FOUND"
+        assert url.attempt_count == 1
+        assert url.lease_owner is None
+        assert url.next_retry_at is None
+
+        attempt_res = await session.execute(
+            select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id1)
+        )
+        attempt = attempt_res.scalar_one()
+        assert attempt.failure_code == "DNS_NAME_NOT_FOUND"
+        assert attempt.retryable is False
+
+        job_res = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
+        job = job_res.scalar_one()
+        assert job.status == ScanJobStatus.FAILED.value
+
+
+async def test_crawl_worker_permanent_dns_failure_direct_fetch_terminal(
+    seeded_queued_job: dict[str, Any],
+) -> None:
+    """Verify permanent DNS error on homepage fetch terminates URL on attempt 1 without retry."""
+    session_factory = seeded_queued_job["session_factory"]
+    job_id = seeded_queued_job["job_id"]
+    url_id1 = seeded_queued_job["url_id1"]
+
+    fetch_fail = FetchResult(
+        final_url="https://e2e-test.com/admin",
+        status_code=None,
+        content_type=None,
+        body_text=None,
+        redirect_history=(),
+        outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+        error_message="Host e2e-test.com does not exist",
+    )
+    page_record = PageScanRecord(
+        requested_url="https://e2e-test.com/admin",
+        final_url=None,
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=RobotsDecision(
+            target_url="https://e2e-test.com/admin",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="Allowed",
+        ),
+        fetch_result=fetch_fail,
+        emails_found_count=0,
+        links_discovered_count=0,
+        error_message="Host e2e-test.com does not exist",
+    )
+    mock_scan_result = SiteScanResult(
+        starting_url="https://e2e-test.com/admin",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.15,
+            stop_reason="FETCH_FAILED",
+        ),
+        page_records=(page_record,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(
+            total_duration_seconds=0.15,
+            failure_code="DNS_NAME_NOT_FOUND",
+        ),
+    )
+
+    mock_orchestrator = AsyncMock()
+    mock_orchestrator.scan = AsyncMock(return_value=mock_scan_result)
+
+    worker = CrawlWorker(
+        session_factory=session_factory,
+        worker_id="e2e-worker-direct-dns",
+        poll_interval_seconds=0.05,
+        heartbeat_interval_seconds=10.0,
+        max_scans=1,
+        orchestrator_factory=lambda: mock_orchestrator,
+    )
+
+    await worker.start()
+
+    # DB Assertions: ScanURL should be FAILED (terminal), 1 attempt, DNS_NAME_NOT_FOUND
+    async with session_factory() as session:
+        url_res = await session.execute(select(ScanURL).where(ScanURL.id == url_id1))
+        url = url_res.scalar_one()
+        assert url.status == ScanURLStatus.FAILED.value
+        assert url.last_error_code == "DNS_NAME_NOT_FOUND"
+        assert url.last_failure_code == "DNS_NAME_NOT_FOUND"
+        assert url.attempt_count == 1
+        assert url.lease_owner is None
+        assert url.next_retry_at is None
+
+        attempt_res = await session.execute(
+            select(CrawlAttempt).where(CrawlAttempt.scan_url_id == url_id1)
+        )
+        attempt = attempt_res.scalar_one()
+        assert attempt.failure_code == "DNS_NAME_NOT_FOUND"
+        assert attempt.retryable is False
 
         job_res = await session.execute(select(ScanJob).where(ScanJob.id == job_id))
         job = job_res.scalar_one()

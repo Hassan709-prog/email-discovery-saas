@@ -46,6 +46,12 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
         ):
             return False
         if page.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+            diagnostics = getattr(site_scan_result, "diagnostics", None)
+            if diagnostics is not None and diagnostics.failure_code in (
+                "DNS_NAME_NOT_FOUND",
+                "TLS_VERIFICATION_FAILED",
+            ):
+                return False
             return True
         if page.fetch_result:
             fetch_code = page.fetch_result.outcome
@@ -56,6 +62,7 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
             ):
                 return True
             if fetch_code in (
+                FetchOutcomeCode.DNS_NAME_NOT_FOUND,
                 FetchOutcomeCode.UNSAFE_HOST,
                 FetchOutcomeCode.INVALID_URL,
                 FetchOutcomeCode.TLS_VERIFICATION_FAILED,
@@ -67,6 +74,9 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
                 return False
             if fetch_code == FetchOutcomeCode.HTTP_ERROR:
                 return page.fetch_result.status_code in _RETRYABLE_HTTP_STATUSES
+    diagnostics = getattr(site_scan_result, "diagnostics", None)
+    if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+        return False
     return True
 
 

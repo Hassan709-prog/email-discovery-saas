@@ -499,3 +499,11 @@ def test_openapi_schema_contains_routes_and_models(client: Any) -> None:
     assert "/api/v1/scan-jobs/{job_id}/events" in paths
     assert "/api/v1/scan-jobs/{job_id}/queue" in paths
     assert "/api/v1/scan-jobs/{job_id}/cancel" in paths
+
+
+def test_format_failure_reason_dns_name_not_found() -> None:
+    """Verify format_failure_reason maps DNS_NAME_NOT_FOUND to user-friendly description."""
+    from email_discovery_api.schemas.api_scan_jobs import format_failure_reason
+
+    desc = format_failure_reason("DNS_NAME_NOT_FOUND", None)
+    assert desc == "Domain name does not exist or has no DNS records"

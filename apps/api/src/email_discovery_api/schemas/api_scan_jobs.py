@@ -219,6 +219,7 @@ _FAILURE_REASON_DESCRIPTIONS: dict[str, str] = {
     "DIRECTORY_INDEX_ONLY": "No meaningful website content found across safe origin variants",
     "TRANSPORT_ERROR": "Network or TLS connection failed",
     "DNS_RESOLUTION_FAILED": "Network or TLS connection failed",
+    "DNS_NAME_NOT_FOUND": "Domain name does not exist or has no DNS records",
     "TLS_VERIFICATION_FAILED": "Network or TLS connection failed",
     "CONNECT_TIMEOUT": "Network or TLS connection failed",
     "READ_TIMEOUT": "Network or TLS connection failed",

@@ -124,6 +124,15 @@ def test_map_outcome_robots_blocked_tls_failure() -> None:
     assert err_code == "TLS_VERIFICATION_FAILED"
 
 
+def test_map_outcome_robots_blocked_permanent_dns() -> None:
+    """Verify SiteScanOutcome.ROBOTS_BLOCKED with DNS_NAME_NOT_FOUND maps to DNS_NAME_NOT_FOUND."""
+    status, err_code = map_outcome_to_url_status(
+        SiteScanOutcome.ROBOTS_BLOCKED, 0, "DNS_NAME_NOT_FOUND"
+    )
+    assert status == ScanURLStatus.FAILED
+    assert err_code == "DNS_NAME_NOT_FOUND"
+
+
 def test_map_outcome_robots_blocked_explicit_disallow() -> None:
     """Verify SiteScanOutcome.ROBOTS_BLOCKED with ROBOTS_BLOCKED or None maps to ROBOTS_BLOCKED."""
     status, err_code = map_outcome_to_url_status(
@@ -168,6 +177,7 @@ async def test_persist_fenced_result_robots_blocked_classifications(
     url_id_tls = uuid.uuid4()
     url_id_disallow = uuid.uuid4()
     url_id_timeout = uuid.uuid4()
+    url_id_dns = uuid.uuid4()
 
     async with session_factory() as session:
         async with session.begin():
@@ -176,10 +186,10 @@ async def test_persist_fenced_result_robots_blocked_classifications(
                 organization_id=org_id,
                 created_by_user_id=user_id,
                 status=ScanJobStatus.RUNNING.value,
-                total_input_count=3,
-                valid_input_count=3,
+                total_input_count=4,
+                valid_input_count=4,
                 queued_count=0,
-                running_count=3,
+                running_count=4,
                 completed_count=0,
                 failed_count=0,
             )
@@ -225,7 +235,21 @@ async def test_persist_fenced_result_robots_blocked_classifications(
                 max_attempts=3,
                 lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
             )
-            session.add_all([job, url_tls, url_disallow, url_timeout])
+            url_dns = ScanURL(
+                id=url_id_dns,
+                scan_job_id=job_id,
+                original_index=3,
+                original_input="https://dns-fail.com",
+                normalized_url="https://dns-fail.com/",
+                normalized_domain="dns-fail.com",
+                status=ScanURLStatus.SCANNING.value,
+                lease_owner="w1",
+                fence_token=1,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            session.add_all([job, url_tls, url_disallow, url_timeout, url_dns])
 
     def make_robots_scan_result(
         start_url: str,
@@ -350,11 +374,33 @@ async def test_persist_fenced_result_robots_blocked_classifications(
         RobotsDecisionCode.TEMPORARY_FAILURE,
     )
 
+    # 4. Permanent DNS error
+    claim_dns = URLClaim(
+        scan_url_id=url_id_dns,
+        organization_id=org_id,
+        job_id=job_id,
+        original_input="https://dns-fail.com",
+        normalized_url="https://dns-fail.com/",
+        normalized_domain="dns-fail.com",
+        lease_owner="w1",
+        fence_token=1,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    res_dns = make_robots_scan_result(
+        "https://dns-fail.com/",
+        "DNS_NAME_NOT_FOUND",
+        PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        RobotsDecisionCode.TEMPORARY_FAILURE,
+    )
+
     async with session_factory() as session:
         persistence = ResultPersistenceService(session)
         await persistence.persist_fenced_result(claim_tls, res_tls)
         await persistence.persist_fenced_result(claim_disallow, res_disallow)
         await persistence.persist_fenced_result(claim_timeout, res_timeout)
+        await persistence.persist_fenced_result(claim_dns, res_dns)
 
     async with session_factory() as session:
         u_tls = (
@@ -365,6 +411,9 @@ async def test_persist_fenced_result_robots_blocked_classifications(
         ).scalar_one()
         u_timeout = (
             await session.execute(select(ScanURL).where(ScanURL.id == url_id_timeout))
+        ).scalar_one()
+        u_dns = (
+            await session.execute(select(ScanURL).where(ScanURL.id == url_id_dns))
         ).scalar_one()
 
         # Terminal TLS failure produces TLS_VERIFICATION_FAILED for both codes
@@ -381,6 +430,11 @@ async def test_persist_fenced_result_robots_blocked_classifications(
         assert u_timeout.status == ScanURLStatus.FAILED.value
         assert u_timeout.last_error_code == "ROBOTS_FETCH_ERROR"
         assert u_timeout.last_failure_code == "GENERIC_TIMEOUT"
+
+        # Permanent DNS failure produces DNS_NAME_NOT_FOUND for both codes
+        assert u_dns.status == ScanURLStatus.FAILED.value
+        assert u_dns.last_error_code == "DNS_NAME_NOT_FOUND"
+        assert u_dns.last_failure_code == "DNS_NAME_NOT_FOUND"
 
 
 @pytest.mark.anyio

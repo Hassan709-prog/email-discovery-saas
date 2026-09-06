@@ -8,7 +8,15 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from email_discovery_api.models.enums import ScanJobSourceType, ScanJobStatus
+from email_discovery_api.models.enums import (
+    ScanJobSourceType,
+    ScanJobStatus,
+    ScanURLStatus,
+)
+from email_discovery_api.schemas.api_scan_jobs import (
+    BulkRedirectAction,
+    BulkRedirectDisposition,
+)
 
 
 class CreateScanJobCommand(BaseModel):
@@ -115,3 +123,35 @@ class ScanJobProgress(BaseModel):
             started_at=started_at,
             completed_at=completed_at,
         )
+
+
+class BulkRedirectCommand(BaseModel):
+    """Command model for bulk redirect review operations."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url_ids: list[UUID] = Field(..., min_length=1, max_length=250)
+
+
+class BulkRedirectItem(BaseModel):
+    """Result item for a single URL target in bulk redirect review."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url_id: UUID
+    status: ScanURLStatus
+    disposition: BulkRedirectDisposition
+
+
+class BulkRedirectResult(BaseModel):
+    """Outcome payload for bulk redirect review operations."""
+
+    model_config = ConfigDict(frozen=True)
+
+    job_id: UUID
+    action: BulkRedirectAction
+    requested_count: int
+    unique_requested_count: int
+    affected_count: int
+    skipped_count: int
+    results: list[BulkRedirectItem]

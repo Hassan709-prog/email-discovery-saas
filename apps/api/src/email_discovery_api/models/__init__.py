@@ -26,6 +26,15 @@ from email_discovery_api.models.job_event import JobEvent
 from email_discovery_api.models.membership import Membership
 from email_discovery_api.models.mixins import TimestampMixin, UUIDPrimaryKeyMixin
 from email_discovery_api.models.organization import Organization
+from email_discovery_api.models.redirect_review import (
+    GENERIC_REDIRECT_REJECTED_MESSAGE,
+    REDIRECT_APPROVAL_FAILURE_CODES,
+    REDIRECT_REJECTED_CODE,
+    apply_url_redirect_approval,
+    apply_url_redirect_rejection,
+    get_requires_redirect_approval_sql_clause,
+    is_url_requiring_redirect_approval,
+)
 from email_discovery_api.models.refresh_session import RefreshSession
 from email_discovery_api.models.rejected_email_candidate import RejectedEmailCandidate
 from email_discovery_api.models.scan_job import ScanJob
@@ -44,12 +53,15 @@ __all__ = [
     "EmailFinding",
     "EmailSourceType",
     "EmailValidationStatus",
+    "GENERIC_REDIRECT_REJECTED_MESSAGE",
     "JobEvent",
     "Membership",
     "MembershipRole",
     "MembershipStatus",
     "Organization",
     "OrganizationStatus",
+    "REDIRECT_APPROVAL_FAILURE_CODES",
+    "REDIRECT_REJECTED_CODE",
     "RefreshSession",
     "RefreshSessionStatus",
     "RejectedEmailCandidate",
@@ -62,6 +74,10 @@ __all__ = [
     "UUIDPrimaryKeyMixin",
     "User",
     "UserStatus",
+    "apply_url_redirect_approval",
+    "apply_url_redirect_rejection",
+    "get_requires_redirect_approval_sql_clause",
+    "is_url_requiring_redirect_approval",
     "normalize_email",
     "normalize_org_slug",
 ]

@@ -23,6 +23,9 @@ from email_discovery_api.api.dependencies.services import (
 )
 from email_discovery_api.models.enums import ScanJobStatus, ScanURLStatus
 from email_discovery_api.schemas.api_scan_jobs import (
+    BulkRedirectApiRequest,
+    BulkRedirectApiResponse,
+    BulkRedirectItemResult,
     CreateScanJobApiRequest,
     JobEventApiResponse,
     PaginatedResponse,
@@ -33,7 +36,10 @@ from email_discovery_api.schemas.api_scan_jobs import (
     ScanJobProgressApiResponse,
     ScanURLApiResponse,
 )
-from email_discovery_api.schemas.scan_jobs import CreateScanJobCommand
+from email_discovery_api.schemas.scan_jobs import (
+    BulkRedirectCommand,
+    CreateScanJobCommand,
+)
 from email_discovery_api.services.policies import ScanCreationPolicy
 from email_discovery_api.services.scan_jobs import ScanJobService, preview_scan_inputs
 
@@ -218,6 +224,9 @@ async def list_scan_job_urls(
     limit: int = Query(100, ge=1, le=100, description="Page size limit"),
     cursor: str | None = Query(None, description="Opaque pagination cursor"),
     status_filter: ScanURLStatus | None = Query(None, alias="status", description="Status filter"),
+    requires_redirect_approval: bool | None = Query(
+        None, description="Filter for URLs requiring redirect approval"
+    ),
     principal: RequestPrincipal = Depends(get_current_principal),
     service: ScanJobService = Depends(get_scan_job_service),
 ) -> PaginatedResponse[ScanURLApiResponse]:
@@ -232,6 +241,7 @@ async def list_scan_job_urls(
         cursor_index=idx,
         cursor_id=url_id,
         status=status_str,
+        requires_redirect_approval=requires_redirect_approval,
     )
 
     items = [ScanURLApiResponse.from_orm_model(u) for u in urls]
@@ -343,3 +353,88 @@ async def approve_url_redirect(
             )
 
     return ScanURLApiResponse.from_orm_model(url)
+
+
+@router.post(
+    "/{job_id}/urls/bulk-approve-redirects",
+    response_model=BulkRedirectApiResponse,
+    summary="Bulk approve cross-domain redirects and retry ScanURLs",
+)
+async def bulk_approve_url_redirects(
+    job_id: UUID,
+    request: BulkRedirectApiRequest,
+    principal: RequestPrincipal = Depends(get_current_principal),
+    service: ScanJobService = Depends(get_scan_job_service),
+    publisher: Any = Depends(get_redis_publisher),
+) -> BulkRedirectApiResponse:
+    """Bulk approve cross-domain redirects for explicit URLs within a job."""
+    res = await service.bulk_approve_url_redirects(
+        organization_id=principal.organization_id,
+        job_id=job_id,
+        command=BulkRedirectCommand(url_ids=request.url_ids),
+    )
+
+    if res.affected_count > 0 and publisher is not None:
+        try:
+            await asyncio.wait_for(
+                publisher.publish_work_available(),
+                timeout=0.25,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Redis wake-up publish failed [code=REDIS_PUBLISH_FAILED, error_type=%s]",
+                type(exc).__name__,
+            )
+
+    return BulkRedirectApiResponse(
+        job_id=res.job_id,
+        action=res.action,
+        requested_count=res.requested_count,
+        unique_requested_count=res.unique_requested_count,
+        affected_count=res.affected_count,
+        skipped_count=res.skipped_count,
+        results=[
+            BulkRedirectItemResult(
+                url_id=item.url_id,
+                status=item.status,
+                disposition=item.disposition,
+            )
+            for item in res.results
+        ],
+    )
+
+
+@router.post(
+    "/{job_id}/urls/bulk-reject-redirects",
+    response_model=BulkRedirectApiResponse,
+    summary="Bulk reject cross-domain redirects for ScanURLs",
+)
+async def bulk_reject_url_redirects(
+    job_id: UUID,
+    request: BulkRedirectApiRequest,
+    principal: RequestPrincipal = Depends(get_current_principal),
+    service: ScanJobService = Depends(get_scan_job_service),
+) -> BulkRedirectApiResponse:
+    """Bulk reject cross-domain redirects for explicit URLs within a job."""
+    res = await service.bulk_reject_url_redirects(
+        organization_id=principal.organization_id,
+        job_id=job_id,
+        command=BulkRedirectCommand(url_ids=request.url_ids),
+    )
+
+    return BulkRedirectApiResponse(
+        job_id=res.job_id,
+        action=res.action,
+        requested_count=res.requested_count,
+        unique_requested_count=res.unique_requested_count,
+        affected_count=res.affected_count,
+        skipped_count=res.skipped_count,
+        results=[
+            BulkRedirectItemResult(
+                url_id=item.url_id,
+                status=item.status,
+                disposition=item.disposition,
+            )
+            for item in res.results
+        ],
+    )

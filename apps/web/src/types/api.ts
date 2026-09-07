@@ -179,14 +179,16 @@ export interface ScanURLApiResponse {
   diagnostics?: ScanURLDiagnosticsApiResponse | null;
 }
 
-export type BulkRedirectDisposition = 'APPROVED' | 'REJECTED' | 'ALREADY_APPLIED' | 'SKIPPED';
+export type BulkRedirectDisposition = 'MUTATED' | 'ALREADY_APPLIED' | 'APPROVED' | 'REJECTED' | 'SKIPPED';
 export type BulkRedirectAction = 'APPROVE' | 'REJECT';
 
 export interface BulkRedirectItemResult {
-  scan_url_id: string;
+  url_id: string;
+  scan_url_id?: string;
+  status?: ScanURLStatus | string;
   disposition: BulkRedirectDisposition;
-  target_domain: string | null;
-  message: string | null;
+  target_domain?: string | null;
+  message?: string | null;
 }
 
 export interface BulkRedirectApiResponse {
@@ -195,11 +197,12 @@ export interface BulkRedirectApiResponse {
   requested_count: number;
   unique_requested_count: number;
   affected_count: number;
+  skipped_count: number;
   results: BulkRedirectItemResult[];
 }
 
 export interface BulkRedirectApiRequest {
-  scan_url_ids: string[];
+  url_ids: string[];
 }
 
 export interface RepresentativeEvidenceApiResponse {
@@ -262,6 +265,7 @@ export interface JobEventApiResponse {
 export interface PaginatedResponse<T> {
   items: T[];
   next_cursor: string | null;
+  total_count?: number | null;
 }
 
 export interface PreviewScanInputsApiRequest {

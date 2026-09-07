@@ -11,6 +11,8 @@ import {
   logoutUser,
   logoutAllUser,
   setOnSessionExpired,
+  bulkApproveUrlRedirects,
+  bulkRejectUrlRedirects,
 } from '@/lib/api-client';
 import { ApiError } from '@/types/api';
 
@@ -346,5 +348,45 @@ describe('api-client.ts', () => {
     mockFetch.mockResolvedValueOnce(new Response(null, { status: 204 }));
     await logoutAllUser();
     expect(getAccessToken()).toBeNull();
+  });
+
+  it('serializes url_ids in bulkApproveUrlRedirects and bulkRejectUrlRedirects contract', async () => {
+    setAccessToken('jwt-123');
+    const mockFetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            job_id: 'job-1',
+            action: 'APPROVE',
+            requested_count: 2,
+            unique_requested_count: 2,
+            affected_count: 2,
+            skipped_count: 0,
+            results: [
+              { url_id: 'u-1', disposition: 'APPROVED' },
+              { url_id: 'u-2', disposition: 'APPROVED' },
+            ],
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    vi.stubGlobal('fetch', mockFetch);
+
+    await bulkApproveUrlRedirects('job-1', { url_ids: ['u-1', 'u-2'] });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const [approveUrl, approveOptions] = mockFetch.mock.calls[0];
+    expect(approveUrl).toBe('/api/v1/scan-jobs/job-1/urls/bulk-approve-redirects');
+    const approveBody = JSON.parse(approveOptions.body);
+    expect(approveBody).toEqual({ url_ids: ['u-1', 'u-2'] });
+    expect(approveBody).not.toHaveProperty('scan_url_ids');
+
+    await bulkRejectUrlRedirects('job-1', { url_ids: ['u-3'] });
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const [rejectUrl, rejectOptions] = mockFetch.mock.calls[1];
+    expect(rejectUrl).toBe('/api/v1/scan-jobs/job-1/urls/bulk-reject-redirects');
+    const rejectBody = JSON.parse(rejectOptions.body);
+    expect(rejectBody).toEqual({ url_ids: ['u-3'] });
+    expect(rejectBody).not.toHaveProperty('scan_url_ids');
   });
 });

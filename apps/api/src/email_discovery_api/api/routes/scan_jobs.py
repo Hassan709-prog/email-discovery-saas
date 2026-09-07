@@ -121,6 +121,7 @@ async def create_scan_job(
         created_by_user_id=principal.user_id,
         inputs=request.inputs,
         overrides=request.overrides,
+        approved_redirect_domains=request.approved_redirect_domains,
         name=request.name,
         source_type=request.source_type,
         configuration_snapshot=request.configuration_snapshot,
@@ -234,7 +235,7 @@ async def list_scan_job_urls(
     idx, url_id = parse_url_cursor(cursor)
     status_str = status_filter.value if status_filter else None
 
-    urls, next_cursor = await service.list_job_urls(
+    urls, next_cursor, total_count = await service.list_job_urls(
         principal.organization_id,
         job_id,
         limit=limit,
@@ -245,7 +246,9 @@ async def list_scan_job_urls(
     )
 
     items = [ScanURLApiResponse.from_orm_model(u) for u in urls]
-    return PaginatedResponse[ScanURLApiResponse](items=items, next_cursor=next_cursor)
+    return PaginatedResponse[ScanURLApiResponse](
+        items=items, next_cursor=next_cursor, total_count=total_count
+    )
 
 
 @router.get(

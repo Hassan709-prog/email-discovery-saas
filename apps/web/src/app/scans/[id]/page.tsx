@@ -65,9 +65,13 @@ export default function JobDetailPage() {
   const [isBulkOperating, setIsBulkOperating] = useState(false);
   const [bulkActionModal, setBulkActionModal] = useState<{
     action: 'APPROVE' | 'REJECT';
-    count: number;
+    targetIds: string[];
   } | null>(null);
   const [rejectingUrlId, setRejectingUrlId] = useState<string | null>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  const triggerElementRef = useRef<HTMLElement | null>(null);
+  const [urlsTotalCount, setUrlsTotalCount] = useState<number | null>(null);
 
   // Results & Findings state
   const [results, setResults] = useState<ScanJobResultItemApiResponse[]>([]);
@@ -102,10 +106,56 @@ export default function JobDetailPage() {
   const [actionLoading, setActionLoading] = useState(false);
   const [approvingUrlId, setApprovingUrlId] = useState<string | null>(null);
 
+  // Dialog keyboard focus management (initial focus and restoration)
+  useEffect(() => {
+    if (bulkActionModal) {
+      if (!triggerElementRef.current && document.activeElement instanceof HTMLElement) {
+        triggerElementRef.current = document.activeElement;
+      }
+      const t = setTimeout(() => {
+        cancelButtonRef.current?.focus();
+      }, 50);
+      return () => clearTimeout(t);
+    } else if (triggerElementRef.current) {
+      const el = triggerElementRef.current;
+      triggerElementRef.current = null;
+      el.focus();
+    }
+  }, [bulkActionModal]);
+
+  const handleModalKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      if (!isBulkOperating) {
+        setBulkActionModal(null);
+      }
+      return;
+    }
+    if (e.key === 'Tab') {
+      const focusable = [cancelButtonRef.current, confirmButtonRef.current].filter(Boolean) as HTMLElement[];
+      if (focusable.length < 2) return;
+      if (e.shiftKey) {
+        if (document.activeElement === focusable[0]) {
+          e.preventDefault();
+          focusable[focusable.length - 1]?.focus();
+        }
+      } else {
+        if (document.activeElement === focusable[focusable.length - 1]) {
+          e.preventDefault();
+          focusable[0]?.focus();
+        }
+      }
+    }
+  };
+
   const handleApproveRedirect = async (urlId: string, targetDomain: string) => {
     try {
       setApprovingUrlId(urlId);
       await approveUrlRedirect(jobId, urlId, targetDomain);
+      setSelectedUrlIds((prev) => {
+        const next = new Set(prev);
+        next.delete(urlId);
+        return next;
+      });
       await fetchJobDetail();
     } catch (err: any) {
       setError(
@@ -124,7 +174,7 @@ export default function JobDetailPage() {
   const handleSingleReject = async (urlId: string) => {
     try {
       setRejectingUrlId(urlId);
-      await bulkRejectUrlRedirects(jobId, { scan_url_ids: [urlId] });
+      await bulkRejectUrlRedirects(jobId, { url_ids: [urlId] });
       setSelectedUrlIds((prev) => {
         const next = new Set(prev);
         next.delete(urlId);
@@ -147,7 +197,7 @@ export default function JobDetailPage() {
 
   const handleConfirmBulkAction = async () => {
     if (!bulkActionModal || !jobId) return;
-    const ids = Array.from(selectedUrlIds).slice(0, 250);
+    const ids = bulkActionModal.targetIds;
     if (ids.length === 0) {
       setBulkActionModal(null);
       return;
@@ -156,15 +206,33 @@ export default function JobDetailPage() {
     setIsBulkOperating(true);
     try {
       if (bulkActionModal.action === 'APPROVE') {
-        await bulkApproveUrlRedirects(jobId, { scan_url_ids: ids });
+        await bulkApproveUrlRedirects(jobId, { url_ids: ids });
       } else {
-        await bulkRejectUrlRedirects(jobId, { scan_url_ids: ids });
+        await bulkRejectUrlRedirects(jobId, { url_ids: ids });
       }
-      setSelectedUrlIds(new Set());
+      setSelectedUrlIds((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) {
+          next.delete(id);
+        }
+        return next;
+      });
       setBulkActionModal(null);
       await fetchJobDetail();
     } catch (err: any) {
-      // Retain selection on failure so user does not lose state
+      // Retain only still-valid selections on failure
+      const validPendingIds = new Set(
+        urls.filter((u) => u.requires_redirect_approval).map((u) => u.id)
+      );
+      setSelectedUrlIds((prev) => {
+        const next = new Set<string>();
+        for (const id of prev) {
+          if (validPendingIds.has(id)) {
+            next.add(id);
+          }
+        }
+        return next;
+      });
       setBulkActionModal(null);
       setError(
         err instanceof ApiError
@@ -198,6 +266,9 @@ export default function JobDetailPage() {
           cursor: cursor || undefined,
           requires_redirect_approval: filter === 'PENDING_APPROVAL' ? true : undefined,
         });
+        if (res.total_count !== undefined && res.total_count !== null) {
+          setUrlsTotalCount(res.total_count);
+        }
         setUrls((prev) => {
           if (!append) return res.items;
           const existingIds = new Set(prev.map((u) => u.id));
@@ -205,6 +276,20 @@ export default function JobDetailPage() {
           return [...prev, ...newItems];
         });
         setUrlsNextCursor(res.next_cursor);
+        // Prune stale selected IDs that no longer require approval among loaded rows
+        if (!append) {
+          const loadedMap = new Map(res.items.map((u) => [u.id, u]));
+          setSelectedUrlIds((prev) => {
+            const next = new Set<string>();
+            for (const id of prev) {
+              const item = loadedMap.get(id);
+              if (!item || item.requires_redirect_approval) {
+                next.add(id);
+              }
+            }
+            return next;
+          });
+        }
       } catch (err) {
         if (err instanceof ApiError) setError(err);
       } finally {
@@ -230,6 +315,21 @@ export default function JobDetailPage() {
       setJob(jobData);
       setUrls(urlsData.items);
       setUrlsNextCursor(urlsData.next_cursor);
+      if (urlsData.total_count !== undefined && urlsData.total_count !== null) {
+        setUrlsTotalCount(urlsData.total_count);
+      }
+      // Prune stale selected IDs that no longer require approval among loaded rows
+      const loadedMap = new Map(urlsData.items.map((u) => [u.id, u]));
+      setSelectedUrlIds((prev) => {
+        const next = new Set<string>();
+        for (const id of prev) {
+          const item = loadedMap.get(id);
+          if (!item || item.requires_redirect_approval) {
+            next.add(id);
+          }
+        }
+        return next;
+      });
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err);
@@ -367,6 +467,8 @@ export default function JobDetailPage() {
 
   const handleUrlsFilterChange = (filter: 'ALL' | 'PENDING_APPROVAL') => {
     setUrlsFilter(filter);
+    setSelectedUrlIds(new Set());
+    setUrlsNextCursor(null);
     fetchUrls(filter, null, false);
   };
 
@@ -991,10 +1093,15 @@ export default function JobDetailPage() {
                   <div className="flex items-center space-x-2">
                     <button
                       type="button"
-                      onClick={() =>
-                        setBulkActionModal({ action: 'APPROVE', count: selectedUrlIds.size })
-                      }
-                      disabled={isBulkOperating}
+                      onClick={(e) => {
+                        triggerElementRef.current = e.currentTarget;
+                        const validSnapshot = urls
+                          .filter((u) => u.requires_redirect_approval && selectedUrlIds.has(u.id))
+                          .map((u) => u.id);
+                        if (validSnapshot.length === 0) return;
+                        setBulkActionModal({ action: 'APPROVE', targetIds: validSnapshot });
+                      }}
+                      disabled={isBulkOperating || bulkActionModal !== null}
                       className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center"
                     >
                       <Check className="w-3.5 h-3.5 mr-1.5" />
@@ -1002,10 +1109,15 @@ export default function JobDetailPage() {
                     </button>
                     <button
                       type="button"
-                      onClick={() =>
-                        setBulkActionModal({ action: 'REJECT', count: selectedUrlIds.size })
-                      }
-                      disabled={isBulkOperating}
+                      onClick={(e) => {
+                        triggerElementRef.current = e.currentTarget;
+                        const validSnapshot = urls
+                          .filter((u) => u.requires_redirect_approval && selectedUrlIds.has(u.id))
+                          .map((u) => u.id);
+                        if (validSnapshot.length === 0) return;
+                        setBulkActionModal({ action: 'REJECT', targetIds: validSnapshot });
+                      }}
+                      disabled={isBulkOperating || bulkActionModal !== null}
                       className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center"
                     >
                       <Ban className="w-3.5 h-3.5 mr-1.5" />
@@ -1014,8 +1126,8 @@ export default function JobDetailPage() {
                     <button
                       type="button"
                       onClick={() => setSelectedUrlIds(new Set())}
-                      disabled={isBulkOperating}
-                      className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-medium text-xs rounded-lg transition-colors"
+                      disabled={isBulkOperating || bulkActionModal !== null}
+                      className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-medium text-xs rounded-lg transition-colors disabled:opacity-50"
                     >
                       Clear Selection
                     </button>
@@ -1026,7 +1138,10 @@ export default function JobDetailPage() {
               {/* Non-technical input count explanation summary card */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs">
                 <p className="font-semibold text-slate-700">
-                  Showing {urls.length} of {job.total_input_count}
+                  Showing {urls.length} of{' '}
+                  {urlsFilter === 'PENDING_APPROVAL'
+                    ? (urlsTotalCount ?? urls.length)
+                    : (urlsTotalCount ?? job.total_input_count)}
                 </p>
                 <div className="flex flex-wrap items-center gap-3 text-slate-600 font-medium">
                   <span>
@@ -1068,7 +1183,7 @@ export default function JobDetailPage() {
                                 }
                               }}
                               checked={isAllLoadedPendingSelected}
-                              disabled={loadedPendingCount === 0 || isBulkOperating}
+                              disabled={loadedPendingCount === 0 || isBulkOperating || bulkActionModal !== null}
                               onChange={() => {
                                 if (isAllLoadedPendingSelected) {
                                   setSelectedUrlIds((prev) => {
@@ -1114,7 +1229,7 @@ export default function JobDetailPage() {
                                 type="checkbox"
                                 aria-label={`Select redirect for ${u.normalized_domain || u.original_input}`}
                                 checked={selectedUrlIds.has(u.id)}
-                                disabled={isBulkOperating}
+                                disabled={isBulkOperating || bulkActionModal !== null}
                                 onChange={() => {
                                   setSelectedUrlIds((prev) => {
                                     const next = new Set(prev);
@@ -1198,6 +1313,7 @@ export default function JobDetailPage() {
                                     disabled={
                                       approvingUrlId === u.id ||
                                       isBulkOperating ||
+                                      bulkActionModal !== null ||
                                       !u.can_approve_redirect
                                     }
                                     className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[11px] rounded shadow-sm disabled:opacity-50 transition-colors"
@@ -1207,7 +1323,7 @@ export default function JobDetailPage() {
                                   <button
                                     type="button"
                                     onClick={() => handleSingleReject(u.id)}
-                                    disabled={rejectingUrlId === u.id || isBulkOperating}
+                                    disabled={rejectingUrlId === u.id || isBulkOperating || bulkActionModal !== null}
                                     className="px-2.5 py-1 bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 font-semibold text-[11px] rounded shadow-sm disabled:opacity-50 transition-colors"
                                   >
                                     {rejectingUrlId === u.id ? 'Rejecting...' : 'Reject'}
@@ -1247,6 +1363,7 @@ export default function JobDetailPage() {
                   role="dialog"
                   aria-modal="true"
                   aria-labelledby="bulk-action-dialog-title"
+                  onKeyDown={handleModalKeyDown}
                 >
                   <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
                     <div className="flex items-center space-x-3">
@@ -1270,7 +1387,7 @@ export default function JobDetailPage() {
                             : 'Reject Selected Redirects'}
                         </h4>
                         <p className="text-xs text-slate-500">
-                          {bulkActionModal.count} redirect{bulkActionModal.count === 1 ? '' : 's'} selected
+                          {bulkActionModal.targetIds.length} redirect{bulkActionModal.targetIds.length === 1 ? '' : 's'} selected
                         </p>
                       </div>
                     </div>
@@ -1278,12 +1395,12 @@ export default function JobDetailPage() {
                     <div className="text-xs text-slate-600 bg-slate-50 p-3 rounded-lg border border-slate-200 space-y-1.5">
                       {bulkActionModal.action === 'APPROVE' ? (
                         <p>
-                          You are approving <strong>{bulkActionModal.count}</strong> out-of-scope domain redirect(s).
+                          You are approving <strong>{bulkActionModal.targetIds.length}</strong> out-of-scope domain redirect(s).
                           The scanner will allow crawling the destination domains and retry email discovery for these URLs.
                         </p>
                       ) : (
                         <p>
-                          You are rejecting <strong>{bulkActionModal.count}</strong> out-of-scope domain redirect(s).
+                          You are rejecting <strong>{bulkActionModal.targetIds.length}</strong> out-of-scope domain redirect(s).
                           These URLs will be permanently marked as rejected and will remain stopped.
                         </p>
                       )}
@@ -1292,6 +1409,7 @@ export default function JobDetailPage() {
                     <div className="flex items-center justify-end space-x-3 pt-2">
                       <button
                         type="button"
+                        ref={cancelButtonRef}
                         onClick={() => setBulkActionModal(null)}
                         disabled={isBulkOperating}
                         className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg transition-colors disabled:opacity-50"
@@ -1300,6 +1418,7 @@ export default function JobDetailPage() {
                       </button>
                       <button
                         type="button"
+                        ref={confirmButtonRef}
                         onClick={handleConfirmBulkAction}
                         disabled={isBulkOperating}
                         className={`px-4 py-2 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center ${

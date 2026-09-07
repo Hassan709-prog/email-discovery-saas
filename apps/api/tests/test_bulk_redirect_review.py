@@ -33,7 +33,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from email_discovery_api.api.dependencies.identity import RequestPrincipal, get_current_principal
@@ -192,6 +192,47 @@ async def test_predicate_and_sql_parity(isolated_db_engine: AsyncEngine) -> None
             "approved_redirect_domain": None,
             "expected": False,
         },
+        # 12. Tabs, carriage returns, and newlines in failure code
+        # falling back to valid last_error_code
+        {
+            "id": uuid.uuid4(),
+            "status": ScanURLStatus.FAILED.value,
+            "last_failure_code": " \t\r\n ",
+            "last_error_code": "OUT_OF_SCOPE_REDIRECT",
+            "redirect_target_domain": "dest12.com",
+            "approved_redirect_domain": None,
+            "expected": True,
+        },
+        # 13. Both last_failure_code and last_error_code are NULL
+        {
+            "id": uuid.uuid4(),
+            "status": ScanURLStatus.FAILED.value,
+            "last_failure_code": None,
+            "last_error_code": None,
+            "redirect_target_domain": "dest13.com",
+            "approved_redirect_domain": None,
+            "expected": False,
+        },
+        # 14. Tabs, carriage returns, and newlines in redirect_target_domain (whitespace-only)
+        {
+            "id": uuid.uuid4(),
+            "status": ScanURLStatus.FAILED.value,
+            "last_failure_code": "OUT_OF_SCOPE_REDIRECT",
+            "last_error_code": None,
+            "redirect_target_domain": "\t\r\n   ",
+            "approved_redirect_domain": None,
+            "expected": False,
+        },
+        # 15. Redirect target domain with leading/trailing tabs and newlines around valid domain
+        {
+            "id": uuid.uuid4(),
+            "status": ScanURLStatus.FAILED.value,
+            "last_failure_code": "OUT_OF_SCOPE_REDIRECT",
+            "last_error_code": None,
+            "redirect_target_domain": " \t dest15.com \r\n ",
+            "approved_redirect_domain": None,
+            "expected": True,
+        },
     ]
 
     async with session_factory() as session:
@@ -235,21 +276,37 @@ async def test_predicate_and_sql_parity(isolated_db_engine: AsyncEngine) -> None
             f"Case {idx} Python predicate failed: expected {tc['expected']}, got {py_result}"
         )
 
-    # 2. Verify SQL predicate parity
+    # 2. Verify SQL predicate parity and true complement partitioning
     async with session_factory() as session:
-        stmt = (
+        clause = get_requires_redirect_approval_sql_clause()
+        stmt_true = (
             select(ScanURL.id)
             .where(
                 ScanURL.scan_job_id == job_id,
-                get_requires_redirect_approval_sql_clause(),
+                func.coalesce(clause, False).is_(True),
             )
             .order_by(ScanURL.original_index.asc())
         )
-        res = await session.execute(stmt)
-        sql_matched_ids = set(res.scalars().all())
+        stmt_false = (
+            select(ScanURL.id)
+            .where(
+                ScanURL.scan_job_id == job_id,
+                func.coalesce(clause, False).is_(False),
+            )
+            .order_by(ScanURL.original_index.asc())
+        )
+        sql_true_ids = set((await session.execute(stmt_true)).scalars().all())
+        sql_false_ids = set((await session.execute(stmt_false)).scalars().all())
 
-    expected_matched_ids = {tc["id"] for tc in test_cases if tc["expected"]}
-    assert sql_matched_ids == expected_matched_ids
+    expected_true_ids = {tc["id"] for tc in test_cases if tc["expected"]}
+    expected_false_ids = {tc["id"] for tc in test_cases if not tc["expected"]}
+    all_case_ids = {tc["id"] for tc in test_cases}
+
+    assert sql_true_ids == expected_true_ids
+    assert sql_false_ids == expected_false_ids
+    # Exact boolean complement verification (no overlap, no omissions)
+    assert sql_true_ids.isdisjoint(sql_false_ids)
+    assert sql_true_ids | sql_false_ids == all_case_ids
 
 
 @pytest.mark.anyio
@@ -384,8 +441,9 @@ async def test_bulk_approve_atomic_success_and_counters(isolated_db_engine: Asyn
 async def test_bulk_approve_idempotent_retry_after_worker_completion(
     isolated_db_engine: AsyncEngine,
 ) -> None:
-    """Verify repeated approval after worker runs (COMPLETED or FAILED) returns ALREADY_APPLIED
-    with no mutations.
+    """Verify repeated approval after worker runs (COMPLETED, NO_EMAIL, or unrelated FAILED)
+    returns ALREADY_APPLIED even when redirect_target_domain/url have been cleared by worker
+    persistence. Also verifies mixed batches with valid pending approvals proceed cleanly.
     """
     session_factory = async_sessionmaker(
         bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
@@ -395,7 +453,9 @@ async def test_bulk_approve_idempotent_retry_after_worker_completion(
     user_id = uuid.uuid4()
     job_id = uuid.uuid4()
     url_completed_id = uuid.uuid4()
+    url_no_email_id = uuid.uuid4()
     url_failed_id = uuid.uuid4()
+    url_pending_id = uuid.uuid4()
 
     async with session_factory() as session:
         async with session.begin():
@@ -411,13 +471,13 @@ async def test_bulk_approve_idempotent_retry_after_worker_completion(
                 organization_id=org_id,
                 created_by_user_id=user_id,
                 status=ScanJobStatus.COMPLETED_WITH_ERRORS.value,
-                total_input_count=2,
-                valid_input_count=2,
-                failed_count=1,
+                total_input_count=4,
+                valid_input_count=4,
+                failed_count=2,
                 queued_count=0,
-                completed_count=1,
+                completed_count=2,
             )
-            # URL already approved, scanned, and COMPLETED
+            # 1. URL already approved, scanned, and COMPLETED (targets cleared by persistence)
             u_comp = ScanURL(
                 id=url_completed_id,
                 scan_job_id=job_id,
@@ -427,30 +487,61 @@ async def test_bulk_approve_idempotent_retry_after_worker_completion(
                 attempt_count=2,
                 max_attempts=4,
                 approved_redirect_domain="target-comp.com",
-                redirect_target_domain="target-comp.com",
+                redirect_target_domain=None,
+                redirect_target_url=None,
             )
-            # URL already approved, scanned, and FAILED on subsequent scan with DNS failure
+            # 2. URL already approved, scanned, and finished with NO_EMAIL (targets cleared)
+            u_no_email = ScanURL(
+                id=url_no_email_id,
+                scan_job_id=job_id,
+                original_input="https://noemail.com",
+                original_index=1,
+                status=ScanURLStatus.NO_EMAIL.value,
+                attempt_count=2,
+                max_attempts=4,
+                approved_redirect_domain="target-noemail.com",
+                redirect_target_domain=None,
+                redirect_target_url=None,
+            )
+            # 3. URL already approved, scanned, and FAILED on subsequent scan with DNS failure
+            # (targets cleared)
             u_fail = ScanURL(
                 id=url_failed_id,
                 scan_job_id=job_id,
                 original_input="https://fail.com",
-                original_index=1,
+                original_index=2,
                 status=ScanURLStatus.FAILED.value,
                 attempt_count=4,
                 max_attempts=4,
                 last_failure_code="DNS_NAME_NOT_FOUND",
                 approved_redirect_domain="target-fail.com",
-                redirect_target_domain="target-fail.com",
+                redirect_target_domain=None,
+                redirect_target_url=None,
             )
-            session.add_all([org, user, job, u_comp, u_fail])
+            # 4. Valid pending approval in same job
+            u_pending = ScanURL(
+                id=url_pending_id,
+                scan_job_id=job_id,
+                original_input="https://pending.com",
+                original_index=3,
+                status=ScanURLStatus.FAILED.value,
+                attempt_count=3,
+                max_attempts=3,
+                last_failure_code="OUT_OF_SCOPE_REDIRECT",
+                approved_redirect_domain=None,
+                redirect_target_domain="target-pending.com",
+                redirect_target_url="https://target-pending.com/",
+            )
+            session.add_all([org, user, job, u_comp, u_no_email, u_fail, u_pending])
 
+    # 1. Test batch of only completed/cleared already-applied rows
     async with session_factory() as session:
         service = ScanJobService(session)
-        cmd = BulkRedirectCommand(url_ids=[url_completed_id, url_failed_id])
+        cmd = BulkRedirectCommand(url_ids=[url_completed_id, url_no_email_id, url_failed_id])
         res = await service.bulk_approve_url_redirects(org_id, job_id, cmd)
 
         assert res.affected_count == 0
-        assert res.skipped_count == 2
+        assert res.skipped_count == 3
         for item in res.results:
             assert item.disposition.value == "ALREADY_APPLIED"
 
@@ -459,7 +550,7 @@ async def test_bulk_approve_idempotent_retry_after_worker_completion(
         job_check = (
             await session.execute(select(ScanJob).where(ScanJob.id == job_id))
         ).scalar_one()
-        assert job_check.failed_count == 1
+        assert job_check.failed_count == 2
         assert job_check.queued_count == 0
         assert job_check.status == ScanJobStatus.COMPLETED_WITH_ERRORS.value
 
@@ -469,6 +560,63 @@ async def test_bulk_approve_idempotent_retry_after_worker_completion(
             .all()
         )
         assert len(events) == 0
+
+    # 2. Test mixed batch: 1 valid pending URL + 3 already-applied completed/failed URLs
+    async with session_factory() as session:
+        service = ScanJobService(session)
+        cmd_mixed = BulkRedirectCommand(
+            url_ids=[url_pending_id, url_completed_id, url_no_email_id, url_failed_id]
+        )
+        res_mixed = await service.bulk_approve_url_redirects(org_id, job_id, cmd_mixed)
+
+        assert res_mixed.affected_count == 1
+        assert res_mixed.skipped_count == 3
+
+        disp_map = {item.url_id: item.disposition.value for item in res_mixed.results}
+        assert disp_map[url_pending_id] == "MUTATED"
+        assert disp_map[url_completed_id] == "ALREADY_APPLIED"
+        assert disp_map[url_no_email_id] == "ALREADY_APPLIED"
+        assert disp_map[url_failed_id] == "ALREADY_APPLIED"
+
+    # Verify u_pending was updated, counters updated, and completed/failed URLs were untouched
+    async with session_factory() as session:
+        urls_check = {
+            u.id: u
+            for u in (
+                (await session.execute(select(ScanURL).where(ScanURL.scan_job_id == job_id)))
+                .scalars()
+                .all()
+            )
+        }
+        # u_pending mutated:
+        assert urls_check[url_pending_id].status == ScanURLStatus.QUEUED.value
+        assert urls_check[url_pending_id].max_attempts == 4
+        assert urls_check[url_pending_id].approved_redirect_domain == "target-pending.com"
+
+        # Already applied URLs remained untouched:
+        assert urls_check[url_completed_id].status == ScanURLStatus.COMPLETED.value
+        assert urls_check[url_completed_id].max_attempts == 4
+        assert urls_check[url_no_email_id].status == ScanURLStatus.NO_EMAIL.value
+        assert urls_check[url_no_email_id].max_attempts == 4
+        assert urls_check[url_failed_id].status == ScanURLStatus.FAILED.value
+        assert urls_check[url_failed_id].max_attempts == 4
+
+        # Job reopened to RUNNING because u_pending is now QUEUED:
+        job_check2 = (
+            await session.execute(select(ScanJob).where(ScanJob.id == job_id))
+        ).scalar_one()
+        assert job_check2.status == ScanJobStatus.RUNNING.value
+        assert job_check2.queued_count == 1
+        assert job_check2.failed_count == 1
+
+        # Only 1 approval event emitted with target-pending.com
+        events2 = (
+            (await session.execute(select(JobEvent).where(JobEvent.scan_job_id == job_id)))
+            .scalars()
+            .all()
+        )
+        assert len(events2) == 1
+        assert events2[0].payload["sample_approved_domains"] == ["target-pending.com"]
 
 
 @pytest.mark.anyio
@@ -1371,6 +1519,140 @@ async def test_single_approve_counter_invariant_violation_aborts_atomically(
             assert res.status_code == 409
             assert res.json()["error"]["code"] == "INVALID_STATE_TRANSITION"
             mock_publisher.publish_work_available.assert_not_called()
+    finally:
+        app.dependency_overrides.clear()
+        app.state.db_manager = None
+
+
+@pytest.mark.anyio
+async def test_list_urls_filtered_pagination_totals(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify that list_scan_job_urls includes filtered total_count matching predicate parity,
+    preserves cursor pagination, scopes by tenant and job, and returns correct totals.
+    """
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = uuid.uuid4()
+    other_org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    other_job_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            org = Organization(id=org_id, name="Org", slug=f"org-{org_id.hex[:6]}")
+            other_org = Organization(
+                id=other_org_id, name="Other", slug=f"oth-{other_org_id.hex[:6]}"
+            )
+            user = User(
+                id=user_id,
+                email=f"u-{user_id.hex[:6]}@example.com",
+                normalized_email=f"u-{user_id.hex[:6]}@example.com",
+                password_hash="hash",
+            )
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=10,
+                valid_input_count=10,
+            )
+            # Other job to ensure job scoping
+            other_job = ScanJob(
+                id=other_job_id,
+                organization_id=other_org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=5,
+                valid_input_count=5,
+            )
+            # 10 URLs in job: 3 pending redirect approval, 7 not pending
+            urls: list[ScanURL] = []
+            for idx in range(10):
+                is_pending = idx < 3
+                urls.append(
+                    ScanURL(
+                        id=uuid.uuid4(),
+                        scan_job_id=job_id,
+                        original_input=f"https://site{idx}.com",
+                        original_index=idx,
+                        status=ScanURLStatus.FAILED.value
+                        if is_pending
+                        else ScanURLStatus.COMPLETED.value,
+                        last_error_code="OUT_OF_SCOPE_REDIRECT" if is_pending else None,
+                        redirect_target_domain=f"target{idx}.com" if is_pending else None,
+                    )
+                )
+            # 2 pending URLs in other job (must NOT bleed into count)
+            for idx in range(2):
+                urls.append(
+                    ScanURL(
+                        id=uuid.uuid4(),
+                        scan_job_id=other_job_id,
+                        original_input=f"https://other{idx}.com",
+                        original_index=idx,
+                        status=ScanURLStatus.FAILED.value,
+                        last_error_code="OUT_OF_SCOPE_REDIRECT",
+                        redirect_target_domain=f"other-target{idx}.com",
+                    )
+                )
+            session.add_all([org, other_org, user, job, other_job, *urls])
+
+    # Test via API route
+    db_manager = MagicMock()
+    db_manager.session_factory = session_factory
+    app.state.db_manager = db_manager
+
+    principal = RequestPrincipal(
+        user_id=user_id, organization_id=org_id, request_id="test-list-totals"
+    )
+    app.dependency_overrides[get_current_principal] = lambda: principal
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
+
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. Unfiltered list with limit=2 (page 1)
+            res_all = await client.get(f"/api/v1/scan-jobs/{job_id}/urls?limit=2")
+            assert res_all.status_code == 200
+            data_all = res_all.json()
+            assert len(data_all["items"]) == 2
+            assert data_all["total_count"] == 10
+            assert data_all["next_cursor"] is not None
+
+            # 2. Filtered list with requires_redirect_approval=true, limit=2
+            res_pend = await client.get(
+                f"/api/v1/scan-jobs/{job_id}/urls?limit=2&requires_redirect_approval=true"
+            )
+            assert res_pend.status_code == 200
+            data_pend = res_pend.json()
+            assert len(data_pend["items"]) == 2
+            assert data_pend["total_count"] == 3
+            assert data_pend["next_cursor"] is not None
+
+            # 3. Next page of filtered list using cursor
+            cursor = data_pend["next_cursor"]
+            res_pend_p2 = await client.get(
+                f"/api/v1/scan-jobs/{job_id}/urls?limit=2&cursor={cursor}&requires_redirect_approval=true"
+            )
+            assert res_pend_p2.status_code == 200
+            data_pend_p2 = res_pend_p2.json()
+            assert len(data_pend_p2["items"]) == 1
+            assert data_pend_p2["total_count"] == 3
+            assert data_pend_p2["next_cursor"] is None
+
+            # 4. Filtered list with requires_redirect_approval=false
+            res_non_pend = await client.get(
+                f"/api/v1/scan-jobs/{job_id}/urls?limit=5&requires_redirect_approval=false"
+            )
+            assert res_non_pend.status_code == 200
+            data_non_pend = res_non_pend.json()
+            assert len(data_non_pend["items"]) == 5
+            assert data_non_pend["total_count"] == 7
     finally:
         app.dependency_overrides.clear()
         app.state.db_manager = None

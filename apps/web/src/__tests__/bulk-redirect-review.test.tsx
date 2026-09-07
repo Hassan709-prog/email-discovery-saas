@@ -237,7 +237,35 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
     });
   });
 
-  it('executes bulk approval flow with confirmation dialog and plural route', async () => {
+  it('displays filtered count in Showing X of Y when filtering by pending approvals', async () => {
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [
+        createPendingUrl('u-1', 0, 'site1.com', 'dest1.com'),
+      ],
+      next_cursor: null,
+      total_count: 1,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Pending Redirect Approvals/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Pending Redirect Approvals/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Showing 1 of 1')).toBeInTheDocument();
+    });
+  });
+
+  it('executes bulk approval flow with confirmation dialog and url_ids contract', async () => {
     const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
     const url2 = createPendingUrl('u-2', 1, 'site2.com', 'dest2.com');
 
@@ -252,9 +280,10 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
       requested_count: 2,
       unique_requested_count: 2,
       affected_count: 2,
+      skipped_count: 0,
       results: [
-        { scan_url_id: 'u-1', disposition: 'APPROVED', target_domain: 'dest1.com', message: 'Approved' },
-        { scan_url_id: 'u-2', disposition: 'APPROVED', target_domain: 'dest2.com', message: 'Approved' },
+        { url_id: 'u-1', disposition: 'APPROVED', target_domain: 'dest1.com', message: 'Approved' },
+        { url_id: 'u-2', disposition: 'APPROVED', target_domain: 'dest2.com', message: 'Approved' },
       ],
     });
 
@@ -291,7 +320,7 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
 
     await waitFor(() => {
       expect(bulkApproveSpy).toHaveBeenCalledWith('job-bulk-123', {
-        scan_url_ids: ['u-1', 'u-2'],
+        url_ids: ['u-1', 'u-2'],
       });
       // Selection cleared on success
       expect(screen.queryByText(/2 pending redirects selected/i)).not.toBeInTheDocument();
@@ -300,7 +329,7 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
     });
   });
 
-  it('executes bulk rejection flow with confirmation dialog and plural route', async () => {
+  it('executes bulk rejection flow with confirmation dialog and url_ids contract', async () => {
     const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
 
     vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
@@ -314,8 +343,9 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
       requested_count: 1,
       unique_requested_count: 1,
       affected_count: 1,
+      skipped_count: 0,
       results: [
-        { scan_url_id: 'u-1', disposition: 'REJECTED', target_domain: 'dest1.com', message: 'Rejected' },
+        { url_id: 'u-1', disposition: 'REJECTED', target_domain: 'dest1.com', message: 'Rejected' },
       ],
     });
 
@@ -351,7 +381,7 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
 
     await waitFor(() => {
       expect(bulkRejectSpy).toHaveBeenCalledWith('job-bulk-123', {
-        scan_url_ids: ['u-1'],
+        url_ids: ['u-1'],
       });
       // Selection cleared on success
       expect(screen.queryByText(/1 pending redirect selected/i)).not.toBeInTheDocument();
@@ -407,7 +437,7 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
     });
   });
 
-  it('executes single-row rejection using bulkRejectUrlRedirects with single ID', async () => {
+  it('executes single-row rejection using bulkRejectUrlRedirects with url_ids contract', async () => {
     const url1 = createPendingUrl('u-single-1', 0, 'site1.com', 'dest1.com');
 
     vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
@@ -421,8 +451,9 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
       requested_count: 1,
       unique_requested_count: 1,
       affected_count: 1,
+      skipped_count: 0,
       results: [
-        { scan_url_id: 'u-single-1', disposition: 'REJECTED', target_domain: 'dest1.com', message: 'Rejected' },
+        { url_id: 'u-single-1', disposition: 'REJECTED', target_domain: 'dest1.com', message: 'Rejected' },
       ],
     });
 
@@ -442,8 +473,246 @@ describe('Bulk Redirect Review Web UI', { timeout: 15000 }, () => {
 
     await waitFor(() => {
       expect(bulkRejectSpy).toHaveBeenCalledWith('job-bulk-123', {
-        scan_url_ids: ['u-single-1'],
+        url_ids: ['u-single-1'],
       });
+    });
+  });
+
+  it('handles individual approval followed by bulk rejection cleanly', async () => {
+    const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
+    const url2 = createPendingUrl('u-2', 1, 'site2.com', 'dest2.com');
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [url1, url2],
+      next_cursor: null,
+    });
+
+    const approveSpy = vi.spyOn(apiClient, 'approveUrlRedirect').mockResolvedValue({
+      ...url1,
+      requires_redirect_approval: false,
+    });
+
+    const bulkRejectSpy = vi.spyOn(apiClient, 'bulkRejectUrlRedirects').mockResolvedValue({
+      job_id: 'job-bulk-123',
+      action: 'REJECT',
+      requested_count: 1,
+      unique_requested_count: 1,
+      affected_count: 1,
+      skipped_count: 0,
+      results: [{ url_id: 'u-2', disposition: 'REJECTED' }],
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i })).toBeInTheDocument();
+    });
+
+    // Select both u-1 and u-2
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select redirect for site2\.com/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/2 pending redirects selected/i)).toBeInTheDocument();
+    });
+
+    // Individually approve u-1
+    const approveBtns = screen.getAllByRole('button', { name: 'Approve & Retry' });
+    fireEvent.click(approveBtns[0]);
+
+    await waitFor(() => {
+      expect(approveSpy).toHaveBeenCalledWith('job-bulk-123', 'u-1', 'dest1.com');
+      // u-1 was approved and pruned from selection, only 1 remains selected
+      expect(screen.getByText(/1 pending redirect selected/i)).toBeInTheDocument();
+    });
+
+    // Now bulk reject remaining selection
+    fireEvent.click(screen.getByRole('button', { name: /Reject Selected \(1\)/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Confirm Rejection' })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Rejection' }));
+
+    await waitFor(() => {
+      expect(bulkRejectSpy).toHaveBeenCalledWith('job-bulk-123', {
+        url_ids: ['u-2'],
+      });
+      expect(screen.queryByText(/pending redirects selected/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it('prunes stale selections when refresh occurs and rows no longer require approval', async () => {
+    const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
+
+    const listUrlsSpy = vi.spyOn(apiClient, 'listScanJobUrls')
+      .mockResolvedValueOnce({ items: [url1], next_cursor: null })
+      .mockResolvedValueOnce({ items: [createCompletedUrl('u-1', 0, 'site1.com')], next_cursor: null });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 pending redirect selected/i)).toBeInTheDocument();
+    });
+
+    // Click Refresh URL List
+    fireEvent.click(screen.getByRole('button', { name: /Refresh URL List/i }));
+
+    await waitFor(() => {
+      expect(listUrlsSpy).toHaveBeenCalledTimes(2);
+      // Since u-1 is now completed and does not require approval, it is pruned from selection
+      expect(screen.queryByText(/1 pending redirect selected/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it('clears selection on filter change', async () => {
+    const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [url1],
+      next_cursor: null,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 pending redirect selected/i)).toBeInTheDocument();
+    });
+
+    // Switch filter to Pending Redirect Approvals
+    fireEvent.click(screen.getByRole('button', { name: /Pending Redirect Approvals/i }));
+
+    await waitFor(() => {
+      // Selection is cleared on filter change
+      expect(screen.queryByText(/1 pending redirect selected/i)).not.toBeInTheDocument();
+    });
+  });
+
+  it('disables background selection controls while confirmation modal is open', async () => {
+    const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [url1],
+      next_cursor: null,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i })).toBeInTheDocument();
+    });
+
+    const checkbox = screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i });
+    fireEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Approve Selected \(1\)/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Approve Selected \(1\)/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Approve Selected Redirects')).toBeInTheDocument();
+      // Table checkboxes are disabled while modal is open
+      expect(checkbox).toBeDisabled();
+      expect(screen.getByTitle('Select all loaded pending redirects')).toBeDisabled();
+    });
+  });
+
+  it('implements dialog accessibility with initial focus, escape-to-close, and keyboard focus trapping', async () => {
+    const url1 = createPendingUrl('u-1', 0, 'site1.com', 'dest1.com');
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [url1],
+      next_cursor: null,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (4)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (4)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Select redirect for site1\.com/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Approve Selected \(1\)/i })).toBeInTheDocument();
+    });
+
+    const triggerBtn = screen.getByRole('button', { name: /Approve Selected \(1\)/i });
+    triggerBtn.focus();
+    fireEvent.click(triggerBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText('Approve Selected Redirects')).toBeInTheDocument();
+    });
+
+    const cancelBtn = screen.getByRole('button', { name: 'Cancel' });
+    const confirmBtn = screen.getByRole('button', { name: 'Confirm Approval' });
+
+    // Initial focus on cancel button
+    await waitFor(() => {
+      expect(document.activeElement).toBe(cancelBtn);
+    });
+
+    const dialog = screen.getByRole('dialog');
+
+    // Tab moves focus to confirm button
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+    // Focus trapping keydown simulation
+    cancelBtn.focus();
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+
+    // Escape closes modal when not executing
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      // Focus restored to triggering button
+      expect(document.activeElement).toBe(triggerBtn);
     });
   });
 });

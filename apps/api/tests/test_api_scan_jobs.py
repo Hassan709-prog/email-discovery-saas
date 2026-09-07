@@ -507,3 +507,45 @@ def test_format_failure_reason_dns_name_not_found() -> None:
 
     desc = format_failure_reason("DNS_NAME_NOT_FOUND", None)
     assert desc == "Domain name does not exist or has no DNS records"
+
+
+def test_create_scan_job_forwards_approved_redirect_domains(
+    test_app: FastAPI, client: Any, test_principal: RequestPrincipal
+) -> None:
+    """Verify approved_redirect_domains in public request is forwarded into CreateScanJobCommand."""
+    mock_service = MagicMock(spec=ScanJobService)
+    test_app.dependency_overrides[get_current_principal] = lambda: test_principal
+    test_app.dependency_overrides[get_scan_job_service] = lambda: mock_service
+
+    job_id = uuid.uuid4()
+    job = ScanJob(
+        id=job_id,
+        organization_id=test_principal.organization_id,
+        created_by_user_id=test_principal.user_id,
+        status=ScanJobStatus.DRAFT.value,
+        source_type="MANUAL",
+        scanner_version="1.0.0",
+        normalization_version="1.0.0",
+        ranking_version="1.0.0",
+        configuration_snapshot={"approved_redirect_domains": ["destination.com"]},
+        total_input_count=1,
+        valid_input_count=1,
+        duplicate_input_count=0,
+        queued_count=0,
+        running_count=0,
+        completed_count=0,
+        failed_count=0,
+        email_finding_count=0,
+        created_at=datetime.now(UTC),
+    )
+    mock_service.create_job = AsyncMock(return_value=CreateJobResult(job=job, created=True))
+
+    payload = {
+        "inputs": ["https://example.com"],
+        "approved_redirect_domains": {"https://example.com": "destination.com"},
+    }
+    res = client.post("/api/v1/scan-jobs", json=payload)
+    assert res.status_code == 201
+    mock_service.create_job.assert_awaited_once()
+    called_cmd = mock_service.create_job.await_args.args[0]
+    assert called_cmd.approved_redirect_domains == {"https://example.com": "destination.com"}

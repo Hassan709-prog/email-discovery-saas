@@ -379,12 +379,13 @@ class JobEventApiResponse(BaseModel):
 
 
 class PaginatedResponse[T](BaseModel):
-    """Generic paginated response envelope with next_cursor."""
+    """Generic paginated response envelope with next_cursor and optional total_count."""
 
     model_config = ConfigDict(frozen=True)
 
     items: list[T]
     next_cursor: str | None = None
+    total_count: int | None = None
 
 
 class BulkRedirectDisposition(StrEnum):

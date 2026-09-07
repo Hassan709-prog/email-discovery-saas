@@ -29,7 +29,7 @@ def is_url_requiring_redirect_approval(url: Any) -> bool:
 
     Matches exactly the SQL filtering logic and serializer rules:
     - Status must be FAILED
-    - approved_redirect_domain must be absent (None or empty/whitespace-only)
+    - approved_redirect_domain must be absent (None or empty/whitespace-only: spaces, tabs, \r, \n)
     - redirect_target_domain must be present and non-empty/non-whitespace
     - Effective failure code (checking last_failure_code first if non-empty,
       falling back to last_error_code) must be in REDIRECT_APPROVAL_FAILURE_CODES.
@@ -41,19 +41,27 @@ def is_url_requiring_redirect_approval(url: Any) -> bool:
         return False
 
     app_redirect = getattr(url, "approved_redirect_domain", None)
-    if app_redirect is not None and bool(str(app_redirect).strip()):
+    if app_redirect is not None and bool(str(app_redirect).strip(" \t\r\n")):
         return False
 
     target_redirect = getattr(url, "redirect_target_domain", None)
-    if target_redirect is None or not bool(str(target_redirect).strip()):
+    if target_redirect is None or not bool(str(target_redirect).strip(" \t\r\n")):
         return False
 
     last_fail = getattr(url, "last_failure_code", None)
     last_err = getattr(url, "last_error_code", None)
 
-    effective_code = (
-        last_fail.strip() if (last_fail is not None and bool(str(last_fail).strip())) else None
-    ) or (last_err.strip() if (last_err is not None and bool(str(last_err).strip())) else None)
+    fail_clean = (
+        str(last_fail).strip(" \t\r\n")
+        if (last_fail is not None and bool(str(last_fail).strip(" \t\r\n")))
+        else None
+    )
+    err_clean = (
+        str(last_err).strip(" \t\r\n")
+        if (last_err is not None and bool(str(last_err).strip(" \t\r\n")))
+        else None
+    )
+    effective_code = fail_clean or err_clean
 
     return effective_code in REDIRECT_APPROVAL_FAILURE_CODES
 
@@ -63,7 +71,7 @@ def get_requires_redirect_approval_sql_clause() -> ColumnElement[bool]:
 
     Ensures:
     1. ScanURL.status == FAILED
-    2. approved_redirect_domain is NULL or whitespace-only
+    2. approved_redirect_domain is NULL or whitespace-only (spaces, tabs, \r, \n)
     3. redirect_target_domain is NOT NULL and non-empty after trim
     4. Effective code (nullif on trimmed last_failure_code with coalesce to
        nullif on trimmed last_error_code) is IN REDIRECT_APPROVAL_FAILURE_CODES.
@@ -71,18 +79,18 @@ def get_requires_redirect_approval_sql_clause() -> ColumnElement[bool]:
     from email_discovery_api.models.scan_url import ScanURL
 
     effective_code = func.coalesce(
-        func.nullif(func.trim(ScanURL.last_failure_code), ""),
-        func.nullif(func.trim(ScanURL.last_error_code), ""),
+        func.nullif(func.trim(ScanURL.last_failure_code, " \t\r\n"), ""),
+        func.nullif(func.trim(ScanURL.last_error_code, " \t\r\n"), ""),
     )
 
     return and_(
         ScanURL.status == ScanURLStatus.FAILED.value,
         or_(
             ScanURL.approved_redirect_domain.is_(None),
-            func.trim(ScanURL.approved_redirect_domain) == "",
+            func.trim(ScanURL.approved_redirect_domain, " \t\r\n") == "",
         ),
         ScanURL.redirect_target_domain.isnot(None),
-        func.trim(ScanURL.redirect_target_domain) != "",
+        func.trim(ScanURL.redirect_target_domain, " \t\r\n") != "",
         effective_code.in_(REDIRECT_APPROVAL_FAILURE_CODES),
     )
 

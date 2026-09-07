@@ -781,8 +781,11 @@ class ScanJobService:
         cursor_id: uuid.UUID | None = None,
         status: str | None = None,
         requires_redirect_approval: bool | None = None,
-    ) -> tuple[list[ScanURL], str | None]:
-        """List job URLs tenant-scoped with keyset pagination returning items and next_cursor."""
+    ) -> tuple[list[ScanURL], str | None, int]:
+        """List job URLs tenant-scoped with keyset pagination.
+
+        Returns (urls, next_cursor, total_count).
+        """
         await self.get_job(organization_id, job_id)
 
         fetch_limit = limit + 1
@@ -795,15 +798,21 @@ class ScanJobService:
             status=status,
             requires_redirect_approval=requires_redirect_approval,
         )
+        total_count = await self.url_repo.count_urls(
+            organization_id,
+            job_id,
+            status=status,
+            requires_redirect_approval=requires_redirect_approval,
+        )
 
         next_cursor: str | None = None
         if len(urls) > limit:
             has_more = urls[:limit]
             last_item = has_more[-1]
             next_cursor = encode_cursor("urls", [last_item.original_index, str(last_item.id)])
-            return has_more, next_cursor
+            return has_more, next_cursor, total_count
 
-        return urls, None
+        return urls, None, total_count
 
     async def list_job_events(
         self,
@@ -991,18 +1000,18 @@ class ScanJobService:
                     f"ScanURL {url_id} not found in job {job_id}.",
                 )
 
-            if url.approved_redirect_domain is not None and (
+            app_redirect = (url.approved_redirect_domain or "").strip()
+            target_redirect = (url.redirect_target_domain or "").strip()
+            if app_redirect and (
                 url.status
                 in (
                     ScanURLStatus.QUEUED.value,
                     ScanURLStatus.SCANNING.value,
                     ScanURLStatus.LEASED.value,
+                    ScanURLStatus.COMPLETED.value,
                 )
-                or (
-                    url.redirect_target_domain is not None
-                    and url.approved_redirect_domain.strip().lower()
-                    == url.redirect_target_domain.strip().lower()
-                )
+                or not target_redirect
+                or app_redirect.lower() == target_redirect.lower()
             ):
                 return url
 
@@ -1122,11 +1131,17 @@ class ScanJobService:
                 last_err = (url.last_error_code or "").strip()
                 effective_code = last_fail or last_err
 
-                # B. Already approved:
-                if (
-                    app_redirect
-                    and target_redirect
-                    and app_redirect.lower() == target_redirect.lower()
+                # B. Already approved (idempotent replay):
+                if app_redirect and (
+                    url.status
+                    in (
+                        ScanURLStatus.QUEUED.value,
+                        ScanURLStatus.SCANNING.value,
+                        ScanURLStatus.LEASED.value,
+                        ScanURLStatus.COMPLETED.value,
+                    )
+                    or not target_redirect
+                    or app_redirect.lower() == target_redirect.lower()
                 ):
                     already_applied_ids.add(uid)
                     continue

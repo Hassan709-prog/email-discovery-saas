@@ -31,7 +31,7 @@ from email_scanner.models import (
     NormalizedURL,
     RedirectHop,
 )
-from email_scanner.normalization import normalize_url
+from email_scanner.normalization import canonicalize_redirect_domain, normalize_url
 from email_scanner.pinned_transport import (
     PinnedAsyncHTTPTransport,
     _connection_attempts_ctx,  # pyright: ignore[reportPrivateUsage]
@@ -375,12 +375,19 @@ class AsyncHTTPFetcher:
                                         is_approved_redirect = False
                                         if config.allow_cross_domain_redirects:
                                             is_approved_redirect = True
-                                        elif (
-                                            target_url.registrable_domain
-                                            and target_url.registrable_domain.lower()
-                                            in [d.lower() for d in config.approved_redirect_domains]
-                                        ):
-                                            is_approved_redirect = True
+                                        elif config.approved_redirect_domains:
+                                            approved_canonical = {
+                                                canonicalize_redirect_domain(d)
+                                                for d in config.approved_redirect_domains
+                                            } - {None}
+                                            target_canonical = canonicalize_redirect_domain(
+                                                target_url.registrable_domain or target_url.hostname
+                                            )
+                                            if (
+                                                target_canonical is not None
+                                                and target_canonical in approved_canonical
+                                            ):
+                                                is_approved_redirect = True
 
                                         if (
                                             effective_redirect_validator is not None

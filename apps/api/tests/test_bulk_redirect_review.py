@@ -1656,3 +1656,133 @@ async def test_list_urls_filtered_pagination_totals(
     finally:
         app.dependency_overrides.clear()
         app.state.db_manager = None
+
+
+@pytest.mark.anyio
+async def test_bulk_redirect_canonicalization_and_safety(
+    isolated_db_engine: AsyncEngine,
+) -> None:
+    """Verify redirect domains are canonicalized to registrable domains, existing rows with
+    hostnames (e.g. www.) are safely handled, requests are idempotent, and invalid/IP
+    redirect targets fail safely without being approved.
+    """
+    session_factory = async_sessionmaker(
+        bind=isolated_db_engine, expire_on_commit=False, class_=AsyncSession
+    )
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    u_hostname_id = uuid.uuid4()
+    u_malformed_id = uuid.uuid4()
+
+    async with session_factory() as session:
+        async with session.begin():
+            org = Organization(id=org_id, name="Org", slug=f"org-{org_id.hex[:6]}")
+            user = User(
+                id=user_id,
+                email=f"u-{user_id.hex[:6]}@example.com",
+                normalized_email=f"u-{user_id.hex[:6]}@example.com",
+                password_hash="hash",
+            )
+            job = ScanJob(
+                id=job_id,
+                organization_id=org_id,
+                created_by_user_id=user_id,
+                status=ScanJobStatus.RUNNING.value,
+                total_input_count=2,
+                valid_input_count=2,
+                failed_count=2,
+                queued_count=0,
+            )
+            # Row 1: Existing row with full hostname containing www.
+            u_hostname = ScanURL(
+                id=u_hostname_id,
+                scan_job_id=job_id,
+                original_index=0,
+                original_input="https://example.com/page1",
+                normalized_url="https://example.com/page1",
+                normalized_domain="example.com",
+                status=ScanURLStatus.FAILED.value,
+                attempt_count=1,
+                max_attempts=3,
+                last_failure_code="OUT_OF_SCOPE_REDIRECT",
+                redirect_target_domain="www.destination.com",
+                redirect_target_url="https://www.destination.com/target",
+                approved_redirect_domain=None,
+            )
+            # Row 2: Malformed target domain (IP address)
+            u_malformed = ScanURL(
+                id=u_malformed_id,
+                scan_job_id=job_id,
+                original_index=1,
+                original_input="https://example.com/page2",
+                normalized_url="https://example.com/page2",
+                normalized_domain="example.com",
+                status=ScanURLStatus.FAILED.value,
+                attempt_count=1,
+                max_attempts=3,
+                last_failure_code="OUT_OF_SCOPE_REDIRECT",
+                redirect_target_domain="192.168.1.1",
+                redirect_target_url="https://192.168.1.1/target",
+                approved_redirect_domain=None,
+            )
+            session.add_all([org, user, job, u_hostname, u_malformed])
+
+    db_manager = MagicMock()
+    db_manager.session_factory = session_factory
+    app.state.db_manager = db_manager
+
+    principal = RequestPrincipal(
+        user_id=user_id, organization_id=org_id, request_id="test-canon-req"
+    )
+    mock_publisher = AsyncMock()
+
+    app.dependency_overrides[get_current_principal] = lambda: principal
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
+    app.dependency_overrides[get_redis_publisher] = lambda: mock_publisher
+
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 1. Approval of www.destination.com row succeeds and canonicalizes to destination.com
+            res1 = await client.post(
+                f"/api/v1/scan-jobs/{job_id}/urls/bulk-approve-redirects",
+                json={"url_ids": [str(u_hostname_id)]},
+            )
+            assert res1.status_code == 200
+            data1 = res1.json()
+            assert data1["affected_count"] == 1
+            assert data1["results"][0]["status"] == "QUEUED"
+            assert data1["results"][0]["disposition"] == "MUTATED"
+
+            # Check database persisted canonical values
+            async with session_factory() as session:
+                persisted_u1 = (
+                    await session.execute(select(ScanURL).where(ScanURL.id == u_hostname_id))
+                ).scalar_one()
+                assert persisted_u1.approved_redirect_domain == "destination.com"
+                assert persisted_u1.redirect_target_domain == "destination.com"
+                assert persisted_u1.status == ScanURLStatus.QUEUED.value
+
+            # 2. Replay of approval is idempotent and returns ALREADY_APPLIED
+            res_replay = await client.post(
+                f"/api/v1/scan-jobs/{job_id}/urls/bulk-approve-redirects",
+                json={"url_ids": [str(u_hostname_id)]},
+            )
+            assert res_replay.status_code == 200
+            data_replay = res_replay.json()
+            assert data_replay["affected_count"] == 0
+            assert data_replay["skipped_count"] == 1
+            assert data_replay["results"][0]["disposition"] == "ALREADY_APPLIED"
+
+            # 3. Attempting to approve the malformed/IP target fails safely
+            res_malformed = await client.post(
+                f"/api/v1/scan-jobs/{job_id}/urls/bulk-approve-redirects",
+                json={"url_ids": [str(u_malformed_id)]},
+            )
+            assert res_malformed.status_code == 400
+            assert res_malformed.json()["error"]["code"] == "INVALID_RESULT_STATE"
+    finally:
+        app.dependency_overrides.clear()
+        app.state.db_manager = None

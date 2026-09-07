@@ -718,6 +718,67 @@ def test_fetch_approved_redirect_domain_permits_destination_and_rejects_unapprov
     asyncio.run(_test())
 
 
+def test_fetch_approved_redirect_domain_canonicalization() -> None:
+    """Fetcher canonicalizes approved domains and handles www, trailing dots, mixed case,
+    and invalid entries safely.
+    """
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "source.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://www.destination.com/landing"},
+                )
+            if request.url.host == "www.destination.com":
+                return httpx.Response(
+                    200, headers={"Content-Type": "text/html"}, content=b"<html>Destination</html>"
+                )
+            if request.url.host == "malformed-source.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://192.168.1.1/landing"},
+                )
+            return httpx.Response(404)
+
+        dns = FakeDNSResolver(
+            mapping={
+                "source.com": ("93.184.215.14",),
+                "www.destination.com": ("93.184.215.15",),
+                "malformed-source.com": ("93.184.215.16",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+
+        # Approved list has www, trailing dot, uppercase, and invalid IP/syntax
+        config = FetchConfig(
+            approved_redirect_domains=(
+                "  WWW.DESTINATION.COM.  ",
+                "192.168.1.1",
+                "invalid..domain",
+            )
+        )
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            config=config,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        res = await fetcher.fetch("https://source.com/start")
+        assert res.outcome == FetchOutcomeCode.SUCCESS
+        assert res.final_url == "https://www.destination.com/landing"
+
+        # IP destination fails safely and is rejected
+        res_malformed = await fetcher.fetch("https://malformed-source.com/start")
+        assert res_malformed.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+
+    asyncio.run(_test())
+
+
 def test_fetch_permanent_dns_failure_no_retries() -> None:
     async def _test() -> None:
         class PermanentFailResolver:

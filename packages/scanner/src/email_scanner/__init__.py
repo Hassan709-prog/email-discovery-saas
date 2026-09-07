@@ -92,7 +92,7 @@ from email_scanner.models import (
     SiteScanResult,
     SiteScanStatistics,
 )
-from email_scanner.normalization import normalize_url
+from email_scanner.normalization import canonicalize_redirect_domain, normalize_url
 from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.pinned_transport import (
     PinnedAsyncHTTPTransport,
@@ -223,6 +223,7 @@ __all__ = [
     "is_in_scope",
     "is_same_origin",
     "is_same_registrable_domain",
+    "canonicalize_redirect_domain",
     "normalize_url",
     "parse_retry_after_header",
     "rank_pages",

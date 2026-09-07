@@ -41,6 +41,7 @@ from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.policies import ScanCreationPolicy
 from email_scanner import (
     URLCleaningBatchResult,
+    canonicalize_redirect_domain,
     clean_and_review_urls,
 )
 
@@ -226,9 +227,11 @@ class ScanJobService:
                 target_domain = target_parsed.hostname
                 app_domain = None
                 if command.approved_redirect_domains:
-                    app_domain = command.approved_redirect_domains.get(
+                    raw_domain = command.approved_redirect_domains.get(
                         item.original_input
                     ) or command.approved_redirect_domains.get(item.canonical_target)
+                    if raw_domain:
+                        app_domain = canonicalize_redirect_domain(raw_domain)
 
                 scan_urls.append(
                     ScanURL(
@@ -1042,15 +1045,21 @@ class ScanJobService:
                     "ScanURL does not have a pending redirect target to approve.",
                 )
 
-            if (
-                approved_target_domain
-                and approved_target_domain.strip().lower() != target_domain.lower()
-            ):
+            canonical_target = canonicalize_redirect_domain(target_domain)
+            if not canonical_target:
                 raise ServiceError(
                     ServiceErrorCode.INVALID_RESULT_STATE,
-                    f"Target domain mismatch. Requested {approved_target_domain!r} "
-                    f"does not match persisted target {target_domain!r}.",
+                    f"ScanURL redirect target {target_domain!r} is not a valid canonical domain.",
                 )
+
+            if approved_target_domain:
+                canonical_approved = canonicalize_redirect_domain(approved_target_domain)
+                if not canonical_approved or canonical_approved != canonical_target:
+                    raise ServiceError(
+                        ServiceErrorCode.INVALID_RESULT_STATE,
+                        f"Target domain mismatch. Requested {approved_target_domain!r} "
+                        f"does not match persisted target {target_domain!r}.",
+                    )
 
             apply_url_redirect_approval(url)
 
@@ -1064,7 +1073,7 @@ class ScanJobService:
                     sequence_number=seq,
                     payload={
                         "scan_url_id": str(url_id),
-                        "approved_redirect_domain": target_domain,
+                        "approved_redirect_domain": canonical_target,
                     },
                 )
                 self.event_repo.append_event(event)
@@ -1131,6 +1140,11 @@ class ScanJobService:
                 last_err = (url.last_error_code or "").strip()
                 effective_code = last_fail or last_err
 
+                canonical_app = canonicalize_redirect_domain(app_redirect) if app_redirect else None
+                canonical_target = (
+                    canonicalize_redirect_domain(target_redirect) if target_redirect else None
+                )
+
                 # B. Already approved (idempotent replay):
                 if app_redirect and (
                     url.status
@@ -1141,6 +1155,11 @@ class ScanJobService:
                         ScanURLStatus.COMPLETED.value,
                     )
                     or not target_redirect
+                    or (
+                        canonical_app is not None
+                        and canonical_target is not None
+                        and canonical_app == canonical_target
+                    )
                     or app_redirect.lower() == target_redirect.lower()
                 ):
                     already_applied_ids.add(uid)
@@ -1151,6 +1170,7 @@ class ScanJobService:
                     url.status == ScanURLStatus.FAILED.value
                     and not app_redirect
                     and bool(target_redirect)
+                    and canonical_target is not None
                     and effective_code
                     in (
                         "OUT_OF_SCOPE_REDIRECT",

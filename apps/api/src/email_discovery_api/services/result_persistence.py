@@ -6,7 +6,6 @@ import re
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlsplit
 
 from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +40,7 @@ from email_discovery_api.services.worker_contracts import (
     LeaseLostError,
     URLClaim,
 )
+from email_scanner import canonicalize_redirect_domain
 from email_scanner.errors import PageScanOutcome, SiteScanOutcome
 from email_scanner.models import SiteScanResult
 
@@ -474,11 +474,10 @@ class ResultPersistenceService:
         ):
             target_cand: str | None = mapped_attempt.redirect_target_url
             if target_cand:
-                parsed = urlsplit(target_cand)
-                hostname: str | None = parsed.hostname
-                if hostname:
+                canon_domain = canonicalize_redirect_domain(target_cand)
+                if canon_domain:
                     redirect_target_url = target_cand
-                    redirect_target_domain = hostname.lower()
+                    redirect_target_domain = canon_domain
 
         if site_scan_result.outcome in (
             SiteScanOutcome.COMPLETED,

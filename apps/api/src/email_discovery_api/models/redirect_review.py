@@ -13,6 +13,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.sql.elements import ColumnElement
 
 from email_discovery_api.models.enums import ScanURLStatus
+from email_scanner import canonicalize_redirect_domain
 
 REDIRECT_APPROVAL_FAILURE_CODES: tuple[str, ...] = (
     "OUT_OF_SCOPE_REDIRECT",
@@ -102,7 +103,10 @@ def apply_url_redirect_approval(url: Any) -> None:
     clears transient lease and failure fields.
     """
     target_domain = getattr(url, "redirect_target_domain", None)
-    url.approved_redirect_domain = target_domain
+    canonical = canonicalize_redirect_domain(target_domain)
+    url.approved_redirect_domain = canonical or target_domain
+    if canonical:
+        url.redirect_target_domain = canonical
     url.status = ScanURLStatus.QUEUED.value
 
     current_attempts = getattr(url, "attempt_count", 0) or 0

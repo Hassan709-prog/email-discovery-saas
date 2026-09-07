@@ -746,3 +746,432 @@ def test_orchestration_recovers_and_extracts_when_href_malformed() -> None:
         assert res.page_records[1].emails_found_count == 1
 
     asyncio.run(_test())
+
+
+def test_fallback_robots_allowed_proceeds() -> None:
+    """Allowed fallback variant proceeds with fetch and crawling."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+        var_html = '<html><body><a href="/contact">Contact</a><p>sales@acme.org</p></body></html>'
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_url: FetchResult(
+                    final_url=var_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                "https://www.acme.org/contact": FetchResult(
+                    final_url="https://www.acme.org/contact",
+                    status_code=200,
+                    content_type="text/html",
+                    body_text="<html><body>Contact page</body></html>",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator(
+            {
+                start_url: RobotsDecision(
+                    target_url=start_url,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                ),
+                var_url: RobotsDecision(
+                    target_url=var_url,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                ),
+            }
+        )
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert var_url in fetcher.fetched_urls
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        assert len(res.page_records) >= 2
+        assert res.page_records[1].requested_url == var_url
+        assert res.page_records[1].outcome == PageScanOutcome.FETCHED_AND_PROCESSED
+
+    asyncio.run(_test())
+
+
+def test_fallback_robots_disallowed_does_not_fetch() -> None:
+    """Disallowed fallback variant does not fetch or crawl."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator(
+            {
+                start_url: RobotsDecision(
+                    target_url=start_url,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                ),
+                var_url: RobotsDecision(
+                    target_url=var_url,
+                    decision=RobotsDecisionCode.DISALLOWED,
+                    crawl_delay=None,
+                    reason="Disallowed by robots.txt",
+                ),
+            }
+        )
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert var_url not in fetcher.fetched_urls
+        assert res.outcome == SiteScanOutcome.ROBOTS_BLOCKED
+        assert any(p.outcome == PageScanOutcome.ROBOTS_DISALLOWED for p in res.page_records)
+
+    asyncio.run(_test())
+
+
+def test_fallback_robots_temporary_failure_does_not_fetch_and_is_retryable() -> None:
+    """Temporary robots failure on fallback does not fetch and maintains retryability."""
+    from email_discovery_crawl_worker.outcome_classifier import (
+        classify_error_code_and_retryability,
+    )
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator(
+            {
+                start_url: RobotsDecision(
+                    target_url=start_url,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                ),
+                var_url: RobotsDecision(
+                    target_url=var_url,
+                    decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+                    crawl_delay=None,
+                    reason="Robots.txt temporary failure",
+                ),
+            }
+        )
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert var_url not in fetcher.fetched_urls
+        assert res.outcome == SiteScanOutcome.ROBOTS_BLOCKED
+        assert any(p.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE for p in res.page_records)
+
+        err_code, is_retryable = classify_error_code_and_retryability(res)
+        assert err_code == "ROBOTS_FETCH_ERROR"
+        assert is_retryable is True
+
+    asyncio.run(_test())
+
+
+def test_fallback_cancellation_propagates() -> None:
+    """Cancellation during fallback stops scan immediately and sets CANCELLED outcome."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+
+        cancelled = False
+
+        def cancel_check() -> bool:
+            return cancelled
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+
+        class CancellingRobots(RobotsPolicyEvaluator):
+            def __init__(self) -> None:
+                pass
+
+            async def evaluate(
+                self,
+                url: str | NormalizedURL,
+                user_agent_token: str | None = None,
+                recorder: Any | None = None,
+            ) -> RobotsDecision:
+                nonlocal cancelled
+                target_s = url.normalized_url if isinstance(url, NormalizedURL) else url
+                if "www." in target_s:
+                    cancelled = True
+                return RobotsDecision(
+                    target_url=target_s,
+                    decision=RobotsDecisionCode.ALLOWED,
+                    crawl_delay=None,
+                    reason="Allowed",
+                )
+
+        orchestrator = SiteScanOrchestrator(
+            fetcher=fetcher,
+            robots_evaluator=CancellingRobots(),
+            cancellation_checker=cancel_check,
+        )
+        res = await orchestrator.scan(start_url)
+        assert res.outcome == SiteScanOutcome.CANCELLED
+        assert var_url not in fetcher.fetched_urls
+
+    asyncio.run(_test())
+
+
+def test_fallback_email_only_on_fallback_homepage() -> None:
+    """Email found only on fallback homepage is correctly extracted with clean page metadata."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+        var_html = "<html><body>Contact us: fallback_sales@acme.org</body></html>"
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_url: FetchResult(
+                    final_url=var_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        assert len(res.email_findings) == 1
+        assert res.email_findings[0].canonical_email == "fallback_sales@acme.org"
+        assert res.page_records[0].requested_url == start_url
+        assert res.page_records[0].emails_found_count == 0
+        assert res.page_records[1].requested_url == var_url
+        assert res.page_records[1].emails_found_count == 1
+        assert res.page_records[1].final_url == var_url
+
+    asyncio.run(_test())
+
+
+def test_fallback_email_on_fallback_contact_page() -> None:
+    """Fallback links are discovered and crawled, finding emails on fallback subpages."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        var_contact_url = "https://www.acme.org/contact"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+        var_home_html = '<html><body><a href="/contact">Contact</a></body></html>'
+        var_contact_html = "<html><body>Email: fallback_support@acme.org</body></html>"
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_url: FetchResult(
+                    final_url=var_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_home_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_contact_url: FetchResult(
+                    final_url=var_contact_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_contact_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        assert len(res.email_findings) == 1
+        assert res.email_findings[0].canonical_email == "fallback_support@acme.org"
+        assert any(p.requested_url == var_contact_url for p in res.page_records)
+
+    asyncio.run(_test())
+
+
+def test_fallback_same_email_on_both_variants_no_double_count() -> None:
+    """Same email found on both original and fallback variants is aggregated exactly once."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        orig_html = "<html><head><title>Index of /</title></head><body>info@acme.org</body></html>"
+        var_html = "<html><body>Welcome! Contact: info@acme.org</body></html>"
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=orig_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_url: FetchResult(
+                    final_url=var_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        assert len(res.email_findings) == 1
+        assert res.statistics.accepted_email_findings == 1
+        assert res.email_findings[0].canonical_email == "info@acme.org"
+
+    asyncio.run(_test())
+
+
+def test_fallback_with_malformed_links_handled_safely() -> None:
+    """Fallback page containing malformed or unparseable links does not crash."""
+
+    async def _test() -> None:
+        start_url = "https://acme.org/"
+        var_url = "https://www.acme.org/"
+        placeholder_html = (
+            "<html><head><title>Index of /</title></head><body>Directory Index</body></html>"
+        )
+        var_html = (
+            "<html><body>"
+            '<a href="javascript:void(0)">JS</a>'
+            '<a href="http://:invalid">Invalid Port</a>'
+            '<a href="mailto:sales@acme.org">Mail</a>'
+            '<a href="/valid-team">Team</a>'
+            "</body></html>"
+        )
+
+        fetcher = MockHTTPFetcher(
+            {
+                start_url: FetchResult(
+                    final_url=start_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=placeholder_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                var_url: FetchResult(
+                    final_url=var_url,
+                    status_code=200,
+                    content_type="text/html",
+                    body_text=var_html,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+                "https://www.acme.org/valid-team": FetchResult(
+                    final_url="https://www.acme.org/valid-team",
+                    status_code=200,
+                    content_type="text/html",
+                    body_text="<html><body>team@acme.org</body></html>",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                ),
+            }
+        )
+        robots = MockRobotsEvaluator()
+        orchestrator = SiteScanOrchestrator(fetcher=fetcher, robots_evaluator=robots)
+        res = await orchestrator.scan(start_url)
+
+        assert res.outcome == SiteScanOutcome.COMPLETED
+        emails = {f.canonical_email for f in res.email_findings}
+        assert "sales@acme.org" in emails or "team@acme.org" in emails
+
+    asyncio.run(_test())

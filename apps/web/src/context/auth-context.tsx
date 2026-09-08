@@ -1,7 +1,8 @@
 'use client';
 
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import {
+  ApiError,
   AuthSuccessResponse,
   LoginRequest,
   OrganizationSchema,
@@ -21,7 +22,7 @@ import {
   setOnSessionExpired,
 } from '@/lib/api-client';
 
-type AuthStatus = 'idle' | 'loading' | 'authenticated' | 'unauthenticated';
+export type AuthStatus = 'idle' | 'loading' | 'authenticated' | 'unauthenticated' | 'restoration_failed';
 
 interface AuthContextType {
   user: UserSchema | null;
@@ -32,6 +33,7 @@ interface AuthContextType {
   logout: () => Promise<void>;
   logoutAll: () => Promise<void>;
   refreshSession: () => Promise<void>;
+  retrySession: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -44,11 +46,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [organization, setOrganization] = useState<OrganizationSchema | null>(null);
   const [status, setStatus] = useState<AuthStatus>('loading');
 
+  const hasAttemptedRefresh = useRef(false);
+  const hasAmbiguousRefreshOutcome = useRef(false);
+
   const clearAuthState = useCallback(() => {
     setAccessToken(null);
     setUser(null);
     setOrganization(null);
     setStatus('unauthenticated');
+    hasAmbiguousRefreshOutcome.current = false;
   }, []);
 
   const broadcastLogout = useCallback(() => {
@@ -90,15 +96,61 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setStatus('authenticated');
   }, []);
 
+  const inFlightRefreshPromiseRef = useRef<Promise<void> | null>(null);
+
+  const executeSessionRestoration = useCallback(
+    async (isRetry = false) => {
+      if (inFlightRefreshPromiseRef.current) {
+        return inFlightRefreshPromiseRef.current;
+      }
+
+      if (hasAmbiguousRefreshOutcome.current && !isRetry) {
+        return;
+      }
+
+      const promise = (async () => {
+        try {
+          setStatus('loading');
+          hasAmbiguousRefreshOutcome.current = false;
+
+          const token = getAccessToken();
+          if (token) {
+            await fetchAndSetProfile();
+          } else {
+            await performSilentRefresh();
+            await fetchAndSetProfile();
+          }
+        } catch (err) {
+          const isConfirmed401 = err instanceof ApiError && err.status === 401;
+
+          if (isConfirmed401) {
+            clearAuthState();
+          } else {
+            hasAmbiguousRefreshOutcome.current = true;
+            if (user) {
+              setStatus('authenticated');
+            } else {
+              setStatus('restoration_failed');
+            }
+          }
+        } finally {
+          inFlightRefreshPromiseRef.current = null;
+        }
+      })();
+
+      inFlightRefreshPromiseRef.current = promise;
+      return promise;
+    },
+    [clearAuthState, fetchAndSetProfile, user]
+  );
+
   const refreshSession = useCallback(async () => {
-    try {
-      setStatus('loading');
-      await performSilentRefresh();
-      await fetchAndSetProfile();
-    } catch {
-      clearAuthState();
-    }
-  }, [clearAuthState, fetchAndSetProfile]);
+    await executeSessionRestoration(false);
+  }, [executeSessionRestoration]);
+
+  const retrySession = useCallback(async () => {
+    await executeSessionRestoration(true);
+  }, [executeSessionRestoration]);
 
   // Initial silent refresh on app mount and multi-tab logout event listeners
   useEffect(() => {
@@ -129,7 +181,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
-    // 2. Storage event listener fallback
+    // 2. Storage event marker fallback
     const onStorageChange = (event: StorageEvent) => {
       if (event.key === LOGOUT_STORAGE_KEY && event.newValue) {
         handleLogoutEvent();
@@ -140,7 +192,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.addEventListener('storage', onStorageChange);
     }
 
-    refreshSession();
+    if (!hasAttemptedRefresh.current) {
+      hasAttemptedRefresh.current = true;
+      refreshSession();
+    }
 
     return () => {
       isMounted = false;
@@ -160,12 +215,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return res;
     }
     const successRes = res as AuthSuccessResponse;
+    hasAmbiguousRefreshOutcome.current = false;
     await fetchAndSetProfile();
     return successRes;
   };
 
   const register = async (payload: RegisterRequest): Promise<AuthSuccessResponse> => {
     const res = await registerUser(payload);
+    hasAmbiguousRefreshOutcome.current = false;
     await fetchAndSetProfile();
     return res;
   };
@@ -199,6 +256,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         logout,
         logoutAll,
         refreshSession,
+        retrySession,
       }}
     >
       {children}

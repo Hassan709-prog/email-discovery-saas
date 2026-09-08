@@ -15,6 +15,9 @@ import {
   ScanURLApiResponse,
 } from '@/types/api';
 import {
+  approveUrlRedirect,
+  bulkApproveUrlRedirects,
+  bulkRejectUrlRedirects,
   cancelScanJob,
   downloadScanJobCsv,
   getScanJob,
@@ -30,6 +33,7 @@ import {
   AlertCircle,
   Play,
   Ban,
+  Check,
   FileText,
   Download,
   Mail,
@@ -54,6 +58,20 @@ export default function JobDetailPage() {
   const [urls, setUrls] = useState<ScanURLApiResponse[]>([]);
   const [urlsNextCursor, setUrlsNextCursor] = useState<string | null>(null);
   const [isLoadingUrls, setIsLoadingUrls] = useState(false);
+  const [urlsFilter, setUrlsFilter] = useState<'ALL' | 'PENDING_APPROVAL'>('ALL');
+
+  // Bulk Redirect Selection state
+  const [selectedUrlIds, setSelectedUrlIds] = useState<Set<string>>(new Set());
+  const [isBulkOperating, setIsBulkOperating] = useState(false);
+  const [bulkActionModal, setBulkActionModal] = useState<{
+    action: 'APPROVE' | 'REJECT';
+    targetIds: string[];
+  } | null>(null);
+  const [rejectingUrlId, setRejectingUrlId] = useState<string | null>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
+  const triggerElementRef = useRef<HTMLElement | null>(null);
+  const [urlsTotalCount, setUrlsTotalCount] = useState<number | null>(null);
 
   // Results & Findings state
   const [results, setResults] = useState<ScanJobResultItemApiResponse[]>([]);
@@ -86,12 +104,200 @@ export default function JobDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [approvingUrlId, setApprovingUrlId] = useState<string | null>(null);
+
+  // Dialog keyboard focus management (initial focus and restoration)
+  useEffect(() => {
+    if (bulkActionModal) {
+      if (!triggerElementRef.current && document.activeElement instanceof HTMLElement) {
+        triggerElementRef.current = document.activeElement;
+      }
+      const t = setTimeout(() => {
+        cancelButtonRef.current?.focus();
+      }, 50);
+      return () => clearTimeout(t);
+    } else if (triggerElementRef.current) {
+      const el = triggerElementRef.current;
+      triggerElementRef.current = null;
+      el.focus();
+    }
+  }, [bulkActionModal]);
+
+  const handleModalKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      if (!isBulkOperating) {
+        setBulkActionModal(null);
+      }
+      return;
+    }
+    if (e.key === 'Tab') {
+      const focusable = [cancelButtonRef.current, confirmButtonRef.current].filter(Boolean) as HTMLElement[];
+      if (focusable.length < 2) return;
+      if (e.shiftKey) {
+        if (document.activeElement === focusable[0]) {
+          e.preventDefault();
+          focusable[focusable.length - 1]?.focus();
+        }
+      } else {
+        if (document.activeElement === focusable[focusable.length - 1]) {
+          e.preventDefault();
+          focusable[0]?.focus();
+        }
+      }
+    }
+  };
+
+  const handleApproveRedirect = async (urlId: string, targetDomain: string) => {
+    try {
+      setApprovingUrlId(urlId);
+      await approveUrlRedirect(jobId, urlId, targetDomain);
+      setSelectedUrlIds((prev) => {
+        const next = new Set(prev);
+        next.delete(urlId);
+        return next;
+      });
+      await fetchJobDetail();
+    } catch (err: any) {
+      setError(
+        err instanceof ApiError
+          ? err
+          : new ApiError(500, {
+              code: 'APPROVE_FAILED',
+              message: err.message || 'Failed to approve redirect',
+            })
+      );
+    } finally {
+      setApprovingUrlId(null);
+    }
+  };
+
+  const handleSingleReject = async (urlId: string) => {
+    try {
+      setRejectingUrlId(urlId);
+      await bulkRejectUrlRedirects(jobId, { url_ids: [urlId] });
+      setSelectedUrlIds((prev) => {
+        const next = new Set(prev);
+        next.delete(urlId);
+        return next;
+      });
+      await fetchJobDetail();
+    } catch (err: any) {
+      setError(
+        err instanceof ApiError
+          ? err
+          : new ApiError(500, {
+              code: 'REJECT_FAILED',
+              message: err.message || 'Failed to reject redirect',
+            })
+      );
+    } finally {
+      setRejectingUrlId(null);
+    }
+  };
+
+  const handleConfirmBulkAction = async () => {
+    if (!bulkActionModal || !jobId) return;
+    const ids = bulkActionModal.targetIds;
+    if (ids.length === 0) {
+      setBulkActionModal(null);
+      return;
+    }
+
+    setIsBulkOperating(true);
+    try {
+      if (bulkActionModal.action === 'APPROVE') {
+        await bulkApproveUrlRedirects(jobId, { url_ids: ids });
+      } else {
+        await bulkRejectUrlRedirects(jobId, { url_ids: ids });
+      }
+      setSelectedUrlIds((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) {
+          next.delete(id);
+        }
+        return next;
+      });
+      setBulkActionModal(null);
+      await fetchJobDetail();
+    } catch (err: any) {
+      // Retain only still-valid selections on failure
+      const validPendingIds = new Set(
+        urls.filter((u) => u.requires_redirect_approval).map((u) => u.id)
+      );
+      setSelectedUrlIds((prev) => {
+        const next = new Set<string>();
+        for (const id of prev) {
+          if (validPendingIds.has(id)) {
+            next.add(id);
+          }
+        }
+        return next;
+      });
+      setBulkActionModal(null);
+      setError(
+        err instanceof ApiError
+          ? err
+          : new ApiError(500, {
+              code:
+                bulkActionModal.action === 'APPROVE'
+                  ? 'BULK_APPROVE_FAILED'
+                  : 'BULK_REJECT_FAILED',
+              message: err.message || `Failed to ${bulkActionModal.action.toLowerCase()} redirects`,
+            })
+      );
+    } finally {
+      setIsBulkOperating(false);
+    }
+  };
 
   // AbortControllers and request generation tracking to discard stale responses
   const progressAbortRef = useRef<AbortController | null>(null);
   const resultsAbortRef = useRef<AbortController | null>(null);
   const resultsGenRef = useRef(0);
   const isPollingRef = useRef(false);
+
+  const fetchUrls = useCallback(
+    async (filter: 'ALL' | 'PENDING_APPROVAL', cursor?: string | null, append = false) => {
+      if (!jobId) return;
+      try {
+        setIsLoadingUrls(true);
+        const res = await listScanJobUrls(jobId, {
+          limit: 50,
+          cursor: cursor || undefined,
+          requires_redirect_approval: filter === 'PENDING_APPROVAL' ? true : undefined,
+        });
+        if (res.total_count !== undefined && res.total_count !== null) {
+          setUrlsTotalCount(res.total_count);
+        }
+        setUrls((prev) => {
+          if (!append) return res.items;
+          const existingIds = new Set(prev.map((u) => u.id));
+          const newItems = res.items.filter((u) => !existingIds.has(u.id));
+          return [...prev, ...newItems];
+        });
+        setUrlsNextCursor(res.next_cursor);
+        // Prune stale selected IDs that no longer require approval among loaded rows
+        if (!append) {
+          const loadedMap = new Map(res.items.map((u) => [u.id, u]));
+          setSelectedUrlIds((prev) => {
+            const next = new Set<string>();
+            for (const id of prev) {
+              const item = loadedMap.get(id);
+              if (!item || item.requires_redirect_approval) {
+                next.add(id);
+              }
+            }
+            return next;
+          });
+        }
+      } catch (err) {
+        if (err instanceof ApiError) setError(err);
+      } finally {
+        setIsLoadingUrls(false);
+      }
+    },
+    [jobId]
+  );
 
   // Fetch scan job detail
   const fetchJobDetail = useCallback(async () => {
@@ -101,11 +307,29 @@ export default function JobDetailPage() {
       setError(null);
       const [jobData, urlsData] = await Promise.all([
         getScanJob(jobId),
-        listScanJobUrls(jobId, { limit: 50 }),
+        listScanJobUrls(jobId, {
+          limit: 50,
+          requires_redirect_approval: urlsFilter === 'PENDING_APPROVAL' ? true : undefined,
+        }),
       ]);
       setJob(jobData);
       setUrls(urlsData.items);
       setUrlsNextCursor(urlsData.next_cursor);
+      if (urlsData.total_count !== undefined && urlsData.total_count !== null) {
+        setUrlsTotalCount(urlsData.total_count);
+      }
+      // Prune stale selected IDs that no longer require approval among loaded rows
+      const loadedMap = new Map(urlsData.items.map((u) => [u.id, u]));
+      setSelectedUrlIds((prev) => {
+        const next = new Set<string>();
+        for (const id of prev) {
+          const item = loadedMap.get(id);
+          if (!item || item.requires_redirect_approval) {
+            next.add(id);
+          }
+        }
+        return next;
+      });
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err);
@@ -115,7 +339,7 @@ export default function JobDetailPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [jobId]);
+  }, [jobId, urlsFilter]);
 
   const isLoadingMoreResultsRef = useRef(false);
 
@@ -238,17 +462,15 @@ export default function JobDetailPage() {
 
   const refreshUrls = useCallback(async () => {
     if (!jobId) return;
-    try {
-      setIsLoadingUrls(true);
-      const res = await listScanJobUrls(jobId, { limit: 50 });
-      setUrls(res.items);
-      setUrlsNextCursor(res.next_cursor);
-    } catch (err) {
-      if (err instanceof ApiError) setError(err);
-    } finally {
-      setIsLoadingUrls(false);
-    }
-  }, [jobId]);
+    await fetchUrls(urlsFilter, null, false);
+  }, [jobId, urlsFilter, fetchUrls]);
+
+  const handleUrlsFilterChange = (filter: 'ALL' | 'PENDING_APPROVAL') => {
+    setUrlsFilter(filter);
+    setSelectedUrlIds(new Set());
+    setUrlsNextCursor(null);
+    fetchUrls(filter, null, false);
+  };
 
   // Polling effect: Polls ONLY /progress for active statuses (QUEUED, RUNNING, CANCELLING)
   useEffect(() => {
@@ -304,18 +526,8 @@ export default function JobDetailPage() {
     if (!jobId || !urlsNextCursor || isLoadingUrls || isLoadingMoreUrlsRef.current) return;
     try {
       isLoadingMoreUrlsRef.current = true;
-      setIsLoadingUrls(true);
-      const res = await listScanJobUrls(jobId, { limit: 50, cursor: urlsNextCursor });
-      setUrls((prev) => {
-        const existingIds = new Set(prev.map((u) => u.id));
-        const newItems = res.items.filter((u) => !existingIds.has(u.id));
-        return [...prev, ...newItems];
-      });
-      setUrlsNextCursor(res.next_cursor);
-    } catch (err) {
-      if (err instanceof ApiError) setError(err);
+      await fetchUrls(urlsFilter, urlsNextCursor, true);
     } finally {
-      setIsLoadingUrls(false);
       isLoadingMoreUrlsRef.current = false;
     }
   };
@@ -809,118 +1021,430 @@ export default function JobDetailPage() {
         )}
 
         {/* Tab Content: URLS */}
-        {activeTab === 'URLS' && (
-          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden space-y-4 p-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex items-center space-x-2">
-                <FileText className="w-5 h-5 text-slate-500" />
-                <h3 className="text-base font-bold text-slate-900">Target URLs ({job.total_input_count})</h3>
-              </div>
-              <button
-                onClick={refreshUrls}
-                disabled={isLoadingUrls}
-                className="inline-flex items-center text-xs font-medium text-slate-600 hover:text-slate-900 px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors shrink-0"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isLoadingUrls ? 'animate-spin' : ''}`} />
-                Refresh URL List
-              </button>
-            </div>
+        {activeTab === 'URLS' && (() => {
+          const loadedPendingUrls = urls.filter((u) => u.requires_redirect_approval);
+          const loadedPendingCount = loadedPendingUrls.length;
+          const selectedPendingCount = loadedPendingUrls.filter((u) => selectedUrlIds.has(u.id)).length;
+          const isAllLoadedPendingSelected =
+            loadedPendingCount > 0 && selectedPendingCount === loadedPendingCount;
+          const isIndeterminate =
+            selectedPendingCount > 0 && selectedPendingCount < loadedPendingCount;
 
-            {/* Non-technical input count explanation summary card */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs">
-              <p className="font-semibold text-slate-700">
-                Showing {urls.length} of {job.total_input_count}
-              </p>
-              <div className="flex flex-wrap items-center gap-3 text-slate-600 font-medium">
-                <span>Submitted inputs: <strong className="text-slate-900">{job.total_input_count}</strong></span>
-                <span>Unique valid websites: <strong className="text-emerald-700">{job.valid_input_count}</strong></span>
-                <span>Duplicate inputs: <strong className="text-slate-700">{job.duplicate_input_count}</strong></span>
-                <span>Displayed rows: <strong className="text-slate-900">{urls.length}</strong></span>
-              </div>
-            </div>
-
-            {urls.length === 0 ? (
-              <div className="p-8 text-center text-sm text-slate-500">No URL rows loaded.</div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600 uppercase tracking-wider font-sans">
-                      <th className="px-4 py-3">#</th>
-                      <th className="px-4 py-3">Original Input</th>
-                      <th className="px-4 py-3">Normalized Domain</th>
-                      <th className="px-4 py-3">Outcome</th>
-                      <th className="px-4 py-3">Selected Email</th>
-                      <th className="px-4 py-3">Duration & Retries</th>
-                      <th className="px-4 py-3">Failure Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-200 text-xs font-mono">
-                    {urls.map((u) => (
-                      <tr key={u.id} className="hover:bg-slate-50">
-                        <td className="px-4 py-3 text-slate-500 font-sans font-semibold">{u.original_index + 1}</td>
-                        <td className="px-4 py-3 text-slate-900 whitespace-pre-wrap break-all">{u.original_input}</td>
-                        <td className="px-4 py-3 text-slate-600">{u.normalized_domain || '—'}</td>
-                        <td className="px-4 py-3 font-sans">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
-                              u.status === 'COMPLETED'
-                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                : u.status === 'NO_EMAIL'
-                                ? 'bg-amber-50 text-amber-700 border-amber-200'
-                                : u.status === 'FAILED'
-                                ? 'bg-rose-50 text-rose-700 border-rose-200'
-                                : u.status === 'CANCELLED'
-                                ? 'bg-slate-100 text-slate-600 border-slate-200'
-                                : 'bg-slate-100 text-slate-700 border-slate-200'
-                            }`}
-                          >
-                            {u.plain_language_outcome || u.status}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 font-sans">
-                          {u.selected_primary_email ? (
-                            <span className="inline-flex items-center px-2 py-0.5 bg-blue-50 text-blue-700 font-semibold border border-blue-200 rounded text-[11px]">
-                              <Mail className="w-3 h-3 mr-1 text-blue-500" />
-                              {u.selected_primary_email}
-                            </span>
-                          ) : (
-                            <span className="text-slate-400 font-sans">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-3 font-sans text-slate-600">
-                          {u.processing_duration_seconds !== undefined && u.processing_duration_seconds !== null ? (
-                            <span>
-                              {u.processing_duration_seconds.toFixed(2)}s
-                              {u.retry_count ? <span className="text-slate-400 ml-1">({u.retry_count} retries)</span> : null}
-                            </span>
-                          ) : (
-                            '—'
-                          )}
-                        </td>
-                        <td className="px-4 py-3 font-sans text-rose-700">
-                          {u.failure_reason || u.last_error_code || '—'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {urlsNextCursor && (
-              <div className="text-center pt-2">
+          return (
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden space-y-4 p-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center space-x-2">
+                  <FileText className="w-5 h-5 text-slate-500" />
+                  <h3 className="text-base font-bold text-slate-900">
+                    Target URLs ({job.total_input_count})
+                  </h3>
+                </div>
                 <button
-                  onClick={loadMoreUrls}
+                  onClick={refreshUrls}
                   disabled={isLoadingUrls}
-                  className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors"
+                  className="inline-flex items-center text-xs font-medium text-slate-600 hover:text-slate-900 px-3 py-1.5 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors shrink-0"
                 >
-                  {isLoadingUrls ? 'Loading...' : 'Load More URLs'}
+                  <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isLoadingUrls ? 'animate-spin' : ''}`} />
+                  Refresh URL List
                 </button>
               </div>
-            )}
-          </div>
-        )}
+
+              {/* URLs Filter Bar */}
+              <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 pb-3">
+                <button
+                  type="button"
+                  onClick={() => handleUrlsFilterChange('ALL')}
+                  disabled={isLoadingUrls}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+                    urlsFilter === 'ALL'
+                      ? 'bg-slate-900 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  All URLs ({job.total_input_count})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleUrlsFilterChange('PENDING_APPROVAL')}
+                  disabled={isLoadingUrls}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors flex items-center space-x-1.5 ${
+                    urlsFilter === 'PENDING_APPROVAL'
+                      ? 'bg-amber-700 text-white shadow-sm'
+                      : 'bg-amber-50 text-amber-800 border border-amber-200 hover:bg-amber-100'
+                  }`}
+                >
+                  <span>Pending Redirect Approvals</span>
+                </button>
+              </div>
+
+              {/* Bulk Action Toolbar */}
+              {selectedUrlIds.size > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-blue-50/80 border border-blue-200 rounded-xl text-xs">
+                  <div className="flex items-center space-x-2">
+                    <span className="font-bold text-blue-950">
+                      {selectedUrlIds.size} pending redirect{selectedUrlIds.size === 1 ? '' : 's'} selected
+                    </span>
+                    {selectedUrlIds.size >= 250 && (
+                      <span className="text-amber-800 font-semibold bg-amber-100/80 px-2 py-0.5 rounded text-[11px]">
+                        Batch limit of 250 reached
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        triggerElementRef.current = e.currentTarget;
+                        const validSnapshot = urls
+                          .filter((u) => u.requires_redirect_approval && selectedUrlIds.has(u.id))
+                          .map((u) => u.id);
+                        if (validSnapshot.length === 0) return;
+                        setBulkActionModal({ action: 'APPROVE', targetIds: validSnapshot });
+                      }}
+                      disabled={isBulkOperating || bulkActionModal !== null}
+                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center"
+                    >
+                      <Check className="w-3.5 h-3.5 mr-1.5" />
+                      Approve Selected ({selectedUrlIds.size})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        triggerElementRef.current = e.currentTarget;
+                        const validSnapshot = urls
+                          .filter((u) => u.requires_redirect_approval && selectedUrlIds.has(u.id))
+                          .map((u) => u.id);
+                        if (validSnapshot.length === 0) return;
+                        setBulkActionModal({ action: 'REJECT', targetIds: validSnapshot });
+                      }}
+                      disabled={isBulkOperating || bulkActionModal !== null}
+                      className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center"
+                    >
+                      <Ban className="w-3.5 h-3.5 mr-1.5" />
+                      Reject Selected ({selectedUrlIds.size})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedUrlIds(new Set())}
+                      disabled={isBulkOperating || bulkActionModal !== null}
+                      className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-medium text-xs rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      Clear Selection
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Non-technical input count explanation summary card */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs">
+                <p className="font-semibold text-slate-700">
+                  Showing {urls.length} of{' '}
+                  {urlsFilter === 'PENDING_APPROVAL'
+                    ? (urlsTotalCount ?? urls.length)
+                    : (urlsTotalCount ?? job.total_input_count)}
+                </p>
+                <div className="flex flex-wrap items-center gap-3 text-slate-600 font-medium">
+                  <span>
+                    Submitted inputs: <strong className="text-slate-900">{job.total_input_count}</strong>
+                  </span>
+                  <span>
+                    Unique valid websites: <strong className="text-emerald-700">{job.valid_input_count}</strong>
+                  </span>
+                  <span>
+                    Duplicate inputs: <strong className="text-slate-700">{job.duplicate_input_count}</strong>
+                  </span>
+                  <span>
+                    Displayed rows: <strong className="text-slate-900">{urls.length}</strong>
+                  </span>
+                </div>
+              </div>
+
+              {urls.length === 0 ? (
+                <div className="p-8 text-center text-sm text-slate-500">
+                  {urlsFilter === 'PENDING_APPROVAL'
+                    ? 'No URLs requiring redirect approval found.'
+                    : 'No URL rows loaded.'}
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-600 uppercase tracking-wider font-sans">
+                        <th className="px-3 py-3 w-10 text-center">
+                          <div className="flex items-center justify-center">
+                            <input
+                              type="checkbox"
+                              id="select-all-loaded-pending"
+                              aria-label="Select all loaded pending redirects"
+                              title="Select all loaded pending redirects"
+                              ref={(el) => {
+                                if (el) {
+                                  el.indeterminate = isIndeterminate;
+                                }
+                              }}
+                              checked={isAllLoadedPendingSelected}
+                              disabled={loadedPendingCount === 0 || isBulkOperating || bulkActionModal !== null}
+                              onChange={() => {
+                                if (isAllLoadedPendingSelected) {
+                                  setSelectedUrlIds((prev) => {
+                                    const next = new Set(prev);
+                                    for (const u of loadedPendingUrls) {
+                                      next.delete(u.id);
+                                    }
+                                    return next;
+                                  });
+                                } else {
+                                  setSelectedUrlIds((prev) => {
+                                    const next = new Set(prev);
+                                    for (const u of loadedPendingUrls) {
+                                      if (next.size >= 250) break;
+                                      next.add(u.id);
+                                    }
+                                    return next;
+                                  });
+                                }
+                              }}
+                              className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                            />
+                            <label htmlFor="select-all-loaded-pending" className="sr-only">
+                              Select all loaded pending redirects
+                            </label>
+                          </div>
+                        </th>
+                        <th className="px-3 py-3">#</th>
+                        <th className="px-4 py-3">Original Input</th>
+                        <th className="px-4 py-3">Normalized Domain</th>
+                        <th className="px-4 py-3">Outcome</th>
+                        <th className="px-4 py-3">Selected Email</th>
+                        <th className="px-4 py-3">Duration & Retries</th>
+                        <th className="px-4 py-3">Failure Reason</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 text-xs font-mono">
+                      {urls.map((u) => (
+                        <tr key={u.id} className="hover:bg-slate-50">
+                          <td className="px-3 py-3 text-center">
+                            {u.requires_redirect_approval ? (
+                              <input
+                                type="checkbox"
+                                aria-label={`Select redirect for ${u.normalized_domain || u.original_input}`}
+                                checked={selectedUrlIds.has(u.id)}
+                                disabled={isBulkOperating || bulkActionModal !== null}
+                                onChange={() => {
+                                  setSelectedUrlIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(u.id)) {
+                                      next.delete(u.id);
+                                    } else {
+                                      if (next.size >= 250) {
+                                        return prev;
+                                      }
+                                      next.add(u.id);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                                className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer disabled:opacity-40"
+                              />
+                            ) : (
+                              <span className="text-slate-300 text-xs">—</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-3 text-slate-500 font-sans font-semibold">
+                            {u.original_index + 1}
+                          </td>
+                          <td className="px-4 py-3 text-slate-900 whitespace-pre-wrap break-all">
+                            {u.original_input}
+                          </td>
+                          <td className="px-4 py-3 text-slate-600">{u.normalized_domain || '—'}</td>
+                          <td className="px-4 py-3 font-sans">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
+                                u.status === 'COMPLETED'
+                                  ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                  : u.status === 'NO_EMAIL'
+                                  ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                  : u.status === 'FAILED'
+                                  ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                  : u.status === 'CANCELLED'
+                                  ? 'bg-slate-100 text-slate-600 border-slate-200'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200'
+                              }`}
+                            >
+                              {u.plain_language_outcome || u.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 font-sans">
+                            {u.selected_primary_email ? (
+                              <span className="inline-flex items-center px-2 py-0.5 bg-blue-50 text-blue-700 font-semibold border border-blue-200 rounded text-[11px]">
+                                <Mail className="w-3 h-3 mr-1 text-blue-500" />
+                                {u.selected_primary_email}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 font-sans">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 font-sans text-slate-600">
+                            {u.processing_duration_seconds !== undefined &&
+                            u.processing_duration_seconds !== null ? (
+                              <span>
+                                {u.processing_duration_seconds.toFixed(2)}s
+                                {u.retry_count ? (
+                                  <span className="text-slate-400 ml-1">({u.retry_count} retries)</span>
+                                ) : null}
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="px-4 py-3 font-sans text-rose-700">
+                            {u.requires_redirect_approval && u.redirect_target_domain ? (
+                              <div className="flex flex-col gap-1.5 py-1">
+                                <div className="text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5">
+                                  Redirected to business domain:{' '}
+                                  <span className="font-bold underline">{u.redirect_target_domain}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleApproveRedirect(u.id, u.redirect_target_domain!)
+                                    }
+                                    disabled={
+                                      approvingUrlId === u.id ||
+                                      isBulkOperating ||
+                                      bulkActionModal !== null ||
+                                      !u.can_approve_redirect
+                                    }
+                                    className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[11px] rounded shadow-sm disabled:opacity-50 transition-colors"
+                                  >
+                                    {approvingUrlId === u.id ? 'Approving...' : 'Approve & Retry'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleSingleReject(u.id)}
+                                    disabled={rejectingUrlId === u.id || isBulkOperating || bulkActionModal !== null}
+                                    className="px-2.5 py-1 bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 font-semibold text-[11px] rounded shadow-sm disabled:opacity-50 transition-colors"
+                                  >
+                                    {rejectingUrlId === u.id ? 'Rejecting...' : 'Reject'}
+                                  </button>
+                                  <span className="text-[11px] text-slate-500 italic">
+                                    Keep blocked
+                                  </span>
+                                </div>
+                              </div>
+                            ) : (
+                              u.failure_reason || u.last_error_code || '—'
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {urlsNextCursor && (
+                <div className="text-center pt-2">
+                  <button
+                    onClick={loadMoreUrls}
+                    disabled={isLoadingUrls}
+                    className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors"
+                  >
+                    {isLoadingUrls ? 'Loading...' : 'Load More URLs'}
+                  </button>
+                </div>
+              )}
+
+              {/* Bulk Action Confirmation Modal */}
+              {bulkActionModal && (
+                <div
+                  className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="bulk-action-dialog-title"
+                  onKeyDown={handleModalKeyDown}
+                >
+                  <div className="bg-white rounded-xl shadow-xl border border-slate-200 max-w-md w-full p-6 space-y-4">
+                    <div className="flex items-center space-x-3">
+                      <div
+                        className={`p-2.5 rounded-full ${
+                          bulkActionModal.action === 'APPROVE'
+                            ? 'bg-emerald-100 text-emerald-700'
+                            : 'bg-rose-100 text-rose-700'
+                        }`}
+                      >
+                        {bulkActionModal.action === 'APPROVE' ? (
+                          <Check className="w-5 h-5" />
+                        ) : (
+                          <Ban className="w-5 h-5" />
+                        )}
+                      </div>
+                      <div>
+                        <h4 id="bulk-action-dialog-title" className="text-base font-bold text-slate-900">
+                          {bulkActionModal.action === 'APPROVE'
+                            ? 'Approve Selected Redirects'
+                            : 'Reject Selected Redirects'}
+                        </h4>
+                        <p className="text-xs text-slate-500">
+                          {bulkActionModal.targetIds.length} redirect{bulkActionModal.targetIds.length === 1 ? '' : 's'} selected
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="text-xs text-slate-600 bg-slate-50 p-3 rounded-lg border border-slate-200 space-y-1.5">
+                      {bulkActionModal.action === 'APPROVE' ? (
+                        <p>
+                          You are approving <strong>{bulkActionModal.targetIds.length}</strong> out-of-scope domain redirect(s).
+                          The scanner will allow crawling the destination domains and retry email discovery for these URLs.
+                        </p>
+                      ) : (
+                        <p>
+                          You are rejecting <strong>{bulkActionModal.targetIds.length}</strong> out-of-scope domain redirect(s).
+                          These URLs will be permanently marked as rejected and will remain stopped.
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-end space-x-3 pt-2">
+                      <button
+                        type="button"
+                        ref={cancelButtonRef}
+                        onClick={() => setBulkActionModal(null)}
+                        disabled={isBulkOperating}
+                        className="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        ref={confirmButtonRef}
+                        onClick={handleConfirmBulkAction}
+                        disabled={isBulkOperating}
+                        className={`px-4 py-2 text-white font-semibold text-xs rounded-lg shadow-sm disabled:opacity-50 transition-colors inline-flex items-center ${
+                          bulkActionModal.action === 'APPROVE'
+                            ? 'bg-emerald-600 hover:bg-emerald-700'
+                            : 'bg-rose-600 hover:bg-rose-700'
+                        }`}
+                      >
+                        {isBulkOperating ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                            Processing...
+                          </>
+                        ) : bulkActionModal.action === 'APPROVE' ? (
+                          'Confirm Approval'
+                        ) : (
+                          'Confirm Rejection'
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Evidence Panel Slide-over Drawer */}
         <EvidencePanel

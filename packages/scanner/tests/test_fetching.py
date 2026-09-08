@@ -1,6 +1,8 @@
 """Tests for scanner-core AsyncHTTPFetcher."""
 
 import asyncio
+import ssl
+from typing import Any
 
 import httpx
 import pytest
@@ -11,10 +13,18 @@ from email_scanner.errors import (
     FetchOutcomeCode,
     HostSafetyError,
     HostSafetyErrorCode,
+    SiteScanFailureCode,
 )
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
-from email_scanner.models import FetchConfig, HostType, NormalizedURL
+from email_scanner.models import (
+    FetchConfig,
+    HostType,
+    NormalizedURL,
+    RetryPolicy,
+    SiteScanDiagnosticRecorder,
+)
+from email_scanner.request_gate import DomainRequestGate
 
 
 class FakeDNSResolver:
@@ -157,6 +167,34 @@ def test_transport_error_classification() -> None:
     asyncio.run(_test())
 
 
+def test_wrapped_tls_verification_error_is_terminal() -> None:
+    """A certificate error wrapped by HTTPX must not become a retryable transport error."""
+
+    async def _test() -> None:
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            certificate_error = ssl.SSLCertVerificationError(
+                1, "certificate verify failed: unable to get local issuer certificate"
+            )
+            raise httpx.ConnectError(
+                "TLS connection failed", request=request
+            ) from certificate_error
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
+
+        result = await fetcher.fetch("https://example.com/certificate-error")
+
+        assert result.outcome == FetchOutcomeCode.TLS_VERIFICATION_FAILED
+        assert result.error_message == "TLS certificate verification failed"
+        assert request_count == 1
+
+    asyncio.run(_test())
+
+
 def test_relative_and_absolute_redirect_success() -> None:
     async def _test() -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -262,5 +300,559 @@ def test_non_2xx_http_error_preserves_status_code() -> None:
         assert result.outcome == FetchOutcomeCode.HTTP_ERROR
         assert result.status_code == 404
         assert result.body_text == "<html>Not Found</html>"
+
+    asyncio.run(_test())
+
+
+def test_redirect_without_retry_records_zero_retries() -> None:
+    """Redirecting once and succeeding without retry must produce:
+
+    redirect_count == 1, retry_count == 0.
+    """
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/redirect":
+                return httpx.Response(302, headers={"Location": "/target"})
+            if request.url.path == "/target":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html"},
+                    content=b"<html>Success</html>",
+                )
+            return httpx.Response(404)
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/redirect", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.final_url == "https://example.com/target"
+        assert len(result.redirect_history) == 1
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.redirect_count == 1
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_request_retry_records_retry_count_and_scheduled_delay() -> None:
+    """A request failing once and succeeding on retry must produce:
+
+    retry_count == 1 and the exact scheduled retry delay.
+    """
+
+    async def _test() -> None:
+        attempt_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Content-Type": "text/html"},
+                    content=b"Service Unavailable",
+                )
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html"},
+                content=b"<html>OK</html>",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            slept_durations.append(seconds)
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-test", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.status_code == 200
+        assert attempt_count == 2
+        assert slept_durations == [1.5]
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.redirect_count == 0
+        assert diagnostics.retry_count == 1
+        assert diagnostics.total_retry_delay_seconds == 1.5
+
+    asyncio.run(_test())
+
+
+def test_cancellation_before_retry_sleep_records_zero_retries_and_zero_delay() -> None:
+    """Cancellation before retry sleep: request handler called once, retry_count 0, delay 0."""
+
+    async def _test() -> None:
+        attempt_count = 0
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count, cancelled
+            attempt_count += 1
+            cancelled = True
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            slept_durations.append(seconds)
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+            cancellation_checker=lambda: cancelled,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-cancel-before", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.TIMEOUT
+        assert result.error_message == "Fetch operation cancelled prior to retry sleep"
+        assert attempt_count == 1
+        assert slept_durations == []
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_cancellation_after_retry_sleep_records_zero_retries_and_completed_delay() -> None:
+    """Cancellation after completed sleep: request handler called once, retry_count 0,
+
+    delay equals completed sleep.
+    """
+
+    async def _test() -> None:
+        attempt_count = 0
+        cancelled = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        slept_durations: list[float] = []
+
+        async def fake_sleeper(seconds: float) -> None:
+            nonlocal cancelled
+            slept_durations.append(seconds)
+            cancelled = True
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=DomainRequestGate(default_minimum_interval_seconds=0.0),
+            async_sleeper=fake_sleeper,
+            jitter_source=lambda _: 0.0,
+            cancellation_checker=lambda: cancelled,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        result = await fetcher.fetch("https://example.com/retry-cancel-after", recorder=recorder)
+
+        assert result.outcome == FetchOutcomeCode.TIMEOUT
+        assert result.error_message == "Fetch operation cancelled after retry sleep"
+        assert attempt_count == 1
+        assert slept_durations == [1.5]
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+        assert diagnostics.total_retry_delay_seconds == 1.5
+
+    asyncio.run(_test())
+
+
+def test_cancellation_during_request_gate_acquire_on_retry_records_zero_retries() -> None:
+    """A repeated request waiting at request gate cancelled prior to HTTP attempt
+
+    must produce retry_count 0.
+    """
+
+    class CancellingRequestGate(DomainRequestGate):
+        def __init__(self) -> None:
+            super().__init__(default_minimum_interval_seconds=0.0)
+            self.acquire_calls = 0
+
+        async def acquire(
+            self,
+            target_url: NormalizedURL,
+            recorder: SiteScanDiagnosticRecorder | None = None,
+        ) -> None:
+            self.acquire_calls += 1
+            if self.acquire_calls > 1:
+                raise asyncio.CancelledError("Cancelled at request gate on retry attempt")
+            await super().acquire(target_url, recorder=recorder)
+
+    async def _test() -> None:
+        attempt_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempt_count
+            attempt_count += 1
+            return httpx.Response(
+                503,
+                headers={"Content-Type": "text/html"},
+                content=b"Service Unavailable",
+            )
+
+        retry_policy = RetryPolicy(base_delay_seconds=1.5, max_delay_seconds=10.0)
+        config = FetchConfig(retry_policy=retry_policy)
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=FakeDNSResolver(),
+            client=client,
+            config=config,
+            request_gate=CancellingRequestGate(),
+            async_sleeper=lambda _: asyncio.sleep(0),
+            jitter_source=lambda _: 0.0,
+        )
+        recorder = SiteScanDiagnosticRecorder()
+
+        with pytest.raises(asyncio.CancelledError):
+            await fetcher.fetch("https://example.com/retry-gate-cancel", recorder=recorder)
+
+        assert attempt_count == 1
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.retry_count == 0
+
+    asyncio.run(_test())
+
+
+def test_fetch_cross_domain_redirect_rejected_by_scope_policy() -> None:
+    """Out-of-scope redirect preserves final_url as source and sets redirect_target_url."""
+
+    async def _test() -> None:
+        requested_urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested_urls.append(str(request.url))
+            if request.url.host == "carefreeair.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://carefreeacandheating.com/landing?foo=bar#frag"},
+                )
+            return httpx.Response(200, content=b"<html>Should not be reached</html>")
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        result = await fetcher.fetch("https://carefreeair.com/start")
+
+        assert result.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+        assert result.final_url == "https://carefreeair.com/start"
+        assert result.redirect_target_url == "https://carefreeacandheating.com/landing?foo=bar"
+        assert len(result.redirect_history) == 0
+        assert requested_urls == ["https://carefreeair.com/start"]
+
+    asyncio.run(_test())
+
+
+def test_fetch_userinfo_credential_bearing_redirect_rejected() -> None:
+    """Redirect Location containing user credentials is rejected as INVALID_URL without target."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                301,
+                headers={"Location": "https://user:pass@carefreeacandheating.com/landing"},
+            )
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(dns_resolver=dns, client=client)
+
+        result = await fetcher.fetch("https://carefreeair.com/start")
+
+        assert result.outcome == FetchOutcomeCode.INVALID_URL
+        assert result.final_url == "https://carefreeair.com/start"
+        assert result.redirect_target_url is None
+
+    asyncio.run(_test())
+
+
+def test_fetch_same_domain_redirect_continues_normally() -> None:
+    """Same-domain redirect succeeds and does not populate redirect_target_url."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/start":
+                return httpx.Response(301, headers={"Location": "/finish"})
+            return httpx.Response(
+                200, headers={"Content-Type": "text/html"}, content=b"<html>OK</html>"
+            )
+
+        dns = FakeDNSResolver()
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        result = await fetcher.fetch("https://example.com/start")
+
+        assert result.outcome == FetchOutcomeCode.SUCCESS
+        assert result.final_url == "https://example.com/finish"
+        assert result.redirect_target_url is None
+        assert len(result.redirect_history) == 1
+
+    asyncio.run(_test())
+
+
+def test_fetch_approved_redirect_domain_permits_destination_and_rejects_unapproved() -> None:
+    """Approved redirect domain allows destination; unapproved domain remains rejected."""
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "carefreeair.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://carefreeacandheating.com/landing"},
+                )
+            if request.url.host == "carefreeacandheating.com":
+                return httpx.Response(
+                    200, headers={"Content-Type": "text/html"}, content=b"<html>Approved</html>"
+                )
+            if request.url.host == "other.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://unapproved.com/landing"},
+                )
+            return httpx.Response(404)
+
+        dns = FakeDNSResolver(
+            mapping={
+                "carefreeair.com": ("93.184.215.14",),
+                "carefreeacandheating.com": ("93.184.215.15",),
+                "other.com": ("93.184.215.16",),
+                "unapproved.com": ("93.184.215.17",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+        config = FetchConfig(approved_redirect_domains=("carefreeacandheating.com",))
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            config=config,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        # 1. Approved destination succeeds
+        res_approved = await fetcher.fetch("https://carefreeair.com/start")
+        assert res_approved.outcome == FetchOutcomeCode.SUCCESS
+        assert res_approved.final_url == "https://carefreeacandheating.com/landing"
+        assert res_approved.redirect_target_url is None
+        assert len(res_approved.redirect_history) == 1
+
+        # 2. Unapproved destination is rejected as OUT_OF_SCOPE_REDIRECT
+        res_unapproved = await fetcher.fetch("https://other.com/start")
+        assert res_unapproved.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+        assert res_unapproved.final_url == "https://other.com/start"
+        assert res_unapproved.redirect_target_url == "https://unapproved.com/landing"
+
+    asyncio.run(_test())
+
+
+def test_fetch_approved_redirect_domain_canonicalization() -> None:
+    """Fetcher canonicalizes approved domains and handles www, trailing dots, mixed case,
+    and invalid entries safely.
+    """
+
+    async def _test() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "source.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://www.destination.com/landing"},
+                )
+            if request.url.host == "www.destination.com":
+                return httpx.Response(
+                    200, headers={"Content-Type": "text/html"}, content=b"<html>Destination</html>"
+                )
+            if request.url.host == "malformed-source.com":
+                return httpx.Response(
+                    301,
+                    headers={"Location": "https://192.168.1.1/landing"},
+                )
+            return httpx.Response(404)
+
+        dns = FakeDNSResolver(
+            mapping={
+                "source.com": ("93.184.215.14",),
+                "www.destination.com": ("93.184.215.15",),
+                "malformed-source.com": ("93.184.215.16",),
+            }
+        )
+        transport = httpx.MockTransport(handler)
+        client = httpx.AsyncClient(transport=transport)
+
+        # Approved list has www, trailing dot, uppercase, and invalid IP/syntax
+        config = FetchConfig(
+            approved_redirect_domains=(
+                "  WWW.DESTINATION.COM.  ",
+                "192.168.1.1",
+                "invalid..domain",
+            )
+        )
+        fetcher = AsyncHTTPFetcher(
+            dns_resolver=dns,
+            client=client,
+            config=config,
+            redirect_validator=lambda curr, target: (
+                curr.registrable_domain == target.registrable_domain
+            ),
+        )
+
+        res = await fetcher.fetch("https://source.com/start")
+        assert res.outcome == FetchOutcomeCode.SUCCESS
+        assert res.final_url == "https://www.destination.com/landing"
+
+        # IP destination fails safely and is rejected
+        res_malformed = await fetcher.fetch("https://malformed-source.com/start")
+        assert res_malformed.outcome == FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+
+    asyncio.run(_test())
+
+
+def test_fetch_permanent_dns_failure_no_retries() -> None:
+    async def _test() -> None:
+        class PermanentFailResolver:
+            async def resolve(
+                self, url: NormalizedURL, *args: object, **kwargs: object
+            ) -> tuple[str, ...]:
+                raise HostSafetyError(
+                    code=HostSafetyErrorCode.DNS_NAME_NOT_FOUND,
+                    message="Host nonexistent.example does not exist",
+                )
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=PermanentFailResolver())
+        recorder = SiteScanDiagnosticRecorder()
+        res = await fetcher.fetch("https://nonexistent.example/", recorder=recorder)
+
+        assert res.outcome == FetchOutcomeCode.DNS_NAME_NOT_FOUND
+        assert len(res.attempts) == 1
+        assert recorder.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        assert diagnostics.retry_count == 0
+
+    asyncio.run(_test())
+
+
+def test_fetch_transient_dns_failure() -> None:
+    async def _test() -> None:
+        class TransientFailResolver:
+            async def resolve(
+                self, url: NormalizedURL, *args: object, **kwargs: object
+            ) -> tuple[str, ...]:
+                raise HostSafetyError(
+                    code=HostSafetyErrorCode.NO_RESOLVED_ADDRESSES,
+                    message="Temporary failure in name resolution",
+                )
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=TransientFailResolver())
+        recorder = SiteScanDiagnosticRecorder()
+        res = await fetcher.fetch("https://transient.example/", recorder=recorder)
+
+        assert res.outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED
+        assert len(res.attempts) == 1
+        assert recorder.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_RESOLUTION_FAILED
+
+    asyncio.run(_test())
+
+
+def test_redirect_malformed_bracketed_location_returns_invalid_url() -> None:
+    """Verify malformed redirect Location with bracketed host returns sanitized INVALID_URL."""
+
+    async def _test() -> None:
+        from unittest.mock import MagicMock
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 302
+        mock_resp.headers = {"location": "http://[album-1]"}
+
+        class MockStream:
+            async def __aenter__(self) -> MagicMock:
+                return mock_resp
+
+            async def __aexit__(self, exc_type: Any, exc_val: Any, tb: Any) -> None:
+                return None
+
+        mock_client = MagicMock()
+        mock_client.stream.return_value = MockStream()
+
+        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=mock_client)
+
+        result = await fetcher.fetch("https://example.com/redirect-malformed")
+        assert result.outcome == FetchOutcomeCode.INVALID_URL
+        assert result.error_message == "Invalid redirect Location URL."
+        assert "album-1" not in (result.error_message or "")
 
     asyncio.run(_test())

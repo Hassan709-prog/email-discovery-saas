@@ -254,3 +254,121 @@ def test_bounded_placeholder_does_not_reject_legitimate_substrings() -> None:
         "attest@company.com",
         "barbara@company.com",
     }
+
+
+def test_weak_external_candidate_filtered_out_when_same_domain_or_strong_external_exists() -> None:
+    """Verify weak external business candidates are excluded from competition when same-domain
+
+    or strong external candidates exist.
+    """
+    site_url = "https://mycompany.com"
+
+    f_same_domain = _make_finding(
+        "info@mycompany.com",
+        site_url,
+        domain_affinity=DomainAffinity.SAME_REGISTRABLE_DOMAIN,
+    )
+
+    f_strong_external = _make_finding(
+        "contact@partneragency.com",
+        "https://mycompany.com/contact",
+        source_kind=EmailSourceKind.MAILTO,
+        domain_affinity=DomainAffinity.EXTERNAL,
+        snippet="Mailto contact partner",
+    )
+
+    # Weak external candidate: no mailto, no contact page snippet, no page score
+    weak_ev = EmailEvidenceRecord(
+        source_url="https://mycompany.com/privacy",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        raw_candidate="contact@unrelated-vendor.com",
+        evidence_snippet="unrelated footer text",
+        page_score=0,
+    )
+    f_weak_external = EmailFinding(
+        source_url="https://mycompany.com/privacy",
+        raw_candidate="contact@unrelated-vendor.com",
+        canonical_email="contact@unrelated-vendor.com",
+        local_part="contact",
+        domain="unrelated-vendor.com",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        category=EmailCategory.ROLE_BASED,
+        domain_affinity=DomainAffinity.EXTERNAL,
+        evidence_snippet="unrelated footer text",
+        disposition=EmailDisposition.ACCEPTED,
+        evidence_records=(weak_ev,),
+    )
+
+    # 1. Test with all 3 candidates: prove weak_external never wins and never alters winner/signals
+    res_baseline = select_primary_email([f_same_domain, f_strong_external], site_url)
+    assert res_baseline.selected_finding is not None
+    assert res_baseline.selected_finding.canonical_email != "contact@unrelated-vendor.com"
+
+    for perm in itertools.permutations([f_same_domain, f_strong_external, f_weak_external]):
+        res = select_primary_email(perm, site_url)
+        assert res.selected_finding is not None
+        assert res.selected_finding.canonical_email != "contact@unrelated-vendor.com"
+        assert res.selected_finding.canonical_email == res_baseline.selected_finding.canonical_email
+        assert res.winning_score == res_baseline.winning_score
+        assert res.active_signals == res_baseline.active_signals
+
+    # 2. Test without same-domain candidate: strong external MUST beat weak external
+    for perm in itertools.permutations([f_strong_external, f_weak_external]):
+        res = select_primary_email(perm, site_url)
+        assert res.selected_finding is not None
+        assert res.selected_finding.canonical_email == "contact@partneragency.com"
+
+
+def test_external_only_fallback_behavior() -> None:
+    """Verify that when no same-domain or strong-external candidates exist, weak external candidates
+
+    are evaluated as fallback.
+    """
+    site_url = "https://mycompany.com"
+
+    weak_ev1 = EmailEvidenceRecord(
+        source_url="https://mycompany.com/footer",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        raw_candidate="contact@agency.com",
+        evidence_snippet="agency link",
+        page_score=0,
+    )
+    f_weak1 = EmailFinding(
+        source_url="https://mycompany.com/footer",
+        raw_candidate="contact@agency.com",
+        canonical_email="contact@agency.com",
+        local_part="contact",
+        domain="agency.com",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        category=EmailCategory.ROLE_BASED,
+        domain_affinity=DomainAffinity.EXTERNAL,
+        evidence_snippet="agency link",
+        disposition=EmailDisposition.ACCEPTED,
+        evidence_records=(weak_ev1,),
+    )
+
+    weak_ev2 = EmailEvidenceRecord(
+        source_url="https://mycompany.com/footer",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        raw_candidate="support@vendor.com",
+        evidence_snippet="vendor link",
+        page_score=0,
+    )
+    f_weak2 = EmailFinding(
+        source_url="https://mycompany.com/footer",
+        raw_candidate="support@vendor.com",
+        canonical_email="support@vendor.com",
+        local_part="support",
+        domain="vendor.com",
+        source_kind=EmailSourceKind.VISIBLE_TEXT,
+        category=EmailCategory.ROLE_BASED,
+        domain_affinity=DomainAffinity.EXTERNAL,
+        evidence_snippet="vendor link",
+        disposition=EmailDisposition.ACCEPTED,
+        evidence_records=(weak_ev2,),
+    )
+
+    res = select_primary_email([f_weak2, f_weak1], site_url)
+    assert res.selected_finding is not None
+    # contact@ is a higher-ranked contact role than support@
+    assert res.selected_finding.canonical_email == "contact@agency.com"

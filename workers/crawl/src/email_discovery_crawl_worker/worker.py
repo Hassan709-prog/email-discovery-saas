@@ -26,6 +26,11 @@ from email_discovery_api.services.worker_contracts import (
     URLClaim,
 )
 from email_discovery_crawl_worker.config import WorkerSettings, get_worker_settings
+from email_discovery_crawl_worker.outcome_classifier import (
+    WorkerExecutionOutcome,
+    classify_error_code_and_retryability,
+    classify_worker_outcome,
+)
 from email_discovery_crawl_worker.presence import WorkerPresenceManager, derive_instance_digest
 from email_discovery_crawl_worker.redis_gate import (
     InvalidDomainError,
@@ -663,12 +668,18 @@ class CrawlWorker:
                 else:
                     from email_scanner.dns import SystemDNSResolver
                     from email_scanner.fetching import AsyncHTTPFetcher
+                    from email_scanner.models import FetchConfig
 
                     dns_resolver = SystemDNSResolver(
                         dns_cache=self.dns_cache,
                         single_flight=self.single_flight,
                     )
+                    approved_domains = (
+                        (claim.approved_redirect_domain,) if claim.approved_redirect_domain else ()
+                    )
+                    fetch_cfg = FetchConfig(approved_redirect_domains=approved_domains)
                     fetcher = AsyncHTTPFetcher(
+                        config=fetch_cfg,
                         dns_resolver=dns_resolver,
                         request_gate=request_gate,
                         cancellation_checker=is_cancelled,
@@ -693,6 +704,7 @@ class CrawlWorker:
                     claim_digest,
                     sanitized_error_code,
                     type(exc).__name__,
+                    exc_info=True,
                 )
 
             if lease_lost_event.is_set():
@@ -705,12 +717,29 @@ class CrawlWorker:
             if orchestration_result is not None and attempt_number is not None:
                 try:
                     updated_claim = dataclasses.replace(claim, attempt_count=attempt_number)
-                    async with self.session_factory() as session:
-                        persistence_service = ResultPersistenceService(session)
-                        await persistence_service.persist_fenced_result(
-                            claim=updated_claim,
-                            site_scan_result=orchestration_result,
-                        )
+                    worker_outcome = classify_worker_outcome(
+                        site_scan_result=orchestration_result,
+                        execution_exception=None,
+                        attempt_count=attempt_number,
+                        max_attempts=claim.max_attempts,
+                    )
+                    if worker_outcome == WorkerExecutionOutcome.RETRYABLE_FAILURE:
+                        err_code, _ = classify_error_code_and_retryability(orchestration_result)
+                        async with self.session_factory() as session:
+                            persistence_service = ResultPersistenceService(session)
+                            await persistence_service.persist_transient_failure(
+                                claim=updated_claim,
+                                error_code=err_code,
+                                error_message="Temporary scan failure; retry scheduled.",
+                                site_scan_result=orchestration_result,
+                            )
+                    else:
+                        async with self.session_factory() as session:
+                            persistence_service = ResultPersistenceService(session)
+                            await persistence_service.persist_fenced_result(
+                                claim=updated_claim,
+                                site_scan_result=orchestration_result,
+                            )
                     async with self.session_factory() as session:
                         await ScanJobService(session).try_finalize_job(
                             claim.organization_id, claim.job_id

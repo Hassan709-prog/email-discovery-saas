@@ -126,6 +126,7 @@ class RobotsPolicyEvaluator:
     ) -> RobotsDecision:
         """Evaluate robots.txt policy for a target URL asynchronously."""
         eval_start_t = self._clock()
+        robots_fetch_elapsed = 0.0
         if isinstance(url, str):
             try:
                 target_url = normalize_url(url)
@@ -173,6 +174,7 @@ class RobotsPolicyEvaluator:
                     )
                     if recorder is not None:
                         dt = max(0.0, self._clock() - r_fetch_start)
+                        robots_fetch_elapsed += dt
                         recorder.robots_fetch_duration_seconds += dt
 
                     cached_policy = self._build_policy(robots_result, token, now)
@@ -183,7 +185,10 @@ class RobotsPolicyEvaluator:
 
         res = self._evaluate_cached_policy(cached_policy, target_url.normalized_url, token)
         if recorder is not None:
-            recorder.robots_evaluation_duration_seconds += max(0.0, self._clock() - eval_start_t)
+            total_elapsed = max(0.0, self._clock() - eval_start_t)
+            recorder.robots_evaluation_duration_seconds += max(
+                0.0, total_elapsed - robots_fetch_elapsed
+            )
         return res
 
     def _build_policy(
@@ -211,14 +216,6 @@ class RobotsPolicyEvaluator:
             and fetch_result.status_code is not None
         ):
             status = fetch_result.status_code
-            if status in {401, 403}:
-                return _CachedRobotsPolicy(
-                    policy_type="ALWAYS_DISALLOW",
-                    parser=None,
-                    crawl_delay=None,
-                    reason=f"robots.txt access denied with HTTP status {status}",
-                    expires_at=now + self._cache_ttl,
-                )
             if status == 429 or status >= 500:
                 return _CachedRobotsPolicy(
                     policy_type="TEMPORARY_FAILURE",
@@ -227,7 +224,9 @@ class RobotsPolicyEvaluator:
                     reason=f"robots.txt temporary failure with HTTP status {status}",
                     expires_at=now + self._temp_fail_ttl,
                 )
-            # Other 4xx status codes (404, 410, etc.) mean robots.txt unavailable -> ALLOW
+            # RFC 9309 section 2.3.1.3 treats 4xx responses (including
+            # 401 and 403) as robots.txt being unavailable. This is not an
+            # explicit Disallow rule, so public resources may still be crawled.
             return _CachedRobotsPolicy(
                 policy_type="ALWAYS_ALLOW",
                 parser=None,

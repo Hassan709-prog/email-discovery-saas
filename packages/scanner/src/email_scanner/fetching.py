@@ -31,7 +31,7 @@ from email_scanner.models import (
     NormalizedURL,
     RedirectHop,
 )
-from email_scanner.normalization import normalize_url
+from email_scanner.normalization import canonicalize_redirect_domain, normalize_url
 from email_scanner.pinned_transport import (
     PinnedAsyncHTTPTransport,
     _connection_attempts_ctx,  # pyright: ignore[reportPrivateUsage]
@@ -45,6 +45,30 @@ from email_scanner.retry import (
     parse_retry_after_header,
     should_retry_fetch,
 )
+
+
+def _contains_tls_error(error: BaseException) -> bool:
+    """Return whether an exception chain contains a typed TLS/SSL failure."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+
+    while pending:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+
+        if isinstance(current, ssl.SSLError):
+            return True
+
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+
+    return False
 
 
 class AsyncHTTPFetcher:
@@ -141,6 +165,7 @@ class AsyncHTTPFetcher:
 
         global_start_time = self._clock()
         global_attempt_counter = 0
+        retries_occurred = 0
         hop_index = 0
         status_code: int | None = None
 
@@ -209,17 +234,20 @@ class AsyncHTTPFetcher:
                     except TypeError:
                         await self._dns_resolver.resolve(current_url)
                 except HostSafetyError as err:
-                    outcome = (
-                        FetchOutcomeCode.DNS_RESOLUTION_FAILED
-                        if err.code == HostSafetyErrorCode.NO_RESOLVED_ADDRESSES
-                        else FetchOutcomeCode.UNSAFE_HOST
-                    )
+                    if err.code == HostSafetyErrorCode.DNS_NAME_NOT_FOUND:
+                        outcome = FetchOutcomeCode.DNS_NAME_NOT_FOUND
+                    elif err.code == HostSafetyErrorCode.NO_RESOLVED_ADDRESSES:
+                        outcome = FetchOutcomeCode.DNS_RESOLUTION_FAILED
+                    else:
+                        outcome = FetchOutcomeCode.UNSAFE_HOST
+
                     if recorder is not None:
-                        recorder.failure_code = (
-                            SiteScanFailureCode.DNS_RESOLUTION_FAILED
-                            if outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED
-                            else SiteScanFailureCode.UNSAFE_HOST
-                        )
+                        if outcome == FetchOutcomeCode.DNS_NAME_NOT_FOUND:
+                            recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                        elif outcome == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
+                            recorder.failure_code = SiteScanFailureCode.DNS_RESOLUTION_FAILED
+                        else:
+                            recorder.failure_code = SiteScanFailureCode.UNSAFE_HOST
                     attempts.append(
                         FetchAttempt(
                             hop_index=hop_index,
@@ -250,6 +278,7 @@ class AsyncHTTPFetcher:
                 hop_attempt = 0
                 next_delay_sec = 0.0
                 next_delay_source: DelaySource | None = None
+                rejected_redirect_target: str | None = None
 
                 while True:
                     # Check global retry attempt limit and elapsed time budget
@@ -291,6 +320,9 @@ class AsyncHTTPFetcher:
                         await self._request_gate.acquire(current_url, recorder=recorder)
                     except TypeError:
                         await self._request_gate.acquire(current_url)
+
+                    if hop_attempt > 1:
+                        retries_occurred += 1
 
                     # Prepare request-scoped connection evidence collector
                     conn_list: list[IPConnectionAttempt] = []
@@ -335,18 +367,37 @@ class AsyncHTTPFetcher:
                                         f"(status {status_code})"
                                     )
                                 else:
-                                    target_str = urllib.parse.urljoin(
-                                        current_url.normalized_url, location
-                                    )
                                     try:
+                                        target_str = urllib.parse.urljoin(
+                                            current_url.normalized_url, location
+                                        )
                                         target_url = normalize_url(target_str)
+                                        is_approved_redirect = False
+                                        if config.allow_cross_domain_redirects:
+                                            is_approved_redirect = True
+                                        elif config.approved_redirect_domains:
+                                            approved_canonical = {
+                                                canonicalize_redirect_domain(d)
+                                                for d in config.approved_redirect_domains
+                                            } - {None}
+                                            target_canonical = canonicalize_redirect_domain(
+                                                target_url.registrable_domain or target_url.hostname
+                                            )
+                                            if (
+                                                target_canonical is not None
+                                                and target_canonical in approved_canonical
+                                            ):
+                                                is_approved_redirect = True
+
                                         if (
                                             effective_redirect_validator is not None
+                                            and not is_approved_redirect
                                             and not effective_redirect_validator(
                                                 current_url, target_url
                                             )
                                         ):
                                             attempt_outcome = FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT
+                                            rejected_redirect_target = target_url.normalized_url
                                             error_msg = (
                                                 f"Redirect to {target_str} rejected by scope policy"
                                             )
@@ -392,6 +443,9 @@ class AsyncHTTPFetcher:
                                     except URLNormalizationError as norm_err:
                                         attempt_outcome = FetchOutcomeCode.INVALID_URL
                                         error_msg = f"Invalid redirect Location URL: {norm_err}"
+                                    except ValueError:
+                                        attempt_outcome = FetchOutcomeCode.INVALID_URL
+                                        error_msg = "Invalid redirect Location URL."
 
                             else:
                                 # Validate content-type for non-redirects
@@ -465,10 +519,16 @@ class AsyncHTTPFetcher:
                         httpcore.ConnectError,
                         httpcore.NetworkError,
                     ) as net_err:
-                        attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
-                        error_msg = f"Transport network error: {net_err}"
-                        if recorder is not None:
-                            recorder.failure_code = SiteScanFailureCode.TRANSPORT_ERROR
+                        if _contains_tls_error(net_err):
+                            attempt_outcome = FetchOutcomeCode.TLS_VERIFICATION_FAILED
+                            error_msg = "TLS certificate verification failed"
+                            if recorder is not None:
+                                recorder.failure_code = SiteScanFailureCode.TLS_VERIFICATION_FAILED
+                        else:
+                            attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
+                            error_msg = f"Transport network error: {net_err}"
+                            if recorder is not None:
+                                recorder.failure_code = SiteScanFailureCode.TRANSPORT_ERROR
                     except Exception as gen_err:
                         attempt_outcome = FetchOutcomeCode.TRANSPORT_ERROR
                         error_msg = f"Unexpected network error: {gen_err}"
@@ -521,6 +581,7 @@ class AsyncHTTPFetcher:
                             outcome=attempt_outcome,
                             error_message=error_msg,
                             attempts=tuple(attempts),
+                            redirect_target_url=rejected_redirect_target,
                         )
 
                     # Calculate retry backoff delay
@@ -561,6 +622,8 @@ class AsyncHTTPFetcher:
 
                     if next_delay_sec > 0.0 and self._sleeper is not None:
                         await self._sleeper(next_delay_sec)
+                        if recorder is not None:
+                            recorder.total_retry_delay_seconds += next_delay_sec
 
                     # Check cancellation after sleep
                     if self._cancellation_checker is not None and self._cancellation_checker():
@@ -579,7 +642,7 @@ class AsyncHTTPFetcher:
             if recorder is not None:
                 fetch_elapsed = max(0.0, self._clock() - global_start_time)
                 recorder.http_fetch_duration_seconds += fetch_elapsed
-                recorder.retry_count += max(0, global_attempt_counter - 1)
+                recorder.retry_count += retries_occurred
                 recorder.redirect_count += len(redirect_history)
                 if status_code is not None:
                     recorder.http_status = status_code

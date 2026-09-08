@@ -42,6 +42,7 @@ def test_map_fetch_outcome_to_failure_code() -> None:
     """Verify typed mapping of FetchOutcomeCode to SiteScanFailureCode for all taxonomy codes."""
     f = map_fetch_outcome_to_failure_code
     assert f(FetchOutcomeCode.DNS_RESOLUTION_FAILED) == SiteScanFailureCode.DNS_RESOLUTION_FAILED
+    assert f(FetchOutcomeCode.DNS_NAME_NOT_FOUND) == SiteScanFailureCode.DNS_NAME_NOT_FOUND
     assert f(FetchOutcomeCode.UNSAFE_HOST) == SiteScanFailureCode.UNSAFE_HOST
     assert (
         f(FetchOutcomeCode.TLS_VERIFICATION_FAILED) == SiteScanFailureCode.TLS_VERIFICATION_FAILED
@@ -57,11 +58,12 @@ def test_map_fetch_outcome_to_failure_code() -> None:
 
 
 def test_sitescan_failure_code_taxonomy_completeness() -> None:
-    """Verify SiteScanFailureCode enum contains all 17 required failure taxonomy codes."""
+    """Verify SiteScanFailureCode enum contains all required failure taxonomy codes."""
     expected_codes = {
         "ROBOTS_BLOCKED",
         "ROBOTS_TEMPORARY_FAILURE",
         "DNS_RESOLUTION_FAILED",
+        "DNS_NAME_NOT_FOUND",
         "UNSAFE_HOST",
         "CONNECT_TIMEOUT",
         "READ_TIMEOUT",
@@ -87,6 +89,7 @@ def test_sitescan_failure_code_taxonomy_completeness() -> None:
         (SiteScanFailureCode.ROBOTS_BLOCKED, "Robots.txt disallowed access"),
         (SiteScanFailureCode.ROBOTS_TEMPORARY_FAILURE, "Robots.txt temporary HTTP/network error"),
         (SiteScanFailureCode.DNS_RESOLUTION_FAILED, "DNS resolution failed"),
+        (SiteScanFailureCode.DNS_NAME_NOT_FOUND, "Permanent DNS name not found or no records"),
         (SiteScanFailureCode.UNSAFE_HOST, "IP/host safety check failed"),
         (SiteScanFailureCode.CONNECT_TIMEOUT, "HTTP connection handshake timeout"),
         (SiteScanFailureCode.READ_TIMEOUT, "HTTP body read stream timeout"),
@@ -103,7 +106,7 @@ def test_sitescan_failure_code_taxonomy_completeness() -> None:
         (SiteScanFailureCode.UNEXPECTED_INTERNAL_ERROR, "Unhandled exception during site scan"),
     ],
 )
-def test_all_17_failure_taxonomy_conditions_produced_and_mapped(
+def test_all_failure_taxonomy_conditions_produced_and_mapped(
     target_code: SiteScanFailureCode, description: str
 ) -> None:
     """Prove every one of the 17 failure taxonomy conditions is backed by a valid code."""

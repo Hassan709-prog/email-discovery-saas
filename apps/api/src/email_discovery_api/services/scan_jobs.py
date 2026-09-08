@@ -18,6 +18,10 @@ from email_discovery_api.api.dependencies.cursors import encode_cursor
 from email_discovery_api.models.crawl_attempt import CrawlAttempt
 from email_discovery_api.models.enums import MembershipRole, ScanJobStatus, ScanURLStatus
 from email_discovery_api.models.job_event import JobEvent
+from email_discovery_api.models.redirect_review import (
+    apply_url_redirect_approval,
+    apply_url_redirect_rejection,
+)
 from email_discovery_api.models.scan_job import ScanJob
 from email_discovery_api.models.scan_url import ScanURL
 from email_discovery_api.repositories.job_events import JobEventRepository
@@ -25,6 +29,11 @@ from email_discovery_api.repositories.organizations import OrganizationAccessRep
 from email_discovery_api.repositories.scan_jobs import ScanJobRepository
 from email_discovery_api.repositories.scan_urls import ScanURLRepository
 from email_discovery_api.schemas.scan_jobs import (
+    BulkRedirectAction,
+    BulkRedirectCommand,
+    BulkRedirectDisposition,
+    BulkRedirectItem,
+    BulkRedirectResult,
     CreateScanJobCommand,
     ScanJobProgress,
 )
@@ -32,6 +41,7 @@ from email_discovery_api.services.errors import ServiceError, ServiceErrorCode
 from email_discovery_api.services.policies import ScanCreationPolicy
 from email_scanner import (
     URLCleaningBatchResult,
+    canonicalize_redirect_domain,
     clean_and_review_urls,
 )
 
@@ -215,6 +225,14 @@ class ScanJobService:
                 url_id = uuid.uuid4()
                 target_parsed = urlsplit(item.canonical_target)
                 target_domain = target_parsed.hostname
+                app_domain = None
+                if command.approved_redirect_domains:
+                    raw_domain = command.approved_redirect_domains.get(
+                        item.original_input
+                    ) or command.approved_redirect_domains.get(item.canonical_target)
+                    if raw_domain:
+                        app_domain = canonicalize_redirect_domain(raw_domain)
+
                 scan_urls.append(
                     ScanURL(
                         id=url_id,
@@ -224,6 +242,7 @@ class ScanJobService:
                         normalized_url=item.canonical_target,
                         normalized_domain=target_domain,
                         status=ScanURLStatus.PENDING.value,
+                        approved_redirect_domain=app_domain,
                     )
                 )
 
@@ -764,8 +783,12 @@ class ScanJobService:
         cursor_index: int | None = None,
         cursor_id: uuid.UUID | None = None,
         status: str | None = None,
-    ) -> tuple[list[ScanURL], str | None]:
-        """List job URLs tenant-scoped with keyset pagination returning items and next_cursor."""
+        requires_redirect_approval: bool | None = None,
+    ) -> tuple[list[ScanURL], str | None, int]:
+        """List job URLs tenant-scoped with keyset pagination.
+
+        Returns (urls, next_cursor, total_count).
+        """
         await self.get_job(organization_id, job_id)
 
         fetch_limit = limit + 1
@@ -776,6 +799,13 @@ class ScanJobService:
             cursor_index=cursor_index,
             cursor_id=cursor_id,
             status=status,
+            requires_redirect_approval=requires_redirect_approval,
+        )
+        total_count = await self.url_repo.count_urls(
+            organization_id,
+            job_id,
+            status=status,
+            requires_redirect_approval=requires_redirect_approval,
         )
 
         next_cursor: str | None = None
@@ -783,9 +813,9 @@ class ScanJobService:
             has_more = urls[:limit]
             last_item = has_more[-1]
             next_cursor = encode_cursor("urls", [last_item.original_index, str(last_item.id)])
-            return has_more, next_cursor
+            return has_more, next_cursor, total_count
 
-        return urls, None
+        return urls, None, total_count
 
     async def list_job_events(
         self,
@@ -915,3 +945,429 @@ class ScanJobService:
             started_at=job.started_at,
             completed_at=job.completed_at,
         )
+
+    @staticmethod
+    def _validate_and_apply_approval_counters(job: ScanJob, affected_count: int) -> None:
+        """Validate counter integrity and apply counter updates for redirect approvals.
+
+        Ensures job.failed_count >= affected_count. Raises ServiceError(INVALID_STATE_TRANSITION)
+        if violated, rolling back the transaction. Does not leak internal counter numbers
+        in the public error response message.
+        """
+        if affected_count <= 0:
+            return
+        if job.failed_count < affected_count:
+            raise ServiceError(
+                ServiceErrorCode.INVALID_STATE_TRANSITION,
+                f"Cannot approve redirect for job {job.id}: "
+                "job state does not permit redirect approval.",
+            )
+        job.failed_count -= affected_count
+        job.queued_count += affected_count
+        if job.completed_at is not None:
+            job.completed_at = None
+        if job.status in (
+            ScanJobStatus.COMPLETED_WITH_ERRORS.value,
+            ScanJobStatus.FAILED.value,
+            ScanJobStatus.COMPLETED.value,
+        ):
+            job.status = ScanJobStatus.RUNNING.value
+
+    async def approve_url_redirect(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        url_id: uuid.UUID,
+        approved_target_domain: str | None = None,
+    ) -> ScanURL:
+        """Approve and retry a ScanURL stuck in OUT_OF_SCOPE_REDIRECT."""
+        async with self.session.begin():
+            # 1. Lock parent ScanJob FOR UPDATE first to enforce canonical lock order
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Job {job_id} was not found for organization {organization_id}.",
+                )
+            if job.status in (ScanJobStatus.CANCELLED.value, ScanJobStatus.CANCELLING.value):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Cannot approve redirect for cancelled job {job_id}.",
+                )
+
+            # 2. Lock target ScanURL FOR UPDATE second
+            url = await self.url_repo.get_url_for_update(organization_id, job_id, url_id)
+            if url is None:
+                raise ServiceError(
+                    ServiceErrorCode.SCAN_URL_NOT_FOUND,
+                    f"ScanURL {url_id} not found in job {job_id}.",
+                )
+
+            app_redirect = (url.approved_redirect_domain or "").strip()
+            target_redirect = (url.redirect_target_domain or "").strip()
+            if app_redirect and (
+                url.status
+                in (
+                    ScanURLStatus.QUEUED.value,
+                    ScanURLStatus.SCANNING.value,
+                    ScanURLStatus.LEASED.value,
+                    ScanURLStatus.COMPLETED.value,
+                )
+                or not target_redirect
+                or app_redirect.lower() == target_redirect.lower()
+            ):
+                return url
+
+            if url.status != ScanURLStatus.FAILED.value:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {url_id} in status {url.status!r} cannot receive redirect approval. "
+                    "Only FAILED URLs can be approved.",
+                )
+
+            last_fail = (url.last_failure_code or "").strip()
+            last_err = (url.last_error_code or "").strip()
+            error_code = last_fail or last_err
+            if error_code not in (
+                "OUT_OF_SCOPE_REDIRECT",
+                "BUSINESS_DOMAIN_REDIRECT_REVIEW",
+                "REDIRECT_REJECTED",
+            ):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL error code {error_code!r} does not permit redirect approval.",
+                )
+
+            target_domain: str | None = (url.redirect_target_domain or "").strip() or None
+            if not target_domain:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    "ScanURL does not have a pending redirect target to approve.",
+                )
+
+            canonical_target = canonicalize_redirect_domain(target_domain)
+            if not canonical_target:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL redirect target {target_domain!r} is not a valid canonical domain.",
+                )
+
+            if approved_target_domain:
+                canonical_approved = canonicalize_redirect_domain(approved_target_domain)
+                if not canonical_approved or canonical_approved != canonical_target:
+                    raise ServiceError(
+                        ServiceErrorCode.INVALID_RESULT_STATE,
+                        f"Target domain mismatch. Requested {approved_target_domain!r} "
+                        f"does not match persisted target {target_domain!r}.",
+                    )
+
+            apply_url_redirect_approval(url)
+
+            self._validate_and_apply_approval_counters(job, 1)
+
+            seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+            if seq is not None:
+                event = JobEvent(
+                    scan_job_id=job_id,
+                    event_type="REDIRECT_APPROVED",
+                    sequence_number=seq,
+                    payload={
+                        "scan_url_id": str(url_id),
+                        "approved_redirect_domain": canonical_target,
+                    },
+                )
+                self.event_repo.append_event(event)
+
+            return url
+
+    async def bulk_approve_url_redirects(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        command: BulkRedirectCommand,
+    ) -> BulkRedirectResult:
+        """Bulk approve and retry ScanURLs with pending cross-domain redirects."""
+        raw_count = len(command.url_ids)
+        unique_ids = list(dict.fromkeys(command.url_ids))
+        unique_count = len(unique_ids)
+
+        if raw_count < 1 or unique_count < 1:
+            raise ServiceError(
+                ServiceErrorCode.NO_VALID_INPUTS,
+                "Bulk redirect request must contain at least 1 URL ID.",
+            )
+        if raw_count > 250 or unique_count > 250:
+            raise ServiceError(
+                ServiceErrorCode.INPUT_LIMIT_EXCEEDED,
+                "Bulk redirect request cannot contain more than 250 unique URL IDs.",
+            )
+
+        async with self.session.begin():
+            # 1. Lock parent ScanJob FOR UPDATE first to enforce canonical lock order
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Job {job_id} was not found for organization {organization_id}.",
+                )
+            if job.status in (ScanJobStatus.CANCELLED.value, ScanJobStatus.CANCELLING.value):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Cannot approve redirect for cancelled job {job_id}.",
+                )
+
+            # 2. Lock requested ScanURLs in deterministic ID order
+            urls = await self.url_repo.get_urls_for_update(organization_id, job_id, unique_ids)
+            url_map = {u.id: u for u in urls}
+
+            # 3. Missing or foreign IDs return sanitized 404
+            missing_ids = [uid for uid in unique_ids if uid not in url_map]
+            if missing_ids:
+                raise ServiceError(
+                    ServiceErrorCode.SCAN_URL_NOT_FOUND,
+                    f"One or more requested ScanURLs were not found in job {job_id}.",
+                )
+
+            # 4. Pre-mutation classification: all-or-nothing
+            pending_mutations: list[ScanURL] = []
+            already_applied_ids: set[uuid.UUID] = set()
+
+            for uid in unique_ids:
+                url = url_map[uid]
+                app_redirect = (url.approved_redirect_domain or "").strip()
+                target_redirect = (url.redirect_target_domain or "").strip()
+                last_fail = (url.last_failure_code or "").strip()
+                last_err = (url.last_error_code or "").strip()
+                effective_code = last_fail or last_err
+
+                canonical_app = canonicalize_redirect_domain(app_redirect) if app_redirect else None
+                canonical_target = (
+                    canonicalize_redirect_domain(target_redirect) if target_redirect else None
+                )
+
+                # B. Already approved (idempotent replay):
+                if app_redirect and (
+                    url.status
+                    in (
+                        ScanURLStatus.QUEUED.value,
+                        ScanURLStatus.SCANNING.value,
+                        ScanURLStatus.LEASED.value,
+                        ScanURLStatus.COMPLETED.value,
+                    )
+                    or not target_redirect
+                    or (
+                        canonical_app is not None
+                        and canonical_target is not None
+                        and canonical_app == canonical_target
+                    )
+                    or app_redirect.lower() == target_redirect.lower()
+                ):
+                    already_applied_ids.add(uid)
+                    continue
+
+                # A. Pending approval:
+                if (
+                    url.status == ScanURLStatus.FAILED.value
+                    and not app_redirect
+                    and bool(target_redirect)
+                    and canonical_target is not None
+                    and effective_code
+                    in (
+                        "OUT_OF_SCOPE_REDIRECT",
+                        "BUSINESS_DOMAIN_REDIRECT_REVIEW",
+                        "REDIRECT_REJECTED",
+                    )
+                ):
+                    pending_mutations.append(url)
+                    continue
+
+                # C. Anything else aborts entire operation
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {uid} in status {url.status!r} cannot receive redirect approval.",
+                )
+
+            # 5. Apply mutations for pending rows
+            domains_affected: list[str] = []
+            for url in pending_mutations:
+                apply_url_redirect_approval(url)
+                if url.approved_redirect_domain:
+                    domains_affected.append(url.approved_redirect_domain)
+
+            affected_count = len(pending_mutations)
+            skipped_count = len(already_applied_ids)
+
+            # 6. Update job counters once with strict invariant validation
+            if affected_count > 0:
+                self._validate_and_apply_approval_counters(job, affected_count)
+
+                seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+                if seq is not None:
+                    sample_domains = sorted(list(set(domains_affected)))[:10]
+                    event = JobEvent(
+                        scan_job_id=job_id,
+                        event_type="REDIRECT_APPROVED",
+                        sequence_number=seq,
+                        payload={
+                            "action": "BULK_APPROVE",
+                            "affected_count": affected_count,
+                            "skipped_count": skipped_count,
+                            "sample_approved_domains": sample_domains,
+                        },
+                    )
+                    self.event_repo.append_event(event)
+
+            items = [
+                BulkRedirectItem(
+                    url_id=uid,
+                    status=ScanURLStatus(url_map[uid].status),
+                    disposition=(
+                        BulkRedirectDisposition.MUTATED
+                        if uid not in already_applied_ids
+                        else BulkRedirectDisposition.ALREADY_APPLIED
+                    ),
+                )
+                for uid in unique_ids
+            ]
+
+            return BulkRedirectResult(
+                job_id=job_id,
+                action=BulkRedirectAction.APPROVE,
+                requested_count=raw_count,
+                unique_requested_count=unique_count,
+                affected_count=affected_count,
+                skipped_count=skipped_count,
+                results=items,
+            )
+
+    async def bulk_reject_url_redirects(
+        self,
+        organization_id: uuid.UUID,
+        job_id: uuid.UUID,
+        command: BulkRedirectCommand,
+    ) -> BulkRedirectResult:
+        """Bulk reject cross-domain redirects for ScanURLs."""
+        raw_count = len(command.url_ids)
+        unique_ids = list(dict.fromkeys(command.url_ids))
+        unique_count = len(unique_ids)
+
+        if raw_count < 1 or unique_count < 1:
+            raise ServiceError(
+                ServiceErrorCode.NO_VALID_INPUTS,
+                "Bulk redirect request must contain at least 1 URL ID.",
+            )
+        if raw_count > 250 or unique_count > 250:
+            raise ServiceError(
+                ServiceErrorCode.INPUT_LIMIT_EXCEEDED,
+                "Bulk redirect request cannot contain more than 250 unique URL IDs.",
+            )
+
+        async with self.session.begin():
+            # 1. Lock parent ScanJob FOR UPDATE first to enforce canonical lock order
+            job = await self.job_repo.get_job_for_update(organization_id, job_id)
+            if job is None:
+                raise ServiceError(
+                    ServiceErrorCode.JOB_NOT_FOUND,
+                    f"Job {job_id} was not found for organization {organization_id}.",
+                )
+            if job.status in (ScanJobStatus.CANCELLED.value, ScanJobStatus.CANCELLING.value):
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_STATE_TRANSITION,
+                    f"Cannot reject redirect for cancelled job {job_id}.",
+                )
+
+            # 2. Lock requested ScanURLs in deterministic ID order
+            urls = await self.url_repo.get_urls_for_update(organization_id, job_id, unique_ids)
+            url_map = {u.id: u for u in urls}
+
+            # 3. Missing or foreign IDs return sanitized 404
+            missing_ids = [uid for uid in unique_ids if uid not in url_map]
+            if missing_ids:
+                raise ServiceError(
+                    ServiceErrorCode.SCAN_URL_NOT_FOUND,
+                    f"One or more requested ScanURLs were not found in job {job_id}.",
+                )
+
+            # 4. Pre-mutation classification: all-or-nothing
+            pending_mutations: list[ScanURL] = []
+            already_applied_ids: set[uuid.UUID] = set()
+
+            for uid in unique_ids:
+                url = url_map[uid]
+                app_redirect = (url.approved_redirect_domain or "").strip()
+                target_redirect = (url.redirect_target_domain or "").strip()
+                last_fail = (url.last_failure_code or "").strip()
+                last_err = (url.last_error_code or "").strip()
+                effective_code = last_fail or last_err
+
+                # Already rejected is an idempotent skip:
+                if (
+                    url.status == ScanURLStatus.FAILED.value
+                    and not app_redirect
+                    and effective_code == "REDIRECT_REJECTED"
+                ):
+                    already_applied_ids.add(uid)
+                    continue
+
+                # Pending rejection:
+                if (
+                    url.status == ScanURLStatus.FAILED.value
+                    and not app_redirect
+                    and bool(target_redirect)
+                    and effective_code
+                    in ("OUT_OF_SCOPE_REDIRECT", "BUSINESS_DOMAIN_REDIRECT_REVIEW")
+                ):
+                    pending_mutations.append(url)
+                    continue
+
+                # Any other row status (including already approved or active) aborts:
+                raise ServiceError(
+                    ServiceErrorCode.INVALID_RESULT_STATE,
+                    f"ScanURL {uid} in status {url.status!r} cannot be rejected.",
+                )
+
+            # 5. Apply mutations for pending rows
+            for url in pending_mutations:
+                apply_url_redirect_rejection(url)
+
+            affected_count = len(pending_mutations)
+            skipped_count = len(already_applied_ids)
+
+            # 6. Rejection does NOT change job counters
+            if affected_count > 0:
+                seq = await self.job_repo.allocate_event_sequence(organization_id, job_id)
+                if seq is not None:
+                    event = JobEvent(
+                        scan_job_id=job_id,
+                        event_type="REDIRECT_REJECTED",
+                        sequence_number=seq,
+                        payload={
+                            "action": "BULK_REJECT",
+                            "affected_count": affected_count,
+                            "skipped_count": skipped_count,
+                        },
+                    )
+                    self.event_repo.append_event(event)
+
+            items = [
+                BulkRedirectItem(
+                    url_id=uid,
+                    status=ScanURLStatus(url_map[uid].status),
+                    disposition=(
+                        BulkRedirectDisposition.MUTATED
+                        if uid not in already_applied_ids
+                        else BulkRedirectDisposition.ALREADY_APPLIED
+                    ),
+                )
+                for uid in unique_ids
+            ]
+
+            return BulkRedirectResult(
+                job_id=job_id,
+                action=BulkRedirectAction.REJECT,
+                requested_count=raw_count,
+                unique_requested_count=unique_count,
+                affected_count=affected_count,
+                skipped_count=skipped_count,
+                results=items,
+            )

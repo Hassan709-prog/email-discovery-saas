@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -45,6 +46,12 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
         ):
             return False
         if page.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+            diagnostics = getattr(site_scan_result, "diagnostics", None)
+            if diagnostics is not None and diagnostics.failure_code in (
+                "DNS_NAME_NOT_FOUND",
+                "TLS_VERIFICATION_FAILED",
+            ):
+                return False
             return True
         if page.fetch_result:
             fetch_code = page.fetch_result.outcome
@@ -55,6 +62,7 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
             ):
                 return True
             if fetch_code in (
+                FetchOutcomeCode.DNS_NAME_NOT_FOUND,
                 FetchOutcomeCode.UNSAFE_HOST,
                 FetchOutcomeCode.INVALID_URL,
                 FetchOutcomeCode.TLS_VERIFICATION_FAILED,
@@ -66,6 +74,9 @@ def _evaluate_retryability(site_scan_result: SiteScanResult) -> bool:
                 return False
             if fetch_code == FetchOutcomeCode.HTTP_ERROR:
                 return page.fetch_result.status_code in _RETRYABLE_HTTP_STATUSES
+    diagnostics = getattr(site_scan_result, "diagnostics", None)
+    if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+        return False
     return True
 
 
@@ -158,6 +169,7 @@ class MappedAttempt:
     robots_duration_seconds: float | None = None
     http_duration_seconds: float | None = None
     parse_duration_seconds: float | None = None
+    redirect_target_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +306,7 @@ class CrawlAttemptResult:
 
     attempt: Any
     is_replay: bool
+    is_cancelled: bool = False
 
 
 def compute_transient_attempt_checksum(
@@ -506,7 +519,24 @@ def map_site_scan_result(
         # For FAILED or PARTIAL outcomes, evaluate retryability from page records
         retryable = _evaluate_retryability(site_scan_result)
     err_msg = sanitize_text(site_scan_result.error_message, max_length=pol.max_error_message_length)
-    elapsed = site_scan_result.statistics.elapsed_seconds if site_scan_result.statistics else 0.0
+    elapsed = (
+        getattr(site_scan_result.statistics, "elapsed_seconds", 0.0)
+        if site_scan_result.statistics
+        else 0.0
+    )
+    safe_elapsed = (
+        float(elapsed)
+        if isinstance(elapsed, (int, float))
+        and not isinstance(elapsed, bool)
+        and math.isfinite(elapsed)
+        and elapsed >= 0.0
+        else 0.0
+    )
+    try:
+        started_at_val = now - timedelta(seconds=safe_elapsed)
+    except OverflowError, ValueError:
+        safe_elapsed = 0.0
+        started_at_val = now
 
     checksum = compute_result_checksum(
         starting_url=requested_url,
@@ -526,6 +556,11 @@ def map_site_scan_result(
 
     diag = getattr(site_scan_result, "diagnostics", None)
     failure_code_val = diag.failure_code if diag else None
+    if site_scan_result.outcome in (
+        SiteScanOutcome.COMPLETED,
+        SiteScanOutcome.COMPLETED_NO_EMAILS,
+    ):
+        failure_code_val = None
     dns_sec = diag.dns_resolution_duration_seconds if diag else None
     gate_sec = diag.gate_wait_duration_seconds if diag else None
     robots_sec = (
@@ -535,6 +570,15 @@ def map_site_scan_result(
     )
     http_sec = diag.http_fetch_duration_seconds if diag else None
     parse_sec = diag.page_processing_duration_seconds if diag else None
+
+    redirect_target_val: str | None = None
+    if (
+        first_page_rec
+        and first_page_rec.fetch_result
+        and getattr(first_page_rec.fetch_result, "redirect_target_url", None)
+    ):
+        sanitized_target = sanitize_url(first_page_rec.fetch_result.redirect_target_url)
+        redirect_target_val = sanitized_target if sanitized_target else None
 
     mapped_attempt = MappedAttempt(
         attempt_number=attempt_number,
@@ -547,9 +591,9 @@ def map_site_scan_result(
         error_message=err_msg,
         redirect_history=redirect_history_clean if redirect_history_clean else None,
         connection_attempts=connection_attempts_clean if connection_attempts_clean else None,
-        started_at=now,
+        started_at=started_at_val,
         completed_at=now,
-        elapsed_seconds=elapsed,
+        elapsed_seconds=safe_elapsed,
         result_checksum=checksum,
         failure_code=failure_code_val,
         dns_duration_seconds=dns_sec,
@@ -557,6 +601,7 @@ def map_site_scan_result(
         robots_duration_seconds=robots_sec,
         http_duration_seconds=http_sec,
         parse_duration_seconds=parse_sec,
+        redirect_target_url=redirect_target_val,
     )
 
     return (

@@ -17,13 +17,30 @@ _OBFUSCATED_EMAIL_REGEX = re.compile(
 _PUNCTUATION_TO_TRIM = ".,;:!?)]\"'"
 
 
+def decode_cloudflare_cfemail(hex_str: str) -> str | None:
+    """Deterministically decode Cloudflare data-cfemail attribute without JS execution."""
+    try:
+        cleaned = hex_str.strip()
+        if len(cleaned) < 4 or len(cleaned) % 2 != 0:
+            return None
+        key = int(cleaned[:2], 16)
+        chars = [chr(int(cleaned[i : i + 2], 16) ^ key) for i in range(2, len(cleaned), 2)]
+        decoded = "".join(chars).strip()
+        if "@" in decoded and "." in decoded:
+            return decoded
+    except Exception:
+        pass
+    return None
+
+
 class HTMLEmailExtractor(html.parser.HTMLParser):
-    """HTML parser extracting visible text and mailto links while ignoring scripts/styles."""
+    """HTML parser extracting visible text, mailto links, and data-cfemail attributes."""
 
     def __init__(self) -> None:
         super().__init__()
         self.visible_text_parts: list[str] = []
         self.mailto_hrefs: list[str] = []
+        self.cfemail_decoded: list[tuple[str, str]] = []
         self._ignored_stack: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -35,8 +52,15 @@ class HTMLEmailExtractor(html.parser.HTMLParser):
         if self._ignored_stack:
             return
 
+        attr_dict = {k.lower(): (html.unescape(v) if v is not None else None) for k, v in attrs}
+
+        cfemail_hex = attr_dict.get("data-cfemail")
+        if cfemail_hex:
+            decoded = decode_cloudflare_cfemail(cfemail_hex)
+            if decoded:
+                self.cfemail_decoded.append((decoded, cfemail_hex))
+
         if tag_lower == "a":
-            attr_dict = {k.lower(): v for k, v in attrs if v is not None}
             href = attr_dict.get("href")
             if href and href.strip().lower().startswith("mailto:"):
                 self.mailto_hrefs.append(href.strip())
@@ -49,8 +73,9 @@ class HTMLEmailExtractor(html.parser.HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._ignored_stack:
             return
-        if data and data.strip():
-            self.visible_text_parts.append(data)
+        unescaped = html.unescape(data)
+        if unescaped and unescaped.strip():
+            self.visible_text_parts.append(unescaped)
 
 
 def build_evidence_snippet(

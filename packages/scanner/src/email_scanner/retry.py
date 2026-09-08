@@ -73,6 +73,7 @@ def should_retry_fetch(
 
     # Non-retryable security, validation, or permanent failures
     if outcome in {
+        FetchOutcomeCode.DNS_NAME_NOT_FOUND,
         FetchOutcomeCode.UNSAFE_HOST,
         FetchOutcomeCode.TLS_VERIFICATION_FAILED,
         FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,

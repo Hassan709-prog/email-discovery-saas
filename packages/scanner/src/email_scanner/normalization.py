@@ -145,3 +145,69 @@ def normalize_url(raw_url: str) -> NormalizedURL:
         host_type=host_type,
         registrable_domain=registrable_domain,
     )
+
+
+def canonicalize_redirect_domain(domain_or_url: str | None) -> str | None:
+    """Return the canonical, lowercase registrable domain for a redirect target or approval.
+
+    Safely handles:
+    - Hostnames with or without www (e.g. 'www.example.com' -> 'example.com')
+    - Subdomains (e.g. 'sub.shop.example.co.uk' -> 'example.co.uk')
+    - Full URLs (e.g. 'https://www.example.com:8080/path' -> 'example.com')
+    - Trailing dots (e.g. 'example.com.' -> 'example.com')
+    - Mixed case and surrounding whitespace (e.g. '  WWW.Example.COM.  ' -> 'example.com')
+    - Malformed or missing domains (returns None safely)
+    - IP addresses and private hosts (returns None safely)
+
+    Never returns a broadly trusted value on invalid or unclassifiable inputs.
+    """
+    if domain_or_url is None:
+        return None
+
+    value = str(domain_or_url).strip(" \t\r\n").rstrip(".")
+    if not value:
+        return None
+
+    # Strip scheme if present
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+            value = parsed.hostname or ""
+        except Exception:
+            return None
+    elif "/" in value:
+        value = value.split("/", 1)[0]
+
+    # Strip port if present (and not an IPv6 literal)
+    if ":" in value and not value.startswith("["):
+        value = value.split(":", 1)[0]
+
+    value = value.strip(" \t\r\n").rstrip(".").lower()
+    if not value:
+        return None
+
+    # IP addresses are not registrable domains; fail safely
+    try:
+        ipaddress.ip_address(value)
+        return None
+    except ValueError:
+        pass
+
+    # Validate IDNA encoding
+    try:
+        value = value.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+
+    # Reject invalid consecutive dots or empty labels
+    if ".." in value:
+        return None
+
+    extracted = _DOMAIN_EXTRACTOR(value)
+    registrable = extracted.top_domain_under_public_suffix
+
+    if not registrable:
+        return None
+
+    canonical = registrable.lower().rstrip(".")
+    return canonical if canonical else None

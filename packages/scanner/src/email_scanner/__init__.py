@@ -10,9 +10,13 @@ from email_scanner.cleaning import (
     get_explanation_for_decision,
     get_ui_label_for_decision,
 )
-from email_scanner.discovery import HTMLLinkExtractor, discover_and_rank_links
+from email_scanner.discovery import (
+    HTMLLinkExtractor,
+    discover_and_rank_links,
+    is_directory_index_or_placeholder,
+)
 from email_scanner.dns import AsyncDNSResolver, SystemDNSResolver
-from email_scanner.email_extraction import HTMLEmailExtractor
+from email_scanner.email_extraction import HTMLEmailExtractor, decode_cloudflare_cfemail
 from email_scanner.email_pipeline import (
     calculate_domain_affinity,
     classify_email_category,
@@ -88,7 +92,7 @@ from email_scanner.models import (
     SiteScanResult,
     SiteScanStatistics,
 )
-from email_scanner.normalization import normalize_url
+from email_scanner.normalization import canonicalize_redirect_domain, normalize_url
 from email_scanner.orchestration import SiteScanOrchestrator
 from email_scanner.pinned_transport import (
     PinnedAsyncHTTPTransport,
@@ -219,6 +223,7 @@ __all__ = [
     "is_in_scope",
     "is_same_origin",
     "is_same_registrable_domain",
+    "canonicalize_redirect_domain",
     "normalize_url",
     "parse_retry_after_header",
     "rank_pages",
@@ -226,4 +231,6 @@ __all__ = [
     "should_retry_fetch",
     "validate_email_candidate",
     "validate_public_host",
+    "decode_cloudflare_cfemail",
+    "is_directory_index_or_placeholder",
 ]

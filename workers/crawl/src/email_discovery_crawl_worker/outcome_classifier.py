@@ -6,9 +6,22 @@ from enum import StrEnum
 
 from email_discovery_api.services.worker_contracts import LeaseLostError
 from email_scanner import FetchOutcomeCode, PageScanOutcome, SiteScanOutcome
-from email_scanner.models import SiteScanResult
+from email_scanner.models import FetchResult, SiteScanResult
 
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _final_failed_hop_was_retried(fetch_result: FetchResult) -> bool:
+    """Determine whether the final failed HTTP hop was internally retried.
+
+    Inspects the final FetchAttempt associated with the failure. It is evidence of
+    an internal repeated request only when its hop_attempt_number > 1. Multiple
+    attempts across different redirect hops (hop_attempt_number == 1) do not count.
+    """
+    if not fetch_result.attempts:
+        return False
+    final_attempt = fetch_result.attempts[-1]
+    return final_attempt.hop_attempt_number > 1
 
 
 class WorkerExecutionOutcome(StrEnum):
@@ -27,13 +40,19 @@ def classify_error_code_and_retryability(
     site_scan_result: SiteScanResult,
 ) -> tuple[str, bool]:
     """Derive stable error code and retryability from page records and fetch outcomes."""
-    if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
-        return "ROBOTS_BLOCKED", False
-
     for page in site_scan_result.page_records:
         if page.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
             return "ROBOTS_BLOCKED", False
         if page.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+            diagnostics = site_scan_result.diagnostics
+            if diagnostics is not None and diagnostics.failure_code == "TLS_VERIFICATION_FAILED":
+                return "TLS_VERIFICATION_FAILED", False
+            if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+                return "DNS_NAME_NOT_FOUND", False
+            if diagnostics is not None and (
+                diagnostics.retry_count > 0 or diagnostics.retry_budget_exhausted
+            ):
+                return "ROBOTS_FETCH_ERROR", False
             return "ROBOTS_FETCH_ERROR", True
         if page.outcome == PageScanOutcome.UNSAFE_HOST:
             return "UNSAFE_HOST", False
@@ -44,10 +63,14 @@ def classify_error_code_and_retryability(
 
         if page.fetch_result:
             fetch_code = page.fetch_result.outcome
+            was_retried = _final_failed_hop_was_retried(page.fetch_result)
+
             if fetch_code == FetchOutcomeCode.TIMEOUT:
-                return "TIMEOUT", True
+                return "TIMEOUT", not was_retried
             if fetch_code == FetchOutcomeCode.TRANSPORT_ERROR:
-                return "TRANSPORT_ERROR", True
+                return "TRANSPORT_ERROR", not was_retried
+            if fetch_code == FetchOutcomeCode.DNS_NAME_NOT_FOUND:
+                return "DNS_NAME_NOT_FOUND", False
             if fetch_code == FetchOutcomeCode.DNS_RESOLUTION_FAILED:
                 return "DNS_RESOLUTION_FAILED", True
             if fetch_code == FetchOutcomeCode.UNSAFE_HOST:
@@ -67,10 +90,17 @@ def classify_error_code_and_retryability(
             if fetch_code == FetchOutcomeCode.HTTP_ERROR:
                 status_code = page.fetch_result.status_code
                 if status_code in RETRYABLE_HTTP_STATUSES:
-                    return f"HTTP_{status_code}", True
+                    return f"HTTP_{status_code}", not was_retried
                 if status_code is not None:
                     return f"HTTP_{status_code}", False
                 return "HTTP_ERROR", False
+
+    diagnostics = site_scan_result.diagnostics
+    if diagnostics is not None and diagnostics.failure_code == "DNS_NAME_NOT_FOUND":
+        return "DNS_NAME_NOT_FOUND", False
+
+    if site_scan_result.outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+        return "ROBOTS_BLOCKED", False
 
     return "SCAN_FAILED", True
 
@@ -104,7 +134,10 @@ def classify_worker_outcome(
     if outcome == SiteScanOutcome.COMPLETED_NO_EMAILS:
         return WorkerExecutionOutcome.TERMINAL_NO_EMAIL
 
-    if outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+    if outcome in (SiteScanOutcome.ROBOTS_BLOCKED, SiteScanOutcome.FAILED):
+        _, is_retryable = classify_error_code_and_retryability(site_scan_result)
+        if is_retryable and attempt_count < max_attempts:
+            return WorkerExecutionOutcome.RETRYABLE_FAILURE
         return WorkerExecutionOutcome.TERMINAL_FAILURE
 
     if outcome == SiteScanOutcome.PARTIAL:
@@ -118,11 +151,5 @@ def classify_worker_outcome(
 
     if outcome == SiteScanOutcome.CANCELLED:
         return WorkerExecutionOutcome.CANCELLED
-
-    if outcome == SiteScanOutcome.FAILED:
-        _, is_retryable = classify_error_code_and_retryability(site_scan_result)
-        if is_retryable and attempt_count < max_attempts:
-            return WorkerExecutionOutcome.RETRYABLE_FAILURE
-        return WorkerExecutionOutcome.TERMINAL_FAILURE
 
     return WorkerExecutionOutcome.TERMINAL_FAILURE

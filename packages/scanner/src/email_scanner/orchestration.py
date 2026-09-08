@@ -10,7 +10,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from email_scanner.discovery import discover_and_rank_links
 from email_scanner.errors import (
     FetchOutcomeCode,
     PageScanOutcome,
@@ -182,7 +181,7 @@ class SiteScanOrchestrator:
         pages_blocked_by_robots = 0
         pages_failed = 0
         last_request_time: float | None = None
-        stop_reason = "QUEUE_EXHAUSTED"
+        stop_reason: str = "QUEUE_EXHAUSTED"
 
         while queue:
             # Check cancellation
@@ -318,6 +317,276 @@ class SiteScanOrchestrator:
             if final_url_str:
                 visited_urls.add(final_url_str)
 
+            def _aggregate_findings(ext_result: Any, p_score: int) -> None:
+                for rejected in ext_result.rejected_candidates:
+                    global_rejected_set.add(rejected)
+
+                for finding in ext_result.findings:
+                    canonical = finding.canonical_email
+                    page_ev_records = tuple(
+                        EmailEvidenceRecord(
+                            source_url=e.source_url,
+                            source_kind=e.source_kind,
+                            raw_candidate=e.raw_candidate,
+                            evidence_snippet=e.evidence_snippet,
+                            page_score=p_score,
+                        )
+                        for e in (finding.evidence_records or ())
+                    ) or (
+                        EmailEvidenceRecord(
+                            source_url=finding.source_url,
+                            source_kind=finding.source_kind,
+                            raw_candidate=finding.raw_candidate,
+                            evidence_snippet=finding.evidence_snippet,
+                            page_score=p_score,
+                        ),
+                    )
+
+                    if canonical not in global_accepted_map:
+                        global_accepted_map[canonical] = EmailFinding(
+                            source_url=finding.source_url,
+                            raw_candidate=finding.raw_candidate,
+                            canonical_email=finding.canonical_email,
+                            local_part=finding.local_part,
+                            domain=finding.domain,
+                            source_kind=finding.source_kind,
+                            category=finding.category,
+                            domain_affinity=finding.domain_affinity,
+                            evidence_snippet=finding.evidence_snippet,
+                            disposition=finding.disposition,
+                            evidence_records=page_ev_records,
+                        )
+                    else:
+                        existing = global_accepted_map[canonical]
+                        combined_ev = list(existing.evidence_records)
+                        for new_rec in page_ev_records:
+                            if not any(
+                                r.source_url == new_rec.source_url
+                                and r.source_kind == new_rec.source_kind
+                                and r.evidence_snippet == new_rec.evidence_snippet
+                                for r in combined_ev
+                            ):
+                                combined_ev.append(new_rec)
+                        global_accepted_map[canonical] = EmailFinding(
+                            source_url=existing.source_url,
+                            raw_candidate=existing.raw_candidate,
+                            canonical_email=existing.canonical_email,
+                            local_part=existing.local_part,
+                            domain=existing.domain,
+                            source_kind=existing.source_kind,
+                            category=existing.category,
+                            domain_affinity=existing.domain_affinity,
+                            evidence_snippet=existing.evidence_snippet,
+                            disposition=existing.disposition,
+                            evidence_records=tuple(combined_ev),
+                        )
+
+            async def _attempt_hostname_fallback(
+                current_norm: NormalizedURL, current_depth: int
+            ) -> bool:
+                nonlocal stop_reason, pages_attempted, pages_fetched, pages_failed
+                nonlocal pages_blocked_by_robots, last_request_time, sequence_counter, pages_queued
+
+                if current_depth != 0 or not current_norm.registrable_domain:
+                    return False
+
+                if not current_norm.hostname.startswith("www."):
+                    variant_str = f"{current_norm.scheme}://www.{current_norm.registrable_domain}/"
+                else:
+                    variant_str = f"{current_norm.scheme}://{current_norm.registrable_domain}/"
+
+                if variant_str in visited_urls:
+                    return False
+
+                visited_urls.add(variant_str)
+                try:
+                    norm_variant = normalize_url(variant_str)
+                except Exception:
+                    return False
+
+                if self._cancellation_checker is not None and self._cancellation_checker():
+                    stop_reason = "CANCELLED"
+                    return True
+
+                var_robots = await self._robots_evaluator.evaluate(norm_variant, recorder=rec)
+
+                if self._cancellation_checker is not None and self._cancellation_checker():
+                    stop_reason = "CANCELLED"
+                    return True
+
+                if var_robots.decision == RobotsDecisionCode.DISALLOWED:
+                    pages_blocked_by_robots += 1
+                    pages_attempted += 1
+                    page_records.append(
+                        PageScanRecord(
+                            requested_url=variant_str,
+                            final_url=None,
+                            depth=0,
+                            outcome=PageScanOutcome.ROBOTS_DISALLOWED,
+                            status_code=None,
+                            robots_decision=var_robots,
+                            fetch_result=None,
+                            emails_found_count=0,
+                            links_discovered_count=0,
+                            error_message="Robots disallowed crawling",
+                        )
+                    )
+                    return True
+
+                if var_robots.decision == RobotsDecisionCode.TEMPORARY_FAILURE:
+                    pages_blocked_by_robots += 1
+                    pages_attempted += 1
+                    page_records.append(
+                        PageScanRecord(
+                            requested_url=variant_str,
+                            final_url=None,
+                            depth=0,
+                            outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+                            status_code=None,
+                            robots_decision=var_robots,
+                            fetch_result=None,
+                            emails_found_count=0,
+                            links_discovered_count=0,
+                            error_message="Robots.txt temporary failure",
+                        )
+                    )
+                    return True
+
+                if var_robots.decision != RobotsDecisionCode.ALLOWED:
+                    pages_blocked_by_robots += 1
+                    pages_attempted += 1
+                    page_records.append(
+                        PageScanRecord(
+                            requested_url=variant_str,
+                            final_url=None,
+                            depth=0,
+                            outcome=PageScanOutcome.ROBOTS_DISALLOWED,
+                            status_code=None,
+                            robots_decision=var_robots,
+                            fetch_result=None,
+                            emails_found_count=0,
+                            links_discovered_count=0,
+                            error_message=(
+                                f"Robots non-allowed decision: {var_robots.decision.value}"
+                            ),
+                        )
+                    )
+                    return True
+
+                # Allowed fallback proceeds
+                if not hasattr(self._fetcher, "request_gate"):
+                    crawl_delay = var_robots.crawl_delay or 0.0
+                    effective_delay = max(cfg.minimum_request_interval_seconds, crawl_delay)
+
+                    if last_request_time is not None:
+                        elapsed_since_last = self._clock() - last_request_time
+                        remaining_sleep = max(0.0, effective_delay - elapsed_since_last)
+
+                        if remaining_sleep > 0.0:
+                            if (
+                                self._cancellation_checker is not None
+                                and self._cancellation_checker()
+                            ):
+                                stop_reason = "CANCELLED"
+                                return True
+
+                            if self._sleeper is not None:
+                                await self._sleeper(remaining_sleep)
+
+                            if (
+                                self._cancellation_checker is not None
+                                and self._cancellation_checker()
+                            ):
+                                stop_reason = "CANCELLED"
+                                return True
+
+                    last_request_time = self._clock()
+
+                if self._cancellation_checker is not None and self._cancellation_checker():
+                    stop_reason = "CANCELLED"
+                    return True
+
+                pages_attempted += 1
+                var_fetch = await self._fetcher.fetch(
+                    norm_variant,
+                    redirect_validator=redirect_validator,
+                    recorder=rec,
+                )
+
+                if self._cancellation_checker is not None and self._cancellation_checker():
+                    stop_reason = "CANCELLED"
+                    return True
+
+                var_final_url_str = var_fetch.final_url or variant_str
+                if var_final_url_str:
+                    visited_urls.add(var_final_url_str)
+
+                if (
+                    var_fetch.outcome != FetchOutcomeCode.SUCCESS
+                    or is_directory_index_or_placeholder(var_fetch.body_text or "")
+                ):
+                    return False
+
+                # Successful fallback fetch
+                pages_fetched += 1
+                var_parse_start = self._clock()
+
+                from email_scanner.email_pipeline import extract_emails
+
+                var_extraction = extract_emails(
+                    var_final_url_str,
+                    var_fetch.body_text or "",
+                    cfg.email_config,
+                )
+                _aggregate_findings(var_extraction, 0)
+
+                from email_scanner.discovery import discover_and_rank_links
+
+                var_discovery = discover_and_rank_links(
+                    var_final_url_str,
+                    var_fetch.body_text or "",
+                    cfg.discovery_config,
+                )
+
+                rec.page_processing_duration_seconds += max(0.0, self._clock() - var_parse_start)
+
+                if 1 <= cfg.max_depth:
+                    for link in var_discovery.discovered_links:
+                        target_url = link.normalized_url
+                        if (
+                            target_url not in discovered_urls_set
+                            and target_url not in visited_urls
+                            and len(discovered_urls_set) < cfg.max_total_discovered_urls
+                        ):
+                            discovered_urls_set.add(target_url)
+                            link_score, _ = calculate_page_score(target_url, link.link_text)
+                            heapq.heappush(
+                                queue,
+                                _QueueItem(
+                                    score=link_score,
+                                    depth=1,
+                                    url=target_url,
+                                    sequence=sequence_counter,
+                                ),
+                            )
+                            sequence_counter += 1
+                            pages_queued += 1
+
+                page_records.append(
+                    PageScanRecord(
+                        requested_url=variant_str,
+                        final_url=var_final_url_str,
+                        depth=0,
+                        outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+                        status_code=var_fetch.status_code,
+                        robots_decision=var_robots,
+                        fetch_result=var_fetch,
+                        emails_found_count=len(var_extraction.findings),
+                        links_discovered_count=len(var_discovery.discovered_links),
+                    )
+                )
+                return True
+
             if fetch_result.outcome != FetchOutcomeCode.SUCCESS:
                 pages_failed += 1
                 page_outcome = (
@@ -345,7 +614,6 @@ class SiteScanOrchestrator:
             pages_fetched += 1
             parse_start_t = self._clock()
 
-            # Extract emails using final_url
             from email_scanner.email_pipeline import extract_emails
 
             extraction_result = extract_emails(
@@ -354,81 +622,22 @@ class SiteScanOrchestrator:
                 cfg.email_config,
             )
 
-            # Record rejected candidates
-            for rejected in extraction_result.rejected_candidates:
-                global_rejected_set.add(rejected)
-
-            # Aggregate findings with global deterministic deduplication
-            # and complete evidence tracking
             page_score = queue_item.score
             from email_scanner.models import EmailEvidenceRecord
 
-            for finding in extraction_result.findings:
-                canonical = finding.canonical_email
-                page_ev_records = tuple(
-                    EmailEvidenceRecord(
-                        source_url=e.source_url,
-                        source_kind=e.source_kind,
-                        raw_candidate=e.raw_candidate,
-                        evidence_snippet=e.evidence_snippet,
-                        page_score=page_score,
-                    )
-                    for e in (finding.evidence_records or ())
-                ) or (
-                    EmailEvidenceRecord(
-                        source_url=finding.source_url,
-                        source_kind=finding.source_kind,
-                        raw_candidate=finding.raw_candidate,
-                        evidence_snippet=finding.evidence_snippet,
-                        page_score=page_score,
-                    ),
-                )
+            _aggregate_findings(extraction_result, page_score)
 
-                if canonical not in global_accepted_map:
-                    global_accepted_map[canonical] = EmailFinding(
-                        source_url=finding.source_url,
-                        raw_candidate=finding.raw_candidate,
-                        canonical_email=finding.canonical_email,
-                        local_part=finding.local_part,
-                        domain=finding.domain,
-                        source_kind=finding.source_kind,
-                        category=finding.category,
-                        domain_affinity=finding.domain_affinity,
-                        evidence_snippet=finding.evidence_snippet,
-                        disposition=finding.disposition,
-                        evidence_records=page_ev_records,
-                    )
-                else:
-                    existing = global_accepted_map[canonical]
-                    combined_ev = list(existing.evidence_records)
-                    for new_rec in page_ev_records:
-                        if not any(
-                            r.source_url == new_rec.source_url
-                            and r.source_kind == new_rec.source_kind
-                            and r.evidence_snippet == new_rec.evidence_snippet
-                            for r in combined_ev
-                        ):
-                            combined_ev.append(new_rec)
-                    global_accepted_map[canonical] = EmailFinding(
-                        source_url=existing.source_url,
-                        raw_candidate=existing.raw_candidate,
-                        canonical_email=existing.canonical_email,
-                        local_part=existing.local_part,
-                        domain=existing.domain,
-                        source_kind=existing.source_kind,
-                        category=existing.category,
-                        domain_affinity=existing.domain_affinity,
-                        evidence_snippet=existing.evidence_snippet,
-                        disposition=existing.disposition,
-                        evidence_records=tuple(combined_ev),
-                    )
+            from email_scanner.discovery import (
+                discover_and_rank_links,
+                is_directory_index_or_placeholder,
+            )
 
-            # Discover links using final_url
             discovery_result = discover_and_rank_links(
                 final_url_str,
                 fetch_result.body_text or "",
                 cfg.discovery_config,
             )
+
             rec.page_processing_duration_seconds += max(0.0, self._clock() - parse_start_t)
 
             # Queue discovered links if within depth and total URL limits
@@ -467,6 +676,15 @@ class SiteScanOrchestrator:
                     links_discovered_count=len(discovery_result.discovered_links),
                 )
             )
+
+            # Check if root homepage returned a bare directory index or empty placeholder
+            if depth == 0 and (
+                is_directory_index_or_placeholder(fetch_result.body_text or "")
+                or len(discovery_result.discovered_links) == 0
+            ):
+                await _attempt_hostname_fallback(norm_current, depth)
+                if self._cancellation_checker is not None and self._cancellation_checker():
+                    break
 
         # Record remaining queued items as skipped for audit completeness
         while queue:
@@ -534,7 +752,30 @@ class SiteScanOrchestrator:
         }:
             site_outcome = SiteScanOutcome.ROBOTS_BLOCKED
         elif pages_fetched == 0:
-            site_outcome = SiteScanOutcome.FAILED
+            if any(
+                p.outcome
+                in {
+                    PageScanOutcome.ROBOTS_DISALLOWED,
+                    PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+                }
+                for p in page_records
+            ):
+                site_outcome = SiteScanOutcome.ROBOTS_BLOCKED
+            else:
+                site_outcome = SiteScanOutcome.FAILED
+        elif (
+            pages_fetched == 1
+            and not sorted_findings
+            and any(
+                p.outcome
+                in {
+                    PageScanOutcome.ROBOTS_DISALLOWED,
+                    PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+                }
+                for p in page_records
+            )
+        ):
+            site_outcome = SiteScanOutcome.ROBOTS_BLOCKED
         elif pages_failed > 0 or stop_reason == "MAX_ELAPSED_TIME_EXCEEDED":
             site_outcome = SiteScanOutcome.PARTIAL
         else:
@@ -550,21 +791,41 @@ class SiteScanOrchestrator:
 
         from email_scanner.errors import SiteScanFailureCode, map_fetch_outcome_to_failure_code
 
-        if site_outcome not in {SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS}:
+        if site_outcome in {SiteScanOutcome.COMPLETED, SiteScanOutcome.COMPLETED_NO_EMAILS}:
+            rec.failure_code = None
+        else:
             if rec.failure_code is None:
                 if site_outcome == SiteScanOutcome.CANCELLED:
                     rec.failure_code = SiteScanFailureCode.CANCELLED
+                elif page_records:
+                    robots_p = next(
+                        (
+                            p
+                            for p in page_records
+                            if p.outcome
+                            in {
+                                PageScanOutcome.ROBOTS_DISALLOWED,
+                                PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+                            }
+                        ),
+                        None,
+                    )
+                    if robots_p is not None and site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+                        if robots_p.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+                            rec.failure_code = SiteScanFailureCode.ROBOTS_TEMPORARY_FAILURE
+                        else:
+                            rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
+                    elif page_records[0].outcome == PageScanOutcome.ROBOTS_DISALLOWED:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
+                    elif page_records[0].outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_TEMPORARY_FAILURE
+                    elif page_records[0].fetch_result is not None:
+                        fetch_out = page_records[0].fetch_result.outcome
+                        rec.failure_code = map_fetch_outcome_to_failure_code(fetch_out)
+                    elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
+                        rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
                 elif site_outcome == SiteScanOutcome.ROBOTS_BLOCKED:
                     rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
-                elif page_records:
-                    first_p = page_records[0]
-                    if first_p.outcome == PageScanOutcome.ROBOTS_DISALLOWED:
-                        rec.failure_code = SiteScanFailureCode.ROBOTS_BLOCKED
-                    elif first_p.outcome == PageScanOutcome.ROBOTS_TEMPORARY_FAILURE:
-                        rec.failure_code = SiteScanFailureCode.ROBOTS_TEMPORARY_FAILURE
-                    elif first_p.fetch_result is not None:
-                        fetch_out = first_p.fetch_result.outcome
-                        rec.failure_code = map_fetch_outcome_to_failure_code(fetch_out)
 
         diagnostics_snapshot = rec.build_diagnostics()
 

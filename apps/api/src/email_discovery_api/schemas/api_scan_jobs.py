@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, TypeVar
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from email_discovery_api.models.enums import ScanJobSourceType, ScanJobStatus, ScanURLStatus
+from email_discovery_api.models.redirect_review import (
+    REDIRECT_REJECTED_CODE,
+    is_url_requiring_redirect_approval,
+)
 
 T = TypeVar("T")
 
@@ -30,6 +35,9 @@ class CreateScanJobApiRequest(BaseModel):
     )
     overrides: dict[int, bool] | None = Field(
         default=None, description="Optional index-based selection overrides"
+    )
+    approved_redirect_domains: dict[str, str] | None = Field(
+        default=None, description="Optional per-URL redirect domain approvals"
     )
     configuration_snapshot: dict[str, Any] = Field(
         default_factory=dict, description="Scan job configuration settings"
@@ -203,6 +211,35 @@ class ScanURLDiagnosticsApiResponse(BaseModel):
     failure_reason: str | None = None
 
 
+_FAILURE_REASON_DESCRIPTIONS: dict[str, str] = {
+    "ROBOTS_BLOCKED": "Blocked by an explicit robots.txt rule",
+    "ROBOTS_FETCH_ERROR": "Skipped because robots.txt could not be verified",
+    "ROBOTS_TEMPORARY_FAILURE": "Skipped because robots.txt could not be verified",
+    "HTTP_403": "Website denied automated access",
+    "AUTOMATED_ACCESS_DENIED": "Website denied automated access",
+    "OUT_OF_SCOPE_REDIRECT": "Redirected to another business website—approval required",
+    "BUSINESS_DOMAIN_REDIRECT_REVIEW": "Redirected to another business website—approval required",
+    REDIRECT_REJECTED_CODE: "External redirect rejected by user",
+    "NO_EMAIL": "No public email detected",
+    "REJECTED_UNRELATED": "Public email found but rejected as unrelated",
+    "DIRECTORY_INDEX_ONLY": "No meaningful website content found across safe origin variants",
+    "TRANSPORT_ERROR": "Network or TLS connection failed",
+    "DNS_RESOLUTION_FAILED": "Network or TLS connection failed",
+    "DNS_NAME_NOT_FOUND": "Domain name does not exist or has no DNS records",
+    "TLS_VERIFICATION_FAILED": "Network or TLS connection failed",
+    "CONNECT_TIMEOUT": "Network or TLS connection failed",
+    "READ_TIMEOUT": "Network or TLS connection failed",
+    "GENERIC_TIMEOUT": "Network or TLS connection failed",
+}
+
+
+def format_failure_reason(fail_code: str | None, error_message: str | None) -> str:
+    """Format failure_reason into clean human-readable descriptions."""
+    if fail_code and fail_code in _FAILURE_REASON_DESCRIPTIONS:
+        return _FAILURE_REASON_DESCRIPTIONS[fail_code]
+    return fail_code or error_message or "Scan execution failed"
+
+
 class ScanURLApiResponse(BaseModel):
     """Public scan URL detail response model."""
 
@@ -226,6 +263,11 @@ class ScanURLApiResponse(BaseModel):
     primary_email_selection_version: str | None = None
     plain_language_outcome: str | None = None
     failure_reason: str | None = None
+    approved_redirect_domain: str | None = None
+    redirect_target_domain: str | None = None
+    redirect_target_url: str | None = None
+    requires_redirect_approval: bool = False
+    can_approve_redirect: bool = False
     diagnostics: ScanURLDiagnosticsApiResponse | None = None
 
     @classmethod
@@ -253,7 +295,7 @@ class ScanURLApiResponse(BaseModel):
         else:
             plain_outcome = "Failed"
             fail_code = getattr(url, "last_failure_code", None) or url.last_error_code
-            reason = fail_code or url.last_error_message or "Scan execution failed"
+            reason = format_failure_reason(fail_code, url.last_error_message)
 
         tot_dur = getattr(url, "total_duration_seconds", None)
         p_attempted = getattr(url, "pages_attempted", None)
@@ -275,6 +317,16 @@ class ScanURLApiResponse(BaseModel):
                 failure_reason=reason,
             )
 
+        app_redirect = getattr(url, "approved_redirect_domain", None)
+        target_redirect = getattr(url, "redirect_target_domain", None)
+        target_redirect_url = getattr(url, "redirect_target_url", None)
+
+        requires_redirect = is_url_requiring_redirect_approval(url)
+        job_obj = getattr(url, "scan_job", None)
+        can_approve = requires_redirect and (
+            job_obj is None or getattr(job_obj, "status", None) not in ("CANCELLED", "CANCELLING")
+        )
+
         return cls(
             id=url.id,
             scan_job_id=url.scan_job_id,
@@ -293,6 +345,11 @@ class ScanURLApiResponse(BaseModel):
             primary_email_selection_version=selection_version,
             plain_language_outcome=plain_outcome,
             failure_reason=reason,
+            approved_redirect_domain=app_redirect,
+            redirect_target_domain=target_redirect,
+            redirect_target_url=target_redirect_url,
+            requires_redirect_approval=requires_redirect,
+            can_approve_redirect=can_approve,
             diagnostics=diag_obj,
         )
 
@@ -322,9 +379,73 @@ class JobEventApiResponse(BaseModel):
 
 
 class PaginatedResponse[T](BaseModel):
-    """Generic paginated response envelope with next_cursor."""
+    """Generic paginated response envelope with next_cursor and optional total_count."""
 
     model_config = ConfigDict(frozen=True)
 
     items: list[T]
     next_cursor: str | None = None
+    total_count: int | None = None
+
+
+class BulkRedirectDisposition(StrEnum):
+    """Result disposition indicating mutation vs idempotent skip."""
+
+    MUTATED = "MUTATED"
+    ALREADY_APPLIED = "ALREADY_APPLIED"
+
+
+class BulkRedirectAction(StrEnum):
+    """Bulk redirect review operation action."""
+
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+
+
+class BulkRedirectApiRequest(BaseModel):
+    """Client request model for bulk redirect approval or rejection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url_ids: list[UUID] = Field(
+        ...,
+        min_length=1,
+        max_length=250,
+        description="Explicit list of 1 to 250 ScanURL IDs",
+    )
+
+    @field_validator("url_ids")
+    @classmethod
+    def validate_url_ids(cls, v: list[UUID]) -> list[UUID]:
+        if len(v) < 1:
+            raise ValueError("Bulk request must contain at least 1 URL ID.")
+        if len(v) > 250:
+            raise ValueError("Bulk request cannot contain more than 250 URL IDs.")
+        unique = set(v)
+        if len(unique) < 1 or len(unique) > 250:
+            raise ValueError("Bulk request must contain between 1 and 250 unique URL IDs.")
+        return v
+
+
+class BulkRedirectItemResult(BaseModel):
+    """Compact outcome for a single requested URL ID."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url_id: UUID
+    status: ScanURLStatus
+    disposition: BulkRedirectDisposition
+
+
+class BulkRedirectApiResponse(BaseModel):
+    """Bounded response model for bulk redirect operations."""
+
+    model_config = ConfigDict(frozen=True)
+
+    job_id: UUID
+    action: BulkRedirectAction
+    requested_count: int
+    unique_requested_count: int
+    affected_count: int
+    skipped_count: int
+    results: list[BulkRedirectItemResult]

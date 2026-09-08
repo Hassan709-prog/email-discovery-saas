@@ -1,8 +1,12 @@
 """Unit tests for deterministic scanner result mapper, URL privacy, and candidate masking."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
+
+import pytest
 
 from email_discovery_api.mappers.crawl_results import (
+    _evaluate_retryability,  # pyright: ignore[reportPrivateUsage]
     map_site_scan_result,
     mask_email_candidate,
     sanitize_text,
@@ -23,6 +27,7 @@ from email_scanner.models import (
     PageScanRecord,
     RedirectHop,
     RobotsDecision,
+    SiteScanDiagnostics,
     SiteScanResult,
     SiteScanStatistics,
 )
@@ -328,3 +333,516 @@ def test_result_mapper_deduplicates_page_records_and_retains_evidence() -> None:
     assert attempt1.result_checksum == attempt2.result_checksum
     assert len(pages1) == len(pages2)
     assert len(findings1) == len(findings2)
+
+
+def test_mapper_enforces_none_failure_code_for_successful_outcomes() -> None:
+    """Verify API mapper sets failure_code=None for COMPLETED and COMPLETED_NO_EMAILS."""
+    from email_scanner.models import SiteScanDiagnostics
+
+    now = datetime.now(UTC)
+    diag_with_failure = SiteScanDiagnostics(
+        total_duration_seconds=1.0,
+        dns_resolution_duration_seconds=0.1,
+        gate_wait_duration_seconds=0.0,
+        robots_fetch_duration_seconds=0.1,
+        robots_evaluation_duration_seconds=0.1,
+        http_fetch_duration_seconds=0.5,
+        page_processing_duration_seconds=0.2,
+        retry_count=1,
+        total_retry_delay_seconds=0.5,
+        redirect_count=0,
+        http_status=200,
+        failure_code="UNEXPECTED_INTERNAL_ERROR",
+        time_budget_exhausted=False,
+        cancellation_occurred=False,
+        retry_budget_exhausted=False,
+    )
+
+    res_completed_no_emails = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=1,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED_NO_EMAILS",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_no_emails, _, _, _, _ = map_site_scan_result(
+        res_completed_no_emails, attempt_number=1, now=now
+    )
+    assert attempt_no_emails.failure_code is None
+
+    res_completed = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=1,
+            accepted_email_findings=1,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_completed, _, _, _, _ = map_site_scan_result(res_completed, attempt_number=1, now=now)
+    assert attempt_completed.failure_code is None
+
+    # PARTIAL outcome should retain failure code
+    res_partial = SiteScanResult(
+        starting_url="https://example.com",
+        outcome=SiteScanOutcome.PARTIAL,
+        statistics=SiteScanStatistics(
+            pages_queued=2,
+            pages_attempted=2,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=2,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=1.0,
+            stop_reason="MAX_PAGES_REACHED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=diag_with_failure,
+    )
+
+    attempt_partial, _, _, _, _ = map_site_scan_result(res_partial, attempt_number=1, now=now)
+    assert attempt_partial.failure_code == "UNEXPECTED_INTERNAL_ERROR"
+
+
+def test_map_site_scan_result_preserves_and_sanitizes_redirect_target_url() -> None:
+    """Verify mapper preserves redirect_target_url and strips query/fragment via sanitize_url."""
+    now = datetime.now(UTC)
+    fetch_res = FetchResult(
+        final_url="https://carefreeair.com/start",
+        status_code=301,
+        content_type=None,
+        body_text=None,
+        redirect_history=(),
+        outcome=FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT,
+        error_message="Redirect rejected by scope policy",
+        redirect_target_url="https://carefreeacandheating.com/landing?token=secret123&foo=bar#section1",
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://carefreeair.com/start",
+        final_url="https://carefreeair.com/start",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=301,
+        robots_decision=RobotsDecision(
+            target_url="https://carefreeair.com/start",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://carefreeair.com/start",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=0,
+            pages_blocked_by_robots=0,
+            pages_failed=1,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="FAILED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.final_url == "https://carefreeair.com/start"
+    assert attempt.redirect_target_url == "https://carefreeacandheating.com/landing"
+
+
+def test_map_site_scan_result_none_redirect_target_url() -> None:
+    """Verify mapper leaves redirect_target_url None when fetch_result has no target."""
+    now = datetime.now(UTC)
+    fetch_res = FetchResult(
+        final_url="https://example.com/",
+        status_code=200,
+        content_type="text/html",
+        body_text="<html>content</html>",
+        redirect_history=(),
+        outcome=FetchOutcomeCode.SUCCESS,
+        redirect_target_url=None,
+    )
+    page_rec = PageScanRecord(
+        requested_url="https://example.com/",
+        final_url="https://example.com/",
+        depth=0,
+        outcome=PageScanOutcome.FETCHED_AND_PROCESSED,
+        status_code=200,
+        robots_decision=RobotsDecision(
+            target_url="https://example.com/",
+            decision=RobotsDecisionCode.ALLOWED,
+            crawl_delay=None,
+            reason="OK",
+        ),
+        fetch_result=fetch_res,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(page_rec,),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.redirect_target_url is None
+
+
+def test_map_site_scan_result_execution_interval_12_5_seconds() -> None:
+    """Verify a 12.5-second result creates a 12.5-second timestamp interval."""
+    now = datetime(2026, 9, 5, 12, 0, 15, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=12.5,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now - timedelta(seconds=12.5)
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 12.5
+    assert attempt.elapsed_seconds == 12.5
+
+
+def test_map_site_scan_result_execution_interval_zero_seconds() -> None:
+    """Verify zero duration remains valid and creates identical start and completion timestamps."""
+    now = datetime(2026, 9, 5, 12, 0, 15, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=0.0,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 0.0
+    assert attempt.elapsed_seconds == 0.0
+
+
+def test_map_site_scan_result_preserves_timezone_awareness() -> None:
+    """Verify timezone-aware datetime instances preserve their exact timezone awareness."""
+    custom_tz = timezone(timedelta(hours=-5))
+    now = datetime(2026, 9, 5, 8, 30, 0, tzinfo=custom_tz)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.COMPLETED_NO_EMAILS,
+        statistics=SiteScanStatistics(
+            pages_queued=1,
+            pages_attempted=1,
+            pages_fetched=1,
+            pages_blocked_by_robots=0,
+            pages_failed=0,
+            urls_discovered=0,
+            accepted_email_findings=0,
+            rejected_email_candidates=0,
+            elapsed_seconds=7.25,
+            stop_reason="COMPLETED",
+        ),
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at.tzinfo == custom_tz
+    assert attempt.started_at.tzinfo == custom_tz
+    assert attempt.completed_at == now
+    assert attempt.started_at == now - timedelta(seconds=7.25)
+    assert (attempt.completed_at - attempt.started_at).total_seconds() == 7.25
+
+
+@pytest.mark.parametrize(
+    "invalid_elapsed",
+    [
+        -5.0,
+        -0.001,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        None,
+        True,
+        False,
+        "invalid_str",
+        1e308,
+    ],
+)
+def test_map_site_scan_result_defensive_invalid_elapsed_values(invalid_elapsed: Any) -> None:
+    """Verify invalid elapsed values do not produce future timestamps or unhandled errors."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+
+    class FakeStats:
+        elapsed_seconds = invalid_elapsed
+
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=FakeStats(),  # type: ignore[arg-type]
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now
+    assert attempt.started_at == attempt.completed_at
+    assert attempt.elapsed_seconds == 0.0
+
+
+def test_map_site_scan_result_defensive_missing_statistics() -> None:
+    """Verify missing statistics produces valid non-future timestamps."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    scan_res = SiteScanResult(
+        starting_url="https://example.com/",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=None,  # type: ignore[arg-type]
+        page_records=(),
+        email_findings=(),
+        rejected_email_candidates=(),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.completed_at is not None
+    assert attempt.completed_at == now
+    assert attempt.started_at == now
+    assert attempt.started_at == attempt.completed_at
+    assert attempt.elapsed_seconds == 0.0
+
+
+def _make_dummy_stats() -> SiteScanStatistics:
+    return SiteScanStatistics(
+        pages_queued=1,
+        pages_attempted=1,
+        pages_fetched=0,
+        pages_blocked_by_robots=0,
+        pages_failed=1,
+        urls_discovered=0,
+        accepted_email_findings=0,
+        rejected_email_candidates=0,
+        elapsed_seconds=0.1,
+        stop_reason="FAILED",
+    )
+
+
+def _make_dummy_robots(url: str = "https://example.com") -> RobotsDecision:
+    return RobotsDecision(
+        target_url=url,
+        decision=RobotsDecisionCode.ALLOWED,
+        crawl_delay=None,
+        reason="Allowed",
+    )
+
+
+def test_evaluate_retryability_permanent_vs_transient_dns() -> None:
+    """Verify permanent DNS is terminal and transient DNS is retryable."""
+    # 1. Direct page fetch permanent DNS failure is non-retryable
+    page_perm = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://nonexistent.example"),
+        fetch_result=FetchResult(
+            final_url="https://nonexistent.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+            error_message="Host nonexistent.example does not exist",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_perm = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_perm,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+    assert _evaluate_retryability(res_perm) is False
+
+    # 2. ROBOTS_TEMPORARY_FAILURE carrying DNS_NAME_NOT_FOUND is non-retryable
+    page_robots = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.ROBOTS_TEMPORARY_FAILURE,
+        status_code=None,
+        robots_decision=RobotsDecision(
+            target_url="https://nonexistent.example",
+            decision=RobotsDecisionCode.TEMPORARY_FAILURE,
+            crawl_delay=None,
+            reason="robots.txt fetch error: Host nonexistent.example does not exist",
+        ),
+        fetch_result=None,
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_robots = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_robots,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+    assert _evaluate_retryability(res_robots) is False
+
+    # 3. Direct page fetch transient DNS failure is retryable
+    page_trans = PageScanRecord(
+        requested_url="https://transient.example",
+        final_url="https://transient.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://transient.example"),
+        fetch_result=FetchResult(
+            final_url="https://transient.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_RESOLUTION_FAILED,
+            error_message="Temporary failure in name resolution",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    res_trans = SiteScanResult(
+        starting_url="https://transient.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_trans,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_RESOLUTION_FAILED"),
+    )
+    assert _evaluate_retryability(res_trans) is True
+
+
+def test_map_site_scan_result_permanent_dns_is_not_retryable() -> None:
+    """Verify map_site_scan_result sets retryable=False for permanent DNS."""
+    now = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    page_perm = PageScanRecord(
+        requested_url="https://nonexistent.example",
+        final_url="https://nonexistent.example",
+        depth=0,
+        outcome=PageScanOutcome.FETCH_FAILED,
+        status_code=None,
+        robots_decision=_make_dummy_robots("https://nonexistent.example"),
+        fetch_result=FetchResult(
+            final_url="https://nonexistent.example",
+            status_code=None,
+            content_type=None,
+            body_text=None,
+            redirect_history=(),
+            outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+            error_message="Host nonexistent.example does not exist",
+        ),
+        emails_found_count=0,
+        links_discovered_count=0,
+    )
+    scan_res = SiteScanResult(
+        starting_url="https://nonexistent.example",
+        outcome=SiteScanOutcome.FAILED,
+        statistics=_make_dummy_stats(),
+        page_records=(page_perm,),
+        email_findings=(),
+        rejected_email_candidates=(),
+        diagnostics=SiteScanDiagnostics(failure_code="DNS_NAME_NOT_FOUND"),
+    )
+
+    attempt, _, _, _, _ = map_site_scan_result(scan_res, attempt_number=1, now=now)
+    assert attempt.retryable is False
+    assert attempt.failure_code == "DNS_NAME_NOT_FOUND"

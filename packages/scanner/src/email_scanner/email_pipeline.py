@@ -179,6 +179,11 @@ def extract_emails(
             if len(raw_candidates_list) < cfg.max_raw_candidates:
                 raw_candidates_list.append((raw_cand, EmailSourceKind.MAILTO, snippet))
 
+    for decoded_email, _hex_val in parser.cfemail_decoded:
+        if len(raw_candidates_list) < cfg.max_raw_candidates:
+            snippet = f"data-cfemail decoded: {decoded_email}"
+            raw_candidates_list.append((decoded_email, EmailSourceKind.OBFUSCATED_TEXT, snippet))
+
     if visible_text_full:
         for raw_cand, kind, snippet in extract_visible_candidates(
             visible_text_full, cfg.max_evidence_length

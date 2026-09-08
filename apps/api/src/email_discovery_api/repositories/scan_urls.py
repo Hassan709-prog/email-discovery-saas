@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from email_discovery_api.models.scan_job import ScanJob
@@ -30,14 +30,22 @@ class ScanURLRepository:
         cursor_index: int | None = None,
         cursor_id: UUID | None = None,
         status: str | None = None,
+        requires_redirect_approval: bool | None = None,
     ) -> list[ScanURL]:
         """List scan URLs with tenant JOIN and deterministic ordering."""
-        from sqlalchemy.orm import selectinload
+        from sqlalchemy.orm import contains_eager, selectinload
+
+        from email_discovery_api.models.redirect_review import (
+            get_requires_redirect_approval_sql_clause,
+        )
 
         stmt = (
             select(ScanURL)
-            .options(selectinload(ScanURL.email_finding))
             .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .options(
+                contains_eager(ScanURL.scan_job),
+                selectinload(ScanURL.email_finding),
+            )
             .where(
                 ScanJob.organization_id == organization_id,
                 ScanURL.scan_job_id == job_id,
@@ -46,6 +54,13 @@ class ScanURLRepository:
 
         if status:
             stmt = stmt.where(ScanURL.status == status)
+
+        if requires_redirect_approval is not None:
+            approval_clause = get_requires_redirect_approval_sql_clause()
+            if requires_redirect_approval:
+                stmt = stmt.where(func.coalesce(approval_clause, False).is_(True))
+            else:
+                stmt = stmt.where(func.coalesce(approval_clause, False).is_(False))
 
         if cursor_index is not None and cursor_id is not None:
             stmt = stmt.where(
@@ -57,13 +72,81 @@ class ScanURLRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def count_urls(
+        self,
+        organization_id: UUID,
+        job_id: UUID,
+        *,
+        status: str | None = None,
+        requires_redirect_approval: bool | None = None,
+    ) -> int:
+        """Count tenant-scoped scan URLs matching status and redirect approval filters."""
+        from email_discovery_api.models.redirect_review import (
+            get_requires_redirect_approval_sql_clause,
+        )
+
+        stmt = (
+            select(func.count())
+            .select_from(ScanURL)
+            .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanURL.scan_job_id == job_id,
+            )
+        )
+
+        if status:
+            stmt = stmt.where(ScanURL.status == status)
+
+        if requires_redirect_approval is not None:
+            approval_clause = get_requires_redirect_approval_sql_clause()
+            if requires_redirect_approval:
+                stmt = stmt.where(func.coalesce(approval_clause, False).is_(True))
+            else:
+                stmt = stmt.where(func.coalesce(approval_clause, False).is_(False))
+
+        result = await self.session.execute(stmt)
+        return int(result.scalar() or 0)
+
+    async def get_urls_for_update(
+        self, organization_id: UUID, job_id: UUID, url_ids: list[UUID]
+    ) -> list[ScanURL]:
+        """Lock and retrieve tenant-scoped ScanURL rows in deterministic ID order."""
+        from sqlalchemy.orm import contains_eager
+
+        if not url_ids:
+            return []
+
+        stmt = (
+            select(ScanURL)
+            .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .options(
+                contains_eager(ScanURL.scan_job),
+            )
+            .where(
+                ScanJob.organization_id == organization_id,
+                ScanURL.scan_job_id == job_id,
+                ScanURL.id.in_(url_ids),
+            )
+            .order_by(ScanURL.id.asc())
+            .with_for_update()
+        )
+        res = await self.session.execute(stmt)
+        return list(res.scalars().all())
+
     async def get_url_for_update(
         self, organization_id: UUID, job_id: UUID, scan_url_id: UUID
     ) -> ScanURL | None:
         """Lock and retrieve tenant-scoped ScanURL row using SELECT ... FOR UPDATE."""
+        from sqlalchemy.orm import contains_eager, selectinload
+
         stmt = (
             select(ScanURL)
             .join(ScanJob, ScanURL.scan_job_id == ScanJob.id)
+            .options(
+                contains_eager(ScanURL.scan_job),
+                selectinload(ScanURL.email_finding),
+            )
             .where(
                 ScanJob.organization_id == organization_id,
                 ScanURL.scan_job_id == job_id,

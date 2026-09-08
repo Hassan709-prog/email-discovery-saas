@@ -125,9 +125,16 @@ def test_should_retry_fetch_classification() -> None:
     assert should_retry_fetch("GET", FetchOutcomeCode.OUT_OF_SCOPE_REDIRECT, None) == (False, None)
     assert should_retry_fetch("GET", FetchOutcomeCode.INVALID_URL, None) == (False, None)
 
-    # Timeouts and Transport errors are retryable
+    # Permanent DNS failures are NEVER retryable
+    assert should_retry_fetch("GET", FetchOutcomeCode.DNS_NAME_NOT_FOUND, None) == (False, None)
+
+    # Timeouts, Transport errors, and Transient DNS errors are retryable
     assert should_retry_fetch("GET", FetchOutcomeCode.TIMEOUT, None) == (True, RetryReason.TIMEOUT)
     assert should_retry_fetch("GET", FetchOutcomeCode.TRANSPORT_ERROR, None) == (
+        True,
+        RetryReason.TRANSPORT_ERROR,
+    )
+    assert should_retry_fetch("GET", FetchOutcomeCode.DNS_RESOLUTION_FAILED, None) == (
         True,
         RetryReason.TRANSPORT_ERROR,
     )

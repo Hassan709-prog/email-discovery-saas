@@ -125,6 +125,9 @@ class ScanURL(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     pages_fetched: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_failure_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    approved_redirect_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    redirect_target_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    redirect_target_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     scan_job: Mapped[ScanJob] = relationship(back_populates="scan_urls")

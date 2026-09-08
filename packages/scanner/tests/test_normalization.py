@@ -6,6 +6,7 @@ from email_scanner import (
     HostType,
     URLNormalizationError,
     URLNormalizationErrorCode,
+    canonicalize_redirect_domain,
     normalize_url,
 )
 
@@ -99,3 +100,33 @@ def test_invalid_inputs_return_stable_error_codes(
         normalize_url(raw_url)
 
     assert error.value.code is expected_code
+
+
+@pytest.mark.parametrize(
+    ("input_val", "expected_domain"),
+    [
+        ("www.destination.com", "destination.com"),
+        ("destination.com", "destination.com"),
+        ("sub.shop.destination.co.uk", "destination.co.uk"),
+        ("https://www.destination.com:8080/path?q=1", "destination.com"),
+        ("http://destination.com/", "destination.com"),
+        ("DESTINATION.COM.", "destination.com"),
+        ("  \t\r\n WWW.DESTINATION.COM. \n ", "destination.com"),
+        ("https://sub.DOMAIN.com./deep/path", "domain.com"),
+        ("https://xn--bcher-kva.de", "xn--bcher-kva.de"),
+        (None, None),
+        ("", None),
+        ("   \t\r\n", None),
+        ("192.168.1.1", None),
+        ("https://10.0.0.1/path", None),
+        ("http://[2001:db8::1]", None),
+        ("invalid..domain", None),
+        ("localhost", None),
+        ("com", None),
+        (".com", None),
+        ("..", None),
+        ("://bad-url", None),
+    ],
+)
+def test_canonicalize_redirect_domain(input_val: str | None, expected_domain: str | None) -> None:
+    assert canonicalize_redirect_domain(input_val) == expected_domain

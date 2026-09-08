@@ -27,6 +27,7 @@ describe('Header & Navigation Audit', () => {
       logout: mockLogout,
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(<Navbar />);
@@ -48,6 +49,7 @@ describe('Header & Navigation Audit', () => {
       logout: mockLogout,
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(<Navbar />);
@@ -72,6 +74,7 @@ describe('Header & Navigation Audit', () => {
       logout: mockLogout,
       logoutAll: vi.fn(),
       refreshSession: vi.fn(),
+      retrySession: vi.fn(),
     });
 
     render(<Navbar />);

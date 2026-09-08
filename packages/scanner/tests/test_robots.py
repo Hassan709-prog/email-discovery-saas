@@ -1,17 +1,26 @@
 """Tests for scanner-core RobotsPolicyEvaluator."""
 
 import asyncio
+from typing import Any
 
 import httpx
+import pytest
 
-from email_scanner.errors import HostSafetyError, HostSafetyErrorCode
+from email_scanner.errors import (
+    FetchOutcomeCode,
+    HostSafetyError,
+    HostSafetyErrorCode,
+    SiteScanFailureCode,
+)
 from email_scanner.fetching import AsyncHTTPFetcher
 from email_scanner.host_safety import validate_public_host
 from email_scanner.models import (
     FetchConfig,
+    FetchResult,
     HostType,
     NormalizedURL,
     RobotsDecisionCode,
+    SiteScanDiagnosticRecorder,
 )
 from email_scanner.robots import RobotsPolicyEvaluator
 
@@ -79,10 +88,11 @@ def test_robots_allow_disallow_and_crawl_delay() -> None:
     asyncio.run(_test())
 
 
-def test_robots_401_403_deny() -> None:
+@pytest.mark.parametrize("status_code", [401, 403, 404, 410])
+def test_robots_unavailable_4xx_allows_crawling(status_code: int) -> None:
     async def _test() -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(403, headers={"Content-Type": "text/plain"})
+            return httpx.Response(status_code, headers={"Content-Type": "text/plain"})
 
         transport = httpx.MockTransport(handler)
         client = httpx.AsyncClient(transport=transport)
@@ -90,48 +100,28 @@ def test_robots_401_403_deny() -> None:
         evaluator = RobotsPolicyEvaluator(fetcher=fetcher)
 
         decision = await evaluator.evaluate("https://denied.com/any/page")
-        assert decision.decision == RobotsDecisionCode.DISALLOWED
-        assert "403" in decision.reason
-
-    asyncio.run(_test())
-
-
-def test_robots_ordinary_404_allow() -> None:
-    async def _test() -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(404, headers={"Content-Type": "text/plain"})
-
-        transport = httpx.MockTransport(handler)
-        client = httpx.AsyncClient(transport=transport)
-        fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
-        evaluator = RobotsPolicyEvaluator(fetcher=fetcher)
-
-        decision = await evaluator.evaluate("https://missing.com/any/page")
         assert decision.decision == RobotsDecisionCode.ALLOWED
+        assert str(status_code) in decision.reason
         assert "unavailable" in decision.reason
 
     asyncio.run(_test())
 
 
-def test_robots_429_and_5xx_temporary_deny() -> None:
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+def test_robots_429_and_5xx_are_temporary_failures(status_code: int) -> None:
     async def _test() -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.host == "error.com":
-                return httpx.Response(503, headers={"Content-Type": "text/plain"})
-            return httpx.Response(429, headers={"Content-Type": "text/plain"})
+            return httpx.Response(status_code, headers={"Content-Type": "text/plain"})
 
         transport = httpx.MockTransport(handler)
         client = httpx.AsyncClient(transport=transport)
         fetcher = AsyncHTTPFetcher(dns_resolver=FakeDNSResolver(), client=client)
         evaluator = RobotsPolicyEvaluator(fetcher=fetcher)
 
-        d1 = await evaluator.evaluate("https://error.com/page")
-        assert d1.decision == RobotsDecisionCode.TEMPORARY_FAILURE
-        assert "503" in d1.reason
-
-        d2 = await evaluator.evaluate("https://example.com/page")
-        assert d2.decision == RobotsDecisionCode.TEMPORARY_FAILURE
-        assert "429" in d2.reason
+        decision = await evaluator.evaluate("https://error.com/page")
+        assert decision.decision == RobotsDecisionCode.TEMPORARY_FAILURE
+        assert str(status_code) in decision.reason
+        assert "temporary failure" in decision.reason
 
     asyncio.run(_test())
 
@@ -198,5 +188,87 @@ def test_stable_deterministic_results() -> None:
         res2 = await evaluator2.evaluate("https://example.com/bad/thing")
 
         assert res1 == res2
+
+    asyncio.run(_test())
+
+
+def test_robots_evaluation_timing_excludes_fetch_time() -> None:
+    """Robots parsing/evaluation timing must not count the robots network fetch twice."""
+
+    async def _test() -> None:
+        current_time = 100.0
+
+        def fake_clock() -> float:
+            return current_time
+
+        class TimedFetcher:
+            config = FetchConfig()
+
+            async def fetch(self, *_args: object, **_kwargs: object) -> FetchResult:
+                nonlocal current_time
+                current_time += 2.0
+                return FetchResult(
+                    final_url="https://example.com/robots.txt",
+                    status_code=200,
+                    content_type="text/plain",
+                    body_text="User-agent: *\nAllow: /",
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.SUCCESS,
+                )
+
+            class RequestGate:
+                def update_domain_interval(self, *_args: object) -> None:
+                    return None
+
+            request_gate = RequestGate()
+
+        recorder = SiteScanDiagnosticRecorder()
+        evaluator = RobotsPolicyEvaluator(fetcher=TimedFetcher(), clock=fake_clock)  # type: ignore[arg-type]
+
+        decision = await evaluator.evaluate("https://example.com/", recorder=recorder)
+
+        assert decision.decision == RobotsDecisionCode.ALLOWED
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.robots_fetch_duration_seconds == 2.0
+        assert diagnostics.robots_evaluation_duration_seconds == 0.0
+
+    asyncio.run(_test())
+
+
+def test_robots_permanent_dns_failure_diagnostics() -> None:
+    async def _test() -> None:
+        class PermanentDNSFailFetcher:
+            config = FetchConfig()
+
+            async def fetch(
+                self, *_args: object, recorder: Any | None = None, **_kwargs: object
+            ) -> FetchResult:
+                if recorder is not None and hasattr(recorder, "failure_code"):
+                    recorder.failure_code = SiteScanFailureCode.DNS_NAME_NOT_FOUND
+                return FetchResult(
+                    final_url="https://nonexistent.example/robots.txt",
+                    status_code=None,
+                    content_type=None,
+                    body_text=None,
+                    redirect_history=(),
+                    outcome=FetchOutcomeCode.DNS_NAME_NOT_FOUND,
+                    error_message="Host nonexistent.example does not exist",
+                )
+
+            class RequestGate:
+                def update_domain_interval(self, *_args: object) -> None:
+                    return None
+
+            request_gate = RequestGate()
+
+        recorder = SiteScanDiagnosticRecorder()
+        evaluator = RobotsPolicyEvaluator(fetcher=PermanentDNSFailFetcher())  # type: ignore[arg-type]
+        decision = await evaluator.evaluate("https://nonexistent.example/", recorder=recorder)
+
+        assert decision.decision == RobotsDecisionCode.TEMPORARY_FAILURE
+        assert "robots.txt fetch error" in decision.reason
+        assert recorder.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
+        diagnostics = recorder.build_diagnostics()
+        assert diagnostics.failure_code == SiteScanFailureCode.DNS_NAME_NOT_FOUND
 
     asyncio.run(_test())

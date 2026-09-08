@@ -22,6 +22,7 @@ vi.mock('@/context/auth-context', () => ({
     logout: vi.fn(),
     logoutAll: vi.fn(),
     refreshSession: vi.fn(),
+    retrySession: vi.fn(),
   }),
   AuthProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
@@ -286,5 +287,110 @@ describe('JobDetailPage', () => {
     expect(localStorage.getItem('refresh_token')).toBeNull();
     expect(sessionStorage.getItem('access_token')).toBeNull();
     expect(sessionStorage.getItem('refresh_token')).toBeNull();
+  });
+
+  it('renders Approve & Retry button ONLY when redirect approval is required and permitted', async () => {
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(mockJobDetail('COMPLETED_WITH_ERRORS'));
+
+    const redirectUrl: ScanURLApiResponse = {
+      id: 'url-redir-1',
+      scan_job_id: 'job-detail-123',
+      original_index: 0,
+      original_input: 'http://source-site.com/',
+      normalized_url: 'https://source-site.com/',
+      normalized_domain: 'source-site.com',
+      status: 'FAILED',
+      duplicate_of_scan_url_id: null,
+      last_error_code: 'OUT_OF_SCOPE_REDIRECT',
+      created_at: new Date().toISOString(),
+      redirect_target_domain: 'destination-site.com',
+      requires_redirect_approval: true,
+      can_approve_redirect: true,
+    };
+
+    const normalFailedUrl: ScanURLApiResponse = {
+      id: 'url-robots-1',
+      scan_job_id: 'job-detail-123',
+      original_index: 1,
+      original_input: 'http://robots-site.com/',
+      normalized_url: 'https://robots-site.com/',
+      normalized_domain: 'robots-site.com',
+      status: 'FAILED',
+      duplicate_of_scan_url_id: null,
+      last_error_code: 'ROBOTS_BLOCKED',
+      created_at: new Date().toISOString(),
+      requires_redirect_approval: false,
+      can_approve_redirect: false,
+    };
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [redirectUrl, normalFailedUrl],
+      next_cursor: null,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (5)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (5)'));
+
+    await waitFor(() => {
+      expect(screen.getByText('destination-site.com')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Approve & Retry/i })).toBeInTheDocument();
+      expect(screen.getByText('Keep blocked')).toBeInTheDocument();
+    });
+  });
+
+  it('invokes approveUrlRedirect API helper when Approve & Retry is clicked', async () => {
+    vi.spyOn(apiClient, 'getScanJob').mockResolvedValue(mockJobDetail('COMPLETED_WITH_ERRORS'));
+
+    const redirectUrl: ScanURLApiResponse = {
+      id: 'url-redir-1',
+      scan_job_id: 'job-detail-123',
+      original_index: 0,
+      original_input: 'http://source-site.com/',
+      normalized_url: 'https://source-site.com/',
+      normalized_domain: 'source-site.com',
+      status: 'FAILED',
+      duplicate_of_scan_url_id: null,
+      last_error_code: 'OUT_OF_SCOPE_REDIRECT',
+      created_at: new Date().toISOString(),
+      redirect_target_domain: 'destination-site.com',
+      requires_redirect_approval: true,
+      can_approve_redirect: true,
+    };
+
+    vi.spyOn(apiClient, 'listScanJobUrls').mockResolvedValue({
+      items: [redirectUrl],
+      next_cursor: null,
+    });
+
+    const approveSpy = vi.spyOn(apiClient, 'approveUrlRedirect').mockResolvedValue({
+      ...redirectUrl,
+      status: 'QUEUED',
+      approved_redirect_domain: 'destination-site.com',
+      requires_redirect_approval: false,
+      can_approve_redirect: false,
+    });
+
+    render(<JobDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Target URLs (5)')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByText('Target URLs (5)'));
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Approve & Retry/i })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Approve & Retry/i }));
+
+    await waitFor(() => {
+      expect(approveSpy).toHaveBeenCalledWith('job-detail-123', 'url-redir-1', 'destination-site.com');
+    });
   });
 });
